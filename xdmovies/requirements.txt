@@ -1,0 +1,37 @@
+# xdmovies Telegram bot — Python dependencies
+#
+# Pinned with floor versions known to work. Newer minor versions OK
+# unless they break the Telegram Bot API or Playwright driver.
+
+# Telegram bot
+python-telegram-bot>=21.0,<22.0
+
+# Browser automation
+# CloakBrowser is a patched Chromium with C++ source-level fingerprint
+# patches (https://github.com/CloakHQ/CloakBrowser, 30.8k stars). Drop-in
+# Playwright replacement. Required: bot will crash loudly on import if
+# missing. ~200MB Chromium binary downloaded on first install.
+cloakbrowser>=0.5.0
+# Playwright is still installed as a fallback helper (used by
+# `playwright install` to fetch OS deps for the binary). The bot
+# itself no longer imports `playwright` for launches.
+playwright>=1.40.0
+# JS-level stealth plugin for the latestnews gate page
+# (browser_stealth.stealth_plugin() -> link_exec._gate_via_manual).
+# Without this, the stealth init script is silently never applied and
+# the gate's invisible Turnstile sees a stock automation fingerprint.
+playwright-stealth>=2.0.0
+
+# HTTP for proxy verification + config load
+# httpx-socks is a transport plugin that lets httpx actually use
+# `proxy="socks5://..."`. Without it, httpx silently ignores SOCKS
+# proxy URLs and connects direct from the VPS IP (which is flagged
+# by Cloudflare). Required so link_follower.follow_download_link and
+# any future httpx use stay routed through the OpenVPN tunnel.
+httpx[socks]>=0.25.0
+python-dotenv>=1.0.0
+
+# Optional but recommended (used by single-instance lock fallback)
+psutil>=5.9.0
+
+aiohttp>=3.8.0

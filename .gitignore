@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+*.env
+# NOTE: .env.template files are SAFE to commit and SHOULD be in the
+# repo. They contain placeholders, not real secrets. They serve as
+# documentation for what values to put in the real .env files on the VPS.
+
+# Cloned third-party solver (populated by deploy/deploy-sidecar.sh)
+third_party/
+
+# Local runtime artifacts
+runlogs/
+results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local dumps / logs
+xdmovies_dumps/
+xdmovies_state/
+live_screens/
+*.log
+*.zip
+
+# Single-instance lockfile (runtime, per-machine)
+.xdmovies_bot.lock
