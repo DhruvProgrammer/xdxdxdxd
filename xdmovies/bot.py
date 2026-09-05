@@ -26,7 +26,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from xdmovies.extractor import Card
 from xdmovies import bot_config
@@ -350,6 +350,44 @@ def _user_mention(user_id: int, user_name: str = "", username: str = "") -> str:
     return f"<code>{_masked_uid(user_id)}</code>"
 
 
+# /scrapeallchannel setup: user_id -> timestamp of the "forward a channel
+# message" prompt. Entries expire after 10 minutes. In-memory only; a
+# restart drops pending setups (user just re-sends the command).
+_SCRAPECHAN_PENDING: Dict[int, float] = {}
+_SCRAPECHAN_PENDING_TTL = 600.0
+
+
+def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
+    """(channel_id, title) from a message forwarded out of a channel.
+
+    Prefers the modern `forward_origin` (MessageOriginChannel), falls back
+    to legacy `forward_from_chat`. Anything else (user forwards, hidden
+    senders, plain messages) yields (None, ""). Never raises.
+    """
+    try:
+        origin = getattr(message, "forward_origin", None)
+        if origin is not None:
+            otype = getattr(origin, "type", "") or ""
+            clsname = type(origin).__name__
+            if otype == "channel" or clsname == "MessageOriginChannel":
+                chat = getattr(origin, "chat", None)
+                cid = getattr(chat, "id", None)
+                title = getattr(chat, "title", "") or ""
+                if isinstance(cid, bool):
+                    pass
+                elif isinstance(cid, int) and cid < 0:
+                    return cid, str(title)
+        legacy = getattr(message, "forward_from_chat", None)
+        if legacy is not None:
+            cid = getattr(legacy, "id", None)
+            title = getattr(legacy, "title", "") or ""
+            if isinstance(cid, int) and not isinstance(cid, bool) and cid < 0:
+                return cid, str(title)
+    except Exception:
+        pass
+    return None, ""
+
+
 # --------------------------------------------------------------------------
 # Job state
 # --------------------------------------------------------------------------
@@ -378,6 +416,12 @@ class Job:
     # name instead of a raw id. May be empty for legacy/programmatic jobs.
     user_name: str = ""
     username: str = ""
+    # Channel-scrape routing (/scrapeallchannel): results post to this
+    # chat instead of the user's chat. silent=True suppresses per-card
+    # progress + batch + summary chatter (solve-link taps and FAILs still
+    # reach the user -- they need a human).
+    post_to_channel: int = 0
+    silent: bool = False
     # Batched results message -- we edit a single Telegram message instead of
     # sending one per card. List because long outputs may need >1 message.
     batch_msg_ids: List[int] = field(default_factory=list)
@@ -455,6 +499,8 @@ class Bot:
     async def _set_progress(self, job: Job, text: str) -> None:
         if self._bot is None:
             _LOG.debug("progress skipped: bot not yet initialized")
+            return
+        if getattr(job, "silent", False):
             return
         try:
             if job.progress_msg_id is None:
@@ -831,9 +877,10 @@ class Bot:
             f"[OK] {job.resolved}/{n} resolved  [FAIL] {job.failed} failed"
         )
         try:
-            await self._bot.send_message(
-                chat_id=job.chat_id, text=summary, parse_mode=ParseMode.HTML
-            )
+            if not getattr(job, "silent", False):
+                await self._bot.send_message(
+                    chat_id=job.chat_id, text=summary, parse_mode=ParseMode.HTML
+                )
         except Exception:
             _LOG.exception("summary send failed")
 
@@ -950,7 +997,9 @@ class Bot:
                     f"<code>{_html_escape(url)}</code>",
                 )
                 child = Job(user_id=job.user_id, chat_id=job.chat_id, url=url,
-                            user_name=job.user_name, username=job.username)
+                            user_name=job.user_name, username=job.username,
+                            post_to_channel=job.post_to_channel,
+                            silent=bool(job.post_to_channel))
                 child.cancel_event = job.cancel_event
                 try:
                     await self._run_for_user(child)
@@ -986,12 +1035,17 @@ class Bot:
             )
         else:
             job.status = "done" if not state.failed else "done_with_errors"
-            text = (
-                f"[OK] <b>{kind}</b> scraping complete.\n"
-                f"pages: <b>{state.pages_completed}</b>  "
-                f"completed: <b>{len(state.completed_urls)}</b>  "
-                f"failed: <b>{len(state.failed)}</b>"
-            )
+            if getattr(job, "post_to_channel", 0):
+                # Channel mode: links already posted per movie; user chat
+                # gets one completion line, no counts/summary chatter.
+                text = f"✅ <b>{kind}</b> scrape done -- posted to the channel."
+            else:
+                text = (
+                    f"[OK] <b>{kind}</b> scraping complete.\n"
+                    f"pages: <b>{state.pages_completed}</b>  "
+                    f"completed: <b>{len(state.completed_urls)}</b>  "
+                    f"failed: <b>{len(state.failed)}</b>"
+                )
         job.finished_at = time.time()
         await _send_safe(self._bot, job.chat_id, text, parse_mode=ParseMode.HTML)
 
@@ -1056,6 +1110,12 @@ class Bot:
         if self._bot is None:
             _LOG.debug("batch skipped: bot not yet initialized")
             return
+        # Channel-scrape children post each movie's batch straight to the
+        # channel as it completes (per-movie-live); user chat stays clean.
+        # Silent without a channel target means nothing to do.
+        target = job.post_to_channel or job.chat_id
+        if getattr(job, "silent", False) and not job.post_to_channel:
+            return
         full_text = self._format_batch_text(page_title, cards)
         chunks = _split_text(full_text)
         try:
@@ -1066,7 +1126,7 @@ class Bot:
                 for msg_id, chunk in zip(existing, chunks):
                     try:
                         await self._bot.edit_message_text(
-                            chat_id=job.chat_id,
+                            chat_id=target,
                             message_id=msg_id,
                             text=chunk,
                             parse_mode=ParseMode.HTML,
@@ -1082,19 +1142,19 @@ class Bot:
                 # First, delete the previous batch if it existed.
                 for old_id in existing:
                     try:
-                        await self._bot.delete_message(chat_id=job.chat_id, message_id=old_id)
+                        await self._bot.delete_message(chat_id=target, message_id=old_id)
                     except Exception:
                         pass
                 new_ids: List[int] = []
                 for chunk in chunks:
                     try:
                         msg = await self._bot.send_message(
-                            chat_id=job.chat_id, text=chunk, parse_mode=ParseMode.HTML
+                            chat_id=target, text=chunk, parse_mode=ParseMode.HTML
                         )
                         new_ids.append(msg.message_id)
                     except _TelegramError.BadRequest as exc:
                         _LOG.warning("batch HTML failed (%s) -- retrying plain", exc)
-                        msg = await self._bot.send_message(chat_id=job.chat_id, text=chunk)
+                        msg = await self._bot.send_message(chat_id=target, text=chunk)
                         new_ids.append(msg.message_id)
                 job.batch_msg_ids = new_ids
         except Exception:
@@ -1226,7 +1286,9 @@ class Bot:
             "/status -- bot health + keep-alive\n"
             "/queue -- show who's waiting\n"
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
+            "/scrapeallchannel -- scrape to your channel (owner only)\n"
             "/cancel -- stop your running/queued job\n"
+            "/restart -- restart the whole bot (owner only)\n"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
 
@@ -1341,6 +1403,7 @@ class Bot:
         uid = update.effective_user.id
         if not bot_config.is_allowed(uid, self.cfg):
             return  # silent ignore
+        _SCRAPECHAN_PENDING.pop(uid, None)
 
         cancelled_running = False
         cancelled_queued = 0
@@ -1400,7 +1463,111 @@ class Bot:
         else:
             text = "ℹ️ nothing to cancel -- no running or queued job for you."
         await _send_safe(context.bot, update.effective_chat.id, text,
-                          parse_mode=ParseMode.HTML)
+                           parse_mode=ParseMode.HTML)
+
+    async def _cmd_restart(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """Owner-only full restart: stop every job, then re-exec the process.
+
+        Cancels the running job + clears the whole queue (all users),
+        destroys solve-server sessions (frees their headed browsers) and
+        stops keep-alive; then replaces this process image via os.execv so
+        the bot boots fresh. systemd sees the same PID; an xvfb-run parent
+        (if any) is untouched. The single-instance lock survives exec.
+        """
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not self.cfg.is_owner(update.effective_user.id):
+            return  # owner only, silent ignore
+        chat_id = update.effective_chat.id
+        try:
+            if self._bot is not None:
+                await self._bot.send_message(
+                    chat_id=chat_id,
+                    text="🔄 <b>Restarting bot</b> -- stopping all jobs...",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception:
+            pass
+        # 1. Stop everything: running job + every queued job, all users.
+        try:
+            if self.current is not None:
+                try:
+                    self.current.cancel_event.set()
+                except Exception:
+                    pass
+            try:
+                items = await self._snapshot_queue()
+            except Exception:
+                items = []
+            try:
+                async with self._queue_cond:
+                    for j in items:
+                        try:
+                            j.cancel_event.set()
+                            j.status = "cancelled"
+                            j.finished_at = time.time()
+                        except Exception:
+                            pass
+                    self.queue.clear()
+                    try:
+                        self._queue_cond.notify_all()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # 2. Tear down solve server (closes session browsers) + keep-alive.
+        # Fresh copies boot in _post_init after the re-exec.
+        try:
+            from xdmovies.solve_server import stop_server
+            await stop_server()
+        except Exception:
+            pass
+        try:
+            from xdmovies.keep_alive import stop_keep_alive
+            await stop_keep_alive()
+        except Exception:
+            pass
+        # 3. Re-exec: every launcher in this repo (systemd unit, run.py,
+        # start_bot.cmd, start.sh) ends up in `python -m xdmovies ...`,
+        # i.e. sys.argv[0] is the package __main__.py. Replay any other
+        # launch verbatim (covers `python run.py ...` style invocations).
+        # CRITICAL: __main__.py does os.chdir into xdmovies/ at boot, so
+        # our CWD is NOT the repo root here -- and `python -m xdmovies`
+        # resolves the package from CWD. Without normalizing, the new
+        # process dies with "No module named xdmovies". chdir back plus
+        # PYTHONPATH as belt and suspenders.
+        try:
+            _here = os.path.dirname(os.path.abspath(__file__))
+            _repo_root = os.path.dirname(_here)
+            try:
+                os.chdir(_repo_root)
+            except Exception:
+                pass
+            try:
+                _pp = os.environ.get("PYTHONPATH", "")
+                if _repo_root not in _pp.split(os.pathsep):
+                    os.environ["PYTHONPATH"] = _repo_root + (os.pathsep + _pp if _pp else "")
+            except Exception:
+                pass
+            argv0 = sys.argv[0] if sys.argv else ""
+            if os.path.basename(argv0) == "__main__.py":
+                new_argv = [sys.executable, "-m", "xdmovies"] + list(sys.argv[1:])
+            else:
+                new_argv = [sys.executable] + list(sys.argv)
+            _LOG.warning("restart command: re-executing %s (cwd=%s)", new_argv, _repo_root)
+            os.execv(sys.executable, new_argv)
+        except Exception as exc:
+            _LOG.exception("restart re-exec failed")
+            try:
+                if self._bot is not None:
+                    await self._bot.send_message(
+                        chat_id=chat_id,
+                        text=f"[FAIL] restart failed ({exc.__class__.__name__}); all jobs were stopped, send a link to start fresh.",
+                    )
+            except Exception:
+                pass
 
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -1450,8 +1617,12 @@ class Bot:
                 InlineKeyboardButton("▶ Resume", callback_data=f"scrapeall:resume:{kind}"),  # type: ignore[misc]
                 InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapeall:start:{kind}"),  # type: ignore[misc]
             ]])
+            _failed = f", <b>{len(state.failed)}</b> failed" if state.failed else ""
             await query.edit_message_text(
-                f"{label} has unfinished scrape history. What do you want to do?",
+                f"{label} has unfinished scrape history.\n"
+                f"Progress: page <b>{state.next_page}</b>, "
+                f"<b>{len(state.completed_urls)}</b> done{_failed}.\n"
+                f"Resume continues there; Start wipes it. What do you want to do?",
                 reply_markup=keyboard,
             )
             return
@@ -1495,12 +1666,225 @@ class Bot:
             f"[OK] {action_label} {kind} scrape from page {state.next_page}. Queue position: {position}."
         )
 
+    async def _try_channel_setup(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> bool:
+        """Consume a forwarded channel message as /scrapeallchannel setup.
+
+        Returns True when the message was consumed (caller must return).
+        Only active while the user has a pending setup flag (10 min TTL).
+        Verifies the bot is admin in the channel before saving.
+        """
+        uid = update.effective_user.id
+        ts = _SCRAPECHAN_PENDING.get(uid)
+        if ts is None:
+            return False
+        if time.time() - ts > _SCRAPECHAN_PENDING_TTL:
+            _SCRAPECHAN_PENDING.pop(uid, None)
+            return False
+        message = update.message
+        cid, title = _extract_forwarded_channel(message)
+        if cid is None:
+            try:
+                txt = ((message.text or "").strip())
+                import re as _re
+                if _re.match(r"^-100\d{5,}$", txt):
+                    cid, title = int(txt), ""
+            except Exception:
+                pass
+        if cid is None:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "⚠️ That doesn't look like a channel forward. Forward any message "
+                "<b>from the channel itself</b> (not from a user), or reply with the "
+                "channel id (<code>-100…</code>).",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        try:
+            me = await context.bot.get_me()
+            member = await context.bot.get_chat_member(chat_id=cid, user_id=me.id)
+            if getattr(member, "status", "") not in ("administrator", "creator"):
+                raise PermissionError(getattr(member, "status", "unknown"))
+        except PermissionError as exc:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                f"⚠️ I'm not an admin in <b>{_html_escape(title or str(cid))}</b> ({exc}). "
+                f"Make me admin (Post Messages), then forward again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        except Exception as exc:
+            _LOG.warning("channel admin check failed: %r", exc)
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "⚠️ I can't see that channel -- add me to it first, make me admin, then forward again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        try:
+            from xdmovies.scrape_all import ScrapeChannel, save_channel
+            save_channel(ScrapeChannel(channel_id=cid, title=title, set_by=uid))
+        except Exception as exc:
+            _LOG.exception("channel save failed")
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                f"[FAIL] could not save channel ({exc.__class__.__name__}). Try again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        _SCRAPECHAN_PENDING.pop(uid, None)
+        shown = _html_escape(title) if title else f"<code>{cid}</code>"
+        await _send_safe(
+            context.bot, update.effective_chat.id,
+            f"✅ Channel saved: <b>{shown}</b>\nRun /scrapeallchannel again to choose what to scrape.",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    async def _cmd_scrapeallchannel(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        if not self.cfg.is_owner(update.effective_user.id):
+            return  # owner only, silent ignore
+        try:
+            from xdmovies.scrape_all import load_channel
+            ch = load_channel()
+        except Exception:
+            ch = None
+        if ch is None:
+            _SCRAPECHAN_PENDING[update.effective_user.id] = time.time()
+            await update.message.reply_text(
+                "📢 No channel set yet.\n\nForward any message from your channel "
+                "here within 10 minutes and I'll save it as the scrape target."
+            )
+            return
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        except Exception:
+            InlineKeyboardButton = InlineKeyboardMarkup = None  # type: ignore
+        if InlineKeyboardMarkup is None:
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 All", callback_data="scrapechan:select:all")],
+            [
+                InlineKeyboardButton("🎬 Movies", callback_data="scrapechan:select:movies"),
+                InlineKeyboardButton("🎞️ Series", callback_data="scrapechan:select:series"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="scrapechan:cancel:-")],
+        ])
+        shown = ch.title or str(ch.channel_id)
+        await update.message.reply_text(
+            f"What do you want to scrape into <b>{_html_escape(shown)}</b>?",
+            reply_markup=keyboard, parse_mode=ParseMode.HTML,
+        )
+
+    async def _on_scrapechan_choice(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if not self.cfg.is_owner(query.from_user.id):
+            return  # owner only, silent ignore
+        data = query.data or ""
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "scrapechan":
+            return
+        action, kind = parts[1], parts[2]
+        if action == "cancel":
+            if query.message is None:
+                return
+            await query.edit_message_text("❌ Channel scrape choice cancelled -- nothing started.")
+            return
+        if action not in {"select", "resume", "start"}:
+            return
+        if kind not in {"all", "movies", "series"}:
+            return
+        if query.message is None:
+            return
+        try:
+            from xdmovies.scrape_all import load_channel
+            ch = load_channel()
+        except Exception:
+            ch = None
+        if ch is None:
+            await query.edit_message_text("⚠️ No channel set. Run /scrapeallchannel and forward a channel message first.")
+            return
+        from xdmovies.scrape_all import has_resumable_history, load_checkpoint
+        state = load_checkpoint(kind)
+        if action == "select" and has_resumable_history(state):
+            label = {"all": "All", "movies": "Movies", "series": "Series"}[kind]
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            except Exception:
+                InlineKeyboardButton = InlineKeyboardMarkup = None  # type: ignore
+            if InlineKeyboardMarkup is None:
+                return
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶ Resume", callback_data=f"scrapechan:resume:{kind}"),
+                InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapechan:start:{kind}"),
+            ]])
+            _failed_c = f", <b>{len(state.failed)}</b> failed" if state.failed else ""
+            await query.edit_message_text(
+                f"{label} has unfinished scrape history.\n"
+                f"Progress: page <b>{state.next_page}</b>, "
+                f"<b>{len(state.completed_urls)}</b> done{_failed_c}.\n"
+                f"Resume continues there; Start wipes it. What do you want to do?",
+                reply_markup=keyboard,
+            )
+            return
+        if action == "select":
+            action = "start"
+        if self.current is not None and self.current.job_type == "scrape_all":
+            await query.edit_message_text("⏳ A scrape-all job is already running.")
+            return
+        items: List[Job] = []
+        items = await self._snapshot_queue()
+        duplicate = any(job.job_type == "scrape_all" and job.content_type == kind for job in items)
+        if duplicate:
+            await query.edit_message_text(f"⏳ A {kind} scrape is already queued.")
+            return
+        from xdmovies.scrape_all import catalog_page_url
+        if action == "start":
+            from xdmovies.scrape_all import ScrapeCheckpoint, save_checkpoint
+            state = ScrapeCheckpoint(kind=kind)
+            save_checkpoint(state)
+        was_finished = state.finished
+        if was_finished and action == "resume":
+            await query.edit_message_text(f"ℹ️ {kind.title()} has already finished; choose start again to restart it.")
+            return
+        if was_finished:
+            state.next_page = 1
+        _q_name, _q_uname = _display_name(query.from_user)
+        job = Job(
+            user_id=query.from_user.id,
+            chat_id=query.message.chat.id,
+            url=catalog_page_url(kind, state.next_page),
+            job_type="scrape_all",
+            content_type=kind,
+            user_name=_q_name,
+            username=_q_uname,
+            post_to_channel=ch.channel_id,
+        )
+        position = await self._enqueue(job)
+        action_label = "Starting from beginning" if action == "start" else "Resuming"
+        shown = ch.title or str(ch.channel_id)
+        await query.edit_message_text(
+            f"[OK] {action_label} {kind} scrape from page {state.next_page} → "
+            f"<b>{_html_escape(shown)}</b>. Queue position: {position}."
+        )
+
     async def _on_text(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
         uid = update.effective_user.id
         if not bot_config.is_allowed(uid, self.cfg):
             return  # silent ignore
+        # Channel-setup consumes forwarded channel messages (and only
+        # while the user has a pending /scrapeallchannel setup).
+        try:
+            if await self._try_channel_setup(update, context):
+                return
+        except Exception:
+            pass
         text = (update.message.text or "").strip()
         m = URL_RE.search(text)
         if not m:
@@ -1576,7 +1960,9 @@ class Bot:
                 BotCommand("status", "show bot health"),
                 BotCommand("queue", "show running + queued jobs"),
                 BotCommand("cancel", "stop my running/queued job(s)"),
+                BotCommand("restart", "restart the whole bot (owner only)"),
                 BotCommand("scrapeall", "scrape all movies or series"),
+                BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
             ])
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
@@ -1652,10 +2038,16 @@ class Bot:
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("queue", self._cmd_queue))
         app.add_handler(CommandHandler("cancel", self._cmd_cancel))
+        app.add_handler(CommandHandler("restart", self._cmd_restart))
         app.add_handler(CommandHandler("scrapeall", self._cmd_scrapeall))
+        app.add_handler(CommandHandler("scrapeallchannel", self._cmd_scrapeallchannel))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
             pattern=r"^scrapeall:(select|resume|start):(all|movies|series)$|^scrapeall:cancel:-$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_scrapechan_choice,
+            pattern=r"^scrapechan:(select|resume|start):(all|movies|series)$|^scrapechan:cancel:-$",
         ))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         return app

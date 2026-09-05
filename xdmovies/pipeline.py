@@ -65,6 +65,91 @@ async def _is_cf_challenge_page(page) -> bool:
     return False
 
 
+async def _try_auto_nudge(page, ctx, url: str) -> bool:
+    """One auto-bypass attempt on a challenged movie page.
+
+    Mirrors the proven solve_server._auto_nudge: give CF a chance to
+    auto-verify, else click the Turnstile checkbox once, then re-check.
+    On a fresh solve, saves the NEW cf_clearance (IP+UA bound to this
+    browser) so next runs and keep-alive reuse it. Returns True when the
+    challenge is gone. Never raises; worst case costs ~20s on a page
+    that stays blocked (caller then raises CFChallengeError as before).
+    """
+    try:
+        from xdmovies.cookie_store import set_cookies_for_domain
+    except Exception:
+        set_cookies_for_domain = None  # type: ignore
+    injected: set = set()
+    try:
+        if ctx is not None:
+            for c in await ctx.cookies():
+                if c.get("name") == "cf_clearance" and c.get("value"):
+                    injected.add(c.get("value"))
+    except Exception:
+        pass
+
+    async def fresh_cookie() -> str:
+        try:
+            if ctx is None:
+                return ""
+            for c in await ctx.cookies():
+                if c.get("name") != "cf_clearance":
+                    continue
+                v = c.get("value") or ""
+                if v and len(v) > 20 and v not in injected:
+                    return v
+        except Exception:
+            pass
+        return ""
+
+    async def clear() -> bool:
+        try:
+            return not await _is_cf_challenge_page(page)
+        except Exception:
+            return False
+
+    try:
+        for _ in range(8):
+            if await clear():
+                return True
+            await asyncio.sleep(1.0)
+        if await fresh_cookie():
+            return await clear()
+        try:
+            for fr in page.frames:
+                try:
+                    u = (fr.url or "").lower()
+                except Exception:
+                    continue
+                if "challenges.cloudflare.com" in u and "turnstile" in u:
+                    try:
+                        await fr.click("body", position={"x": 30, "y": 32}, delay=80, timeout=5000)
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+        for _ in range(8):
+            if await clear():
+                break
+            await asyncio.sleep(1.0)
+        if not await clear():
+            return False
+        val = await fresh_cookie()
+        if val and set_cookies_for_domain is not None:
+            try:
+                ua = await page.evaluate("navigator.userAgent")
+            except Exception:
+                ua = None
+            try:
+                set_cookies_for_domain(_normalize_domain(url), f"cf_clearance={val}", user_agent=ua)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> str:
     """Fetch url via CloakBrowser (patched Chromium) with stored
     cf_clearance injected. Raises CFChallengeError if still challenged.
@@ -119,6 +204,17 @@ async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> 
         await asyncio.sleep(0.8)
         is_chal = await _is_cf_challenge_page(page)
         html = await page.content()
+        if is_chal:
+            # Auto-nudge first: CF often auto-verifies within seconds and
+            # an interactive widget can still be coaxed with one checkbox
+            # click (same pattern as the gate flow). Only a page that
+            # survives the nudge raises CFChallengeError as before.
+            try:
+                if await _try_auto_nudge(page, ctx, url):
+                    html = await page.content()
+                    is_chal = await _is_cf_challenge_page(page)
+            except Exception:
+                pass
         if is_chal:
             # Audit finding H1: previous code only raised
             # CFChallengeError if the challenge was *also* in the title

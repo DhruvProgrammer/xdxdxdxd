@@ -8,7 +8,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 
@@ -77,6 +77,46 @@ def has_resumable_history(state: ScrapeCheckpoint) -> bool:
         or state.failed
         or state.next_page > 1
     )
+
+
+@dataclass
+class ScrapeChannel:
+    """Where /scrapeallchannel posts. Single global target, set by
+    forwarding any channel message to the bot (owner only)."""
+    channel_id: int = 0
+    title: str = ""
+    set_by: int = 0
+    updated_at: float = field(default_factory=time.time)
+    schema_version: int = 1
+
+
+def channel_path() -> Path:
+    return STATE_DIR / "scrape_channel.json"
+
+
+def load_channel() -> Optional[ScrapeChannel]:
+    path = channel_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("schema_version") != 1 or not int(data.get("channel_id") or 0):
+            raise ValueError("incompatible scrape channel file")
+        return ScrapeChannel(**data)
+    except Exception:
+        return None
+
+
+def save_channel(cfg: ScrapeChannel) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cfg.updated_at = time.time()
+    path = channel_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(asdict(cfg), handle, ensure_ascii=True, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def _canonical_detail_url(href: str, base_url: str, kind: str) -> str | None:
