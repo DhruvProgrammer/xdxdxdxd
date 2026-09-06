@@ -73,6 +73,56 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"\s+", " ", no_tags).strip()
 
 
+@dataclass
+class HubDetails:
+    """What a HubCloud drive page states statically (no clicks needed).
+
+    title/size come from <title> + the File Size row; final_url is the
+    gamerxyt token URL from `var url = '...'` (fallback: a#download href)
+    -- the same destination the gate flow produces after full automation.
+    Empty strings mean "not found".
+    """
+    title: str = ""
+    size: str = ""
+    final_url: str = ""
+
+
+_HUB_TITLE_RE = re.compile(r"<title[^>]*>([^<]{4,200})</title>", re.IGNORECASE)
+_HUB_HEADER_RE = re.compile(
+    r'class="card-header[^"]*"[^>]*>\s*([^<]{4,200}?)\s*</div>', re.IGNORECASE | re.DOTALL)
+_HUB_SIZE_RE = re.compile(r"File Size<i[^>]*>([^<]{1,30})</i>", re.IGNORECASE)
+_HUB_VAR_URL_RE = re.compile(r"var\s+url\s*=\s*'(https?://[^']+)'")
+_HUB_DL_HREF_RE = re.compile(
+    r"<a\b(?=[^>]*\bid=\"download\")[^>]*\bhref=\"([^\"]+)\"", re.IGNORECASE)
+
+
+def extract_hub_details(html: str) -> HubDetails:
+    """Parse a HubCloud /drive/<id> page. Pure function, no I/O."""
+    if not html:
+        return HubDetails()
+    title = ""
+    m = _HUB_TITLE_RE.search(html)
+    if m:
+        title = re.sub(r"\s+", " ", m.group(1)).strip()
+    if not title:
+        m = _HUB_HEADER_RE.search(html)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1)).strip()
+    size = ""
+    m = _HUB_SIZE_RE.search(html)
+    if m:
+        size = re.sub(r"\s+", " ", m.group(1)).strip()
+    final_url = ""
+    m = _HUB_VAR_URL_RE.search(html)
+    if m:
+        final_url = m.group(1).strip()
+    if not final_url:
+        m = _HUB_DL_HREF_RE.search(html)
+        if m:
+            final_url = m.group(1).strip()
+    return HubDetails(title=title, size=size, final_url=final_url)
+
+
 def _read_tag_text(html: str, open_match_start: int) -> Tuple[str, int]:
     """Given the start of a matching open-tag, return (text, position_after_close)."""
     open_end = html.find(">", open_match_start)

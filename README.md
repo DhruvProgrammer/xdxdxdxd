@@ -96,6 +96,11 @@ User sends https://top.xdmovies.wtf/movies/<slug> (or /series/<slug>)
    Host-based (never full-URL substring) matching, so `pureddl` in an ad
    query can no longer trip the `ddl` hint. Known ad/CPA hosts are
    excluded outright; a last-line guard refuses ad URLs as results.
+8. **Static hub read** (`extractor.extract_hub_details` +
+   `link_exec.fetch/resolve_hub_details`). HubCloud drive pages state
+   their title, size, and final gamerxyt token URL in plain HTML, so one
+   cheap HTTPS GET replaces a full browser navigation wherever a hub
+   URL is in hand; the browser flow remains the fallback.
 
 ## Telegram commands
 

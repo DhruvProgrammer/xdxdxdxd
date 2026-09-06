@@ -80,6 +80,80 @@ def _is_destination_url(url: str) -> bool:
         return False
     return any(x in h for x in DEST_HOST_HINTS)
 
+
+async def fetch_hub_details(url: str, timeout: float = 12.0):
+    """Cheap static read of a hub drive page (no browser).
+
+    Plain HTTPS GET with stored cookies + UA, parsed by
+    extractor.extract_hub_details. Returns the details, or None when the
+    fetch fails, is challenged, or parses empty -- callers fall back to
+    the browser flow. Never raises. Only attempted for hubcloud/hubdrive
+    hosts (the parser is shaped for their drive pages).
+    """
+    try:
+        h = _url_host(url or "")
+        if not h or ("hubcloud" not in h and "hubdrive" not in h):
+            return None
+        try:
+            import httpx
+        except Exception:
+            return None
+        cookies = {}
+        try:
+            for c in get_cookies_for_url(url) or []:
+                if c.get("name") and c.get("value"):
+                    cookies[c["name"]] = c["value"]
+        except Exception:
+            cookies = {}
+        try:
+            ua = get_user_agent_for_url(url) or None
+        except Exception:
+            ua = None
+        headers = {
+            "Referer": "https://latestnewsonline.sbs/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        if ua:
+            headers["User-Agent"] = ua
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True, headers=headers, cookies=cookies
+        ) as cli:
+            r = await cli.get(url)
+        if r.status_code != 200:
+            return None
+        html = r.text or ""
+        if len(html) < 2000:
+            return None
+        low = html.lower()
+        if "just a moment" in low or "checking your browser" in low or "cf-mitigated" in low:
+            return None
+        from xdmovies.extractor import extract_hub_details
+        d = extract_hub_details(html)
+        if not d.final_url and not d.title:
+            return None
+        return d
+    except Exception:
+        return None
+
+
+async def resolve_hub_details(url: str):
+    """(final_url, title, size) for a hub drive URL via static read.
+
+    Validates the parsed final URL (must itself be a destination, never
+    an ad or a self-loop). Falls back to (url, "", "") on anything
+    unexpected -- callers keep today's behavior. Never raises.
+    """
+    try:
+        d = await fetch_hub_details(url)
+    except Exception:
+        d = None
+    if not d:
+        return url, "", ""
+    final = (d.final_url or "").strip()
+    if final and final != url and _is_destination_url(final) and not _is_ad_url(final):
+        return final, d.title, d.size
+    return url, d.title, d.size
+
 ANTI_AD_INIT_SCRIPT = r"""
 (() => {
     if (window.__adNeutralized) return;
@@ -857,6 +931,16 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             if _is_ad_url(dest) or not any(h in _url_host(dest) for h in hub_hints):
                 return dest
             else:
+                # Fast path first: the hub drive page states its title, size
+                # and final gamerxyt token URL statically -- one cheap HTTPS
+                # GET instead of a full browser navigation.
+                try:
+                    _rf, _rt, _rs = await resolve_hub_details(dest)
+                    if _rf and _rf != dest:
+                        print(f"[link_exec] hub static fast path: {dest[:80]} -> {_rf[:80]}")
+                        return _rf
+                except Exception:
+                    pass
                 try:
                     await page.goto(dest, wait_until="domcontentloaded", timeout=30000)
                     for sel in ("a#download", "a.btn-download", "a.btn-primary",

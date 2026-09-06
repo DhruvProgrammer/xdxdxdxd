@@ -18,13 +18,14 @@ Queue:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import traceback
-import types
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -279,6 +280,58 @@ async def _drop_msg(bot, chat_id: int, message_id: Optional[int]) -> None:
         pass
 
 
+def _restart_notice_path() -> str:
+    try:
+        return os.path.join(tempfile.gettempdir(), "xdmovies_restart_notice.json")
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".xdmovies_restart_notice.json")
+
+
+def _write_restart_notice(chat_id: int) -> None:
+    try:
+        with open(_restart_notice_path(), "w", encoding="utf-8") as f:
+            json.dump({"chat_id": chat_id, "at": time.time()}, f)
+    except Exception:
+        pass
+
+
+def _clear_restart_notice() -> None:
+    try:
+        os.remove(_restart_notice_path())
+    except Exception:
+        pass
+
+
+async def _announce_restart_if_pending(bot) -> None:
+    """Send the post-restart success message if /restart left one pending.
+
+    Called once at boot. Stale (>10 min) or missing files are silently
+    dropped so an unrelated reboot never sends a phantom success note.
+    Never raises.
+    """
+    path = _restart_notice_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    _clear_restart_notice()
+    try:
+        if time.time() - float(data.get("at", 0)) > 600:
+            return
+        chat_id = int(data.get("chat_id"))
+    except Exception:
+        return
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="✅ <b>Bot restarted successfully</b> -- fresh and ready. Send a link.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+
 def _fmt_dur(seconds: float) -> str:
     """Compact duration: 36s, 2m 28s, 1h 05m. Used for queue ages/ETAs."""
     s = max(0, int(seconds))
@@ -336,6 +389,57 @@ def _is_gate_url(url: str) -> bool:
         return bool(h) and (h == _gh or h.endswith("." + _gh))
     except Exception:
         return False
+
+
+async def _enrich_hub_dest(dest: str, card) -> str:
+    """Best-effort upgrade of a hub /drive/ URL to its final gamerxyt URL
+    via one static hub read (no browser). Fills empty card title/size
+    from the hub page. Returns dest unchanged on any failure. Never
+    raises (extra safety: callers treat enrichment as optional)."""
+    try:
+        from xdmovies.link_exec import resolve_hub_details as _rhd
+        try:
+            _rf, _rt, _rs = await _rhd(dest)
+        except Exception:
+            return dest
+        if _rf and _rf != dest:
+            _LOG.info("hub dest enriched to final: %s", _rf[:100])
+            dest = _rf
+        try:
+            if _rt and not card.title:
+                card.title = _rt
+                card.file_name = card.file_name or _rt
+            if _rs and not card.size:
+                card.size = _rs
+        except Exception:
+            pass
+        return dest
+    except Exception:
+        return dest
+
+
+MAX_LINKS_PER_MESSAGE = 10
+
+
+def _extract_links(text: str, limit: int = MAX_LINKS_PER_MESSAGE) -> Tuple[List[str], int]:
+    """All supported URLs in a message: (deduped list up to limit, dropped count).
+
+    Lets users paste several links (one per line) in a single message;
+    each becomes its own queued job, resolved one by one.
+    """
+    out: List[str] = []
+    seen = set()
+    try:
+        for m in URL_RE.finditer(text or ""):
+            u = m.group(0)
+            if u in seen:
+                continue
+            seen.add(u)
+            if len(out) < limit:
+                out.append(u)
+    except Exception:
+        pass
+    return out, max(0, len(seen) - len(out))
 
 
 def _display_name(user) -> Tuple[str, str]:
@@ -759,9 +863,23 @@ class Bot:
                 if _is_dest_url(card.url):
                     # Direct hub link straight on the movie page (e.g.
                     # hubcloud.one/drive/...): no link.xdmovies.wtf hop,
-                    # no latestnews gate. Deliver as-is instead of
-                    # burning two browsers on follow + button flow.
+                    # no latestnews gate. Enrich via one cheap static hub
+                    # read (title/size/final gamerxyt URL); fall back to
+                    # the raw drive URL on any failure.
                     dest = card.url
+                    try:
+                        from xdmovies.link_exec import resolve_hub_details as _rhd
+                        _rf, _rt, _rs = await _rhd(card.url)
+                        if _rf and _rf != card.url:
+                            dest = _rf
+                            _LOG.info("direct dest enriched to final: %s", dest[:100])
+                        if _rt and not card.title:
+                            card.title = _rt
+                            card.file_name = card.file_name or _rt
+                        if _rs and not card.size:
+                            card.size = _rs
+                    except Exception:
+                        pass
                     _LOG.info("direct dest card, skipping follow+gate: %s", card.url[:100])
                     results.append((card, dest, None))
                     job.resolved += 1
@@ -817,6 +935,7 @@ class Bot:
                                                 _r2 = _gsr2(token2) or {}
                                                 if (_r2.get("final_url") or "").strip():
                                                     dest = _r2["final_url"].strip()
+                                                    dest = await _enrich_hub_dest(dest, card)
                                                     break
                                             except: pass
                                             try:
@@ -863,6 +982,7 @@ class Bot:
                                     _rf = _gsrf(tokenf) or {}
                                     if (_rf.get("final_url") or "").strip():
                                         dest = _rf["final_url"].strip()
+                                        dest = await _enrich_hub_dest(dest, card)
                                         results.append((card, dest, None))
                                         job.resolved += 1
                                         try:
@@ -1599,9 +1719,11 @@ class Bot:
             else:
                 new_argv = [sys.executable] + list(sys.argv)
             _LOG.warning("restart command: re-executing %s (cwd=%s)", new_argv, _repo_root)
+            _write_restart_notice(chat_id)
             os.execv(sys.executable, new_argv)
         except Exception as exc:
             _LOG.exception("restart re-exec failed")
+            _clear_restart_notice()
             try:
                 if self._bot is not None:
                     await self._bot.send_message(
@@ -1914,6 +2036,24 @@ class Bot:
             f"<b>{_html_escape(shown)}</b>. Queue position: {position}."
         )
 
+    async def _confirm_enqueued(self, context: "ContextTypes.DEFAULT_TYPE",
+                              chat_id: int, url: str, pos: int) -> Optional[int]:
+        """Single-link enqueue note. Returns message_id for clutter cleanup."""
+        icon, title = _pretty_title(url)
+        if self.current is None and pos == 1:
+            return await _send_safe(
+                context.bot, chat_id,
+                f"🔄 <b>Starting now</b>\n{icon} {title}",
+                parse_mode=ParseMode.HTML,
+            )
+        behind = (pos - 1) + (1 if self.current else 0)
+        eta = pos * 35  # rough guess
+        return await _send_safe(
+            context.bot, chat_id,
+            f"📋 <b>Queued</b> -- position #{behind + 1}\n{icon} {title}\n⏳ ETA ~{_fmt_dur(eta)}",
+            parse_mode=ParseMode.HTML,
+        )
+
     async def _on_text(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
@@ -1928,8 +2068,8 @@ class Bot:
         except Exception:
             pass
         text = (update.message.text or "").strip()
-        m = URL_RE.search(text)
-        if not m:
+        urls, dropped = _extract_links(text)
+        if not urls:
             await _send_safe(
                 context.bot, update.effective_chat.id,
                 "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
@@ -1937,7 +2077,6 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return
-        url = m.group(0)
 
         # Audit finding M3: count jobs the user already has queued
         # (not just the one running) so the busy check covers the whole
@@ -1957,24 +2096,26 @@ class Bot:
 
         depth = self._queue_depth()
         _nm, _un = _display_name(update.effective_user)
-        job = Job(user_id=uid, chat_id=update.effective_chat.id, url=url,
-                  user_name=_nm, username=_un)
-        pos = await self._enqueue(job)
-        icon, title = _pretty_title(url)
-        if self.current is None and pos == 1:
-            job.enqueue_msg_id = await _send_safe(
-                context.bot, update.effective_chat.id,
-                f"🔄 <b>Starting now</b>\n{icon} {title}",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            behind = (pos - 1) + (1 if self.current else 0)
-            eta = pos * 35  # rough guess
-            job.enqueue_msg_id = await _send_safe(
-                context.bot, update.effective_chat.id,
-                f"📋 <b>Queued</b> -- position #{behind + 1}\n{icon} {title}\n⏳ ETA ~{_fmt_dur(eta)}",
-                parse_mode=ParseMode.HTML,
-            )
+        if len(urls) == 1:
+            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=urls[0],
+                      user_name=_nm, username=_un)
+            pos = await self._enqueue(job)
+            job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, urls[0], pos)
+            return
+        jobs = []
+        for url in urls:
+            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=url,
+                      user_name=_nm, username=_un)
+            await self._enqueue(job)
+            jobs.append(job)
+        lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
+        for idx, job in enumerate(jobs, 1):
+            icon, title = _pretty_title(job.url)
+            lines.append(f"{idx}. {icon} {title}")
+        if dropped:
+            lines.append(f"⚠️ +{dropped} more ignored (max {MAX_LINKS_PER_MESSAGE}/message).")
+        await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
+                         parse_mode=ParseMode.HTML)
 
     # ---- lifecycle -------------------------------------------------------
     async def _post_init(self, application: "Application") -> None:
@@ -2010,6 +2151,10 @@ class Bot:
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
         await self._start_dispatcher_after_polling()
+        try:
+            await _announce_restart_if_pending(application.bot)
+        except Exception:
+            pass
 
     async def _post_stop(self, _application: "Application") -> None:
         try:
