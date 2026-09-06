@@ -788,6 +788,26 @@ async def _launch_for_session(sess: SolveSession):
                             except Exception:
                                 pass
                             if dest:
+                                # If the solve browser itself sits on the hub
+                                # page, parse its title/size/final URL into
+                                # the shared cache (zero extra network; works
+                                # behind CF where plain HTTPS fetches fail).
+                                try:
+                                    from xdmovies.link_exec import note_hub_details as _note
+                                    from xdmovies.extractor import extract_hub_details as _ehd
+                                    try:
+                                        _cur = page.url or ""
+                                    except Exception:
+                                        _cur = ""
+                                    if _cur and ("hubcloud" in _cur or "hubdrive" in _cur):
+                                        try:
+                                            _hd = _ehd(await page.content() or "")
+                                        except Exception:
+                                            _hd = None
+                                        if _hd is not None and (_hd.title or _hd.final_url):
+                                            _note(_cur, _hd.final_url, _hd.title, _hd.size)
+                                except Exception:
+                                    pass
                                 _finish_gate_solve(sess, dest, "go-to-link")
                             else:
                                 logger.warning("[solve_server] gate auto-drive: Go clicked but no destination found")

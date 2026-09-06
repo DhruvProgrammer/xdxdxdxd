@@ -394,20 +394,31 @@ def _is_gate_url(url: str) -> bool:
 
 async def _enrich_hub_dest(dest: str, card) -> str:
     """Best-effort upgrade of a hub /drive/ URL to its final gamerxyt URL
-    via one static hub read (no browser). Fills empty card title/size
-    from the hub page. Returns dest unchanged on any failure. Never
-    raises (extra safety: callers treat enrichment as optional)."""
+    with real title/size from the hub page. Prefers the in-browser cache
+    (filled when a flow already loaded that hub page behind CF); falls
+    back to one static HTTPS read. Returns dest unchanged on any failure.
+    Never raises (callers treat enrichment as optional)."""
     try:
-        from xdmovies.link_exec import resolve_hub_details as _rhd
+        from xdmovies.link_exec import (
+            resolve_hub_details as _rhd,
+            get_hub_details as _ghd,
+        )
         try:
-            _rf, _rt, _rs = await _rhd(dest)
+            _cached = _ghd(dest)
         except Exception:
-            return dest
+            _cached = None
+        if _cached:
+            _rf, _rt, _rs = _cached
+        else:
+            try:
+                _rf, _rt, _rs = await _rhd(dest)
+            except Exception:
+                return dest
         if _rf and _rf != dest:
             _LOG.info("hub dest enriched to final: %s", _rf[:100])
             dest = _rf
         try:
-            if _rt and not card.title:
+            if _rt and (not card.title or card.title == "Gate link"):
                 card.title = _rt
                 card.file_name = card.file_name or _rt
             if _rs and not card.size:
@@ -417,6 +428,26 @@ async def _enrich_hub_dest(dest: str, card) -> str:
         return dest
     except Exception:
         return dest
+
+
+async def _finalize_gate_card(card, dest: str, result) -> str:
+    """Finish a gate-resolved card: upgrade to the final hub URL and fill
+    the real title/size from the hub page (the gate page itself carries
+    no movie name, so gate-direct cards start empty). Also points the
+    batch header at the real title when it still shows the placeholder.
+    Returns (possibly upgraded) dest. Never raises."""
+    try:
+        dest = await _enrich_hub_dest(dest, card)
+    except Exception:
+        pass
+    try:
+        if (result is not None
+                and getattr(result, "page_title", "") in ("Gate link", "", "(untitled)")
+                and card.title and card.title != "Gate link"):
+            result.page_title = card.title
+    except Exception:
+        pass
+    return dest
 
 
 MAX_LINKS_PER_MESSAGE = 10
@@ -701,7 +732,7 @@ class Bot:
                 # movie page fetch (nothing to extract) and the per-card
                 # loop below skips the follow hop for gate hosts --
                 # straight to the drive.
-                cards = [Card(title="Gate link", file_name="Gate link", url=job.url)]
+                cards = [Card(title="", file_name="", url=job.url)]
                 result = types.SimpleNamespace(page_title="Gate link", html_len=0, cards=cards)
             else:
                 result = await _extract_with_diagnostics(  # type: ignore[misc]
@@ -864,23 +895,11 @@ class Bot:
                 if _is_dest_url(card.url):
                     # Direct hub link straight on the movie page (e.g.
                     # hubcloud.one/drive/...): no link.xdmovies.wtf hop,
-                    # no latestnews gate. Enrich via one cheap static hub
-                    # read (title/size/final gamerxyt URL); fall back to
-                    # the raw drive URL on any failure.
-                    dest = card.url
-                    try:
-                        from xdmovies.link_exec import resolve_hub_details as _rhd
-                        _rf, _rt, _rs = await _rhd(card.url)
-                        if _rf and _rf != card.url:
-                            dest = _rf
-                            _LOG.info("direct dest enriched to final: %s", dest[:100])
-                        if _rt and not card.title:
-                            card.title = _rt
-                            card.file_name = card.file_name or _rt
-                        if _rs and not card.size:
-                            card.size = _rs
-                    except Exception:
-                        pass
+                    # no latestnews gate. Enrich to the final URL and
+                    # fill any missing title/size from the hub page.
+                    dest = await _finalize_gate_card(
+                        card, card.url,
+                        types.SimpleNamespace(page_title="", html_len=0, cards=[card]))
                     _LOG.info("direct dest card, skipping follow+gate: %s", card.url[:100])
                     results.append((card, dest, None))
                     job.resolved += 1
@@ -936,7 +955,7 @@ class Bot:
                                                 _r2 = _gsr2(token2) or {}
                                                 if (_r2.get("final_url") or "").strip():
                                                     dest = _r2["final_url"].strip()
-                                                    dest = await _enrich_hub_dest(dest, card)
+                                                    dest = await _finalize_gate_card(card, dest, result)
                                                     break
                                             except: pass
                                             try:
@@ -951,6 +970,7 @@ class Bot:
                             _LOG.exception("button flow failed for %s", url2)
                             break
                         if dest:
+                            dest = await _finalize_gate_card(card, dest, result)
                             break
                         if _btn_attempt == 0:
                             _LOG.warning("button flow returned empty for %s, retrying once", url2)
@@ -983,7 +1003,7 @@ class Bot:
                                     _rf = _gsrf(tokenf) or {}
                                     if (_rf.get("final_url") or "").strip():
                                         dest = _rf["final_url"].strip()
-                                        dest = await _enrich_hub_dest(dest, card)
+                                        dest = await _finalize_gate_card(card, dest, result)
                                         results.append((card, dest, None))
                                         job.resolved += 1
                                         try:
@@ -998,6 +1018,7 @@ class Bot:
                                         try:
                                             dest = await _execute_button_flow(url2r, session_id=shared_session, headless=False)  # type: ignore
                                             if dest:
+                                                dest = await _finalize_gate_card(card, dest, result)
                                                 results.append((card, dest, None))
                                                 job.resolved += 1
                                                 try:

@@ -13,7 +13,7 @@ import asyncio
 import re
 import sys
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, _normalize_domain, set_cookies_for_domain
 from xdmovies.browser_stealth import is_chromium_family, stealth_plugin
@@ -36,6 +36,38 @@ DEST_HOST_HINTS = (
     "hubcloud", "hubdrive", "gdflix", "gofile", "vcloud",
     "drive.google", "fdrive", "ddl", "faststream", "gamerxyt",
 )
+
+# Hub details cache: url -> (final_url, title, size, timestamp).
+# The browser flows already load hub pages behind CF; parsing the loaded
+# DOM and sharing it here beats a separate HTTPS fetch that a datacenter
+# IP cannot complete. 1h TTL; best-effort, never raises.
+_HUB_DETAILS_CACHE: Dict[str, Tuple[str, str, str, float]] = {}
+_HUB_CACHE_TTL = 3600.0
+
+
+def note_hub_details(url: str, final_url: str = "", title: str = "", size: str = "") -> None:
+    try:
+        if not url:
+            return
+        if not final_url and not title:
+            return
+        _HUB_DETAILS_CACHE[url] = (final_url or "", title or "", size or "", time.time())
+    except Exception:
+        pass
+
+
+def get_hub_details(url: str):
+    """(final_url, title, size) or None. Fresh entries only."""
+    try:
+        e = _HUB_DETAILS_CACHE.get(url or "")
+        if not e:
+            return None
+        if time.time() - e[3] > _HUB_CACHE_TTL:
+            _HUB_DETAILS_CACHE.pop(url, None)
+            return None
+        return e[0], e[1], e[2]
+    except Exception:
+        return None
 
 # Hosts that are NEVER destinations (ad networks / CPA landers observed
 # in the wild). Checked first: a substring hit on a dest hint inside an
@@ -943,6 +975,23 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
                     pass
                 try:
                     await page.goto(dest, wait_until="domcontentloaded", timeout=30000)
+                    # The loaded hub page states its own title/size/final
+                    # URL statically -- parse and share via cache (zero
+                    # extra network; works behind CF where plain HTTPS
+                    # fetches are challenged).
+                    try:
+                        from xdmovies.extractor import extract_hub_details as _ehd
+                        _html = await page.content()
+                        _hd = _ehd(_html or "")
+                        if _hd.title or _hd.final_url:
+                            note_hub_details(dest, _hd.final_url, _hd.title, _hd.size)
+                            if _hd.final_url and _hd.final_url != dest \
+                                    and _is_destination_url(_hd.final_url) \
+                                    and not _is_ad_url(_hd.final_url):
+                                print(f"[link_exec] hub page parse: {dest[:80]} -> {_hd.final_url[:80]}")
+                                return _hd.final_url
+                    except Exception:
+                        pass
                     for sel in ("a#download", "a.btn-download", "a.btn-primary",
                                 "button.btn-primary", "a[class*='download']"):
                         try:
