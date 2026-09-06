@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
