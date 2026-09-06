@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import traceback
+import types
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -143,7 +144,14 @@ except ImportError:  # pragma: no cover
     ParseMode = None  # type: ignore
 
 
-URL_RE = re.compile(r"https?://(?:top\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+", re.IGNORECASE)
+# Movie/series pages AND direct gate links. A pasted latestnews URL runs
+# as a single-card gate job: no movie-page fetch, no follow hop, straight
+# to the gate drive (saves a full browser + page load per link).
+URL_RE = re.compile(
+    r"https?://(?:top\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
+    r"|https?://latestnewsonline\.sbs/r/[A-Za-z0-9]+",
+    re.IGNORECASE,
+)
 
 # Per Telegram hard limit. We split at 4000 to leave room for the
 # "(...continued)" prefix.
@@ -312,6 +320,22 @@ def _masked_uid(user_id: int) -> str:
     """Privacy: `...4974` instead of a full Telegram user id."""
     s = str(user_id or "")
     return f"...{s[-4:]}" if len(s) > 4 else (s or "?")
+
+
+def _is_gate_url(url: str) -> bool:
+    """True for direct latestnewsonline.sbs gate links (single-movie jobs
+    and per-card routing). Host-based, so ad lookalikes can never match.
+    """
+    try:
+        from xdmovies.link_exec import GATE_HOST as _gh
+    except Exception:
+        _gh = "latestnewsonline.sbs"
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(url or "").hostname or "").lower()
+        return bool(h) and (h == _gh or h.endswith("." + _gh))
+    except Exception:
+        return False
 
 
 def _display_name(user) -> Tuple[str, str]:
@@ -567,7 +591,15 @@ class Bot:
         cards: List[Card] = []
         result = None
         try:
-            result = await _extract_with_diagnostics(  # type: ignore[misc]
+            if _is_gate_url(job.url):
+                # Direct gate link pasted in chat: single-card job. No
+                # movie page fetch (nothing to extract) and the per-card
+                # loop below skips the follow hop for gate hosts --
+                # straight to the drive.
+                cards = [Card(title="Gate link", file_name="Gate link", url=job.url)]
+                result = types.SimpleNamespace(page_title="Gate link", html_len=0, cards=cards)
+            else:
+                result = await _extract_with_diagnostics(  # type: ignore[misc]
                 job.url, session_id=session_id, headless=self.headless
             )
             cards = result.cards
@@ -616,7 +648,8 @@ class Bot:
                     job.finished_at = time.time()
                     return
             else:
-                await _send_safe(self._bot, job.chat_id, f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS 132.145.15.58:8080", parse_mode=ParseMode.HTML)
+                _vps = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
+                await _send_safe(self._bot, job.chat_id, f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS {_vps}", parse_mode=ParseMode.HTML)
                 job.status = "error"
                 job.error = f"cf_challenge:{host}"
                 job.finished_at = time.time()
@@ -740,9 +773,16 @@ class Bot:
             except Exception:
                 pass
             try:
-                url2, status2, page_text = await _follow_download_link(  # type: ignore[misc]
-                    card.url, session_id=shared_session, headless=self.headless
-                )
+                if _is_gate_url(card.url):
+                    # Already a gate link (incl. direct-paste jobs): the
+                    # follow hop would just reload this same page in
+                    # another browser. Skip straight to the gate drive.
+                    url2, status2, page_text = card.url, 200, ""
+                    _LOG.info("gate card, skipping follow hop: %s", card.url[:100])
+                else:
+                    url2, status2, page_text = await _follow_download_link(  # type: ignore[misc]
+                        card.url, session_id=shared_session, headless=self.headless
+                    )
                 if not url2:
                     err = "follow returned empty URL"
                 else:
@@ -887,12 +927,14 @@ class Bot:
         job.status = "done" if job.failed == 0 else "done_with_errors"
         job.finished_at = time.time()
         self.last_solve_ago = 0.0
-        # remember this post for keep-alive refresh (CF is on posts, not home)
-        try:
-            from xdmovies.keep_alive import remember_movie_url
-            remember_movie_url(job.url)
-        except Exception:
-            pass
+        # remember movie posts for keep-alive refresh (CF is on posts, not
+        # home). Gate-direct jobs have no post page -- nothing to remember.
+        if not _is_gate_url(job.url):
+            try:
+                from xdmovies.keep_alive import remember_movie_url
+                remember_movie_url(job.url)
+            except Exception:
+                pass
 
     async def _run_scrape_all(self, job: Job) -> None:
         from xdmovies.scrape_all import (
@@ -1890,7 +1932,8 @@ class Bot:
         if not m:
             await _send_safe(
                 context.bot, update.effective_chat.id,
-                "[FAIL] not an xdmovies URL. Send something like `https://top.xdmovies.wtf/movies/<slug>`",
+                "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
+                "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
                 parse_mode=ParseMode.HTML,
             )
             return

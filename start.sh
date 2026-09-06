@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# Boot xdmovies bot — VPS token solve-server (132.145.15.58:8080), no Docker.
+# Boot xdmovies bot — VPS token solve-server (VPS_IP:8080), no Docker.
 # Direct IP from VPS (no VPN layer — Cloudflare will fingerprint the
 # Oracle Cloud ASN; this is intentional per the v6 architecture).
 
 set -e
-VPS_IP="132.145.15.58"
+# VPS public IP: explicit env wins, else auto-detect, else fail loudly.
+# (No hardcoded default: a stale IP silently breaks solve links.)
+# Override per machine without editing: VPS_IP=1.2.3.4 bash start.sh
+VPS_IP="${VPS_IP:-}"
+if [ -z "$VPS_IP" ]; then
+    VPS_IP="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || wget -qO- --timeout=8 https://api.ipify.org 2>/dev/null || true)"
+fi
+if ! printf '%s' "$VPS_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "[start.sh] FATAL: cannot determine VPS_IP (set VPS_IP=1.2.3.4 env and re-run)." >&2
+    exit 1
+fi
 SOLVE_PORT="${SOLVE_SERVER_PORT:-8080}"
 export SOLVE_SERVER_HOST="${SOLVE_SERVER_HOST:-0.0.0.0}"
 export SOLVE_SERVER_PORT="$SOLVE_PORT"

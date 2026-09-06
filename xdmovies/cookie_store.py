@@ -408,7 +408,8 @@ def _age_human(seconds: float) -> str:
 def status_text() -> str:
     data = _load_raw()
     if not data:
-        return "No cf_clearance stored yet. Send a movie link — if CF on post blocks, I'll send a solve link http://132.145.15.58:8080/solve/... (tap checkbox) + auto keep-alive every 25m."
+        base = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
+        return f"No cf_clearance stored yet. Send a movie link — if CF on post blocks, I'll send a solve link {base}/solve/... (tap checkbox) + auto keep-alive every 25m."
     lines: List[str] = []
     now = time.time()
     for k, v in sorted(data.items()):

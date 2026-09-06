@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xdmovies bot — VPS deploy (VPS 132.145.15.58) — VPS token only, no Docker/Cantarebella
+# xdmovies bot — VPS deploy — VPS token only, no Docker/Cantarebella
 
 set -euo pipefail
 
@@ -7,11 +7,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="${REPO_DIR:-${SCRIPT_DIR}}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-${USER}}}"
 SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
-VPS_IP="132.145.15.58"
+# VPS public IP: explicit env wins, else auto-detect, else fail loudly.
+# (No hardcoded default anywhere: a stale IP silently breaks solve links.)
+# Override per machine without editing: VPS_IP=1.2.3.4 bash deploy.sh
+VPS_IP="${VPS_IP:-}"
 SOLVE_PORT="8080"
 
 log() { printf "\033[1;34m[deploy]\033[0m %s\n" "$*"; }
 err() { printf "\033[1;31m[err]\033[0m %s\n" "$*" >&2; }
+
+if [ -z "${VPS_IP:-}" ]; then
+    VPS_IP="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || wget -qO- --timeout=8 https://api.ipify.org 2>/dev/null || true)"
+fi
+if [ -z "${VPS_IP:-}" ] || [[ ! "$VPS_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    err "VPS_IP is empty/unresolvable and public-IP auto-detect failed."
+    err "Re-run as: VPS_IP=1.2.3.4 bash deploy.sh"
+    exit 1
+fi
 
 log "VPS: $VPS_IP  solve link: http://$VPS_IP:$SOLVE_PORT/solve/<token>"
 
@@ -195,7 +207,7 @@ rm -f "${REPO_DIR}/.xdmovies_bot.lock" 2>/dev/null || true
 
 sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
-Description=xdmovies Telegram bot — VPS token solve-server + CloakBrowser (132.145.15.58)
+Description=xdmovies Telegram bot — VPS token solve-server + CloakBrowser ($VPS_IP)
 After=network-online.target
 Wants=network-online.target
 
