@@ -1,6 +1,4 @@
-"""Stage 5: Drive the gate page (latestnewsonline.sbs) -- API fast path first
-(session -> rebind -> step-2 -> complete via in-page fetch), Generate /
-Continue / Go click flow as automatic fallback. MANUAL COOKIE MODE.
+"""Stage 5: Drive the gate page (latestnewsonline.sbs) through Generate/Continue/Go -- MANUAL COOKIE MODE.
 
 No auto CF solver, no Gemma, no Cantarebella sidecar.
 CF clearance is supplied by the user via /setcookie and injected from
@@ -33,14 +31,6 @@ INNER_TURNSTILE_NUDGE = os.environ.get("XDMOVIES_INNER_NUDGE", "1").lower() not 
 INNER_TURNSTILE_NUDGE_WAIT = float(os.environ.get("XDMOVIES_INNER_NUDGE_WAIT", "30") or "30")
 
 GATE_HOST = "latestnewsonline.sbs"
-
-# API fast path (default ON): walk the gate's own session machine
-# (session -> rebind -> step-2 -> reset-for-fresh-token -> complete) via
-# in-page fetch() instead of Generate/Continue/Go clicks. Proven live
-# (HUB-OK, ~40-55s vs 60-90s+ click flow). Any miss falls through to
-# the click flow untouched. Set XDMOVIES_GATE_API=0 to disable.
-GATE_API_FAST = os.environ.get("XDMOVIES_GATE_API", "1").lower() not in ("0", "false", "no")
-GATE_API_WAIT = float(os.environ.get("XDMOVIES_GATE_API_WAIT", "6.3") or "6.3")
 
 DEST_HOST_HINTS = (
     "hubcloud", "hubdrive", "gdflix", "gofile", "vcloud",
@@ -701,157 +691,6 @@ async def _wait_for_hubcloud_deep_link(page, max_wait: float = 30.0, ctx=None) -
     return await _extract_destination(page, ctx)
 
 # ---------------------------------------------------------------------------
-# API fast path: same server steps, zero clicks.
-# ---------------------------------------------------------------------------
-# Walks session -> rebind -> step-2 -> complete via in-page fetch() in the
-# already-open CloakBrowser page (cookies + CF clearance + a genuine
-# Turnstile all present). Skips Generate/Continue/Go clicks, reloads and
-# modal-close loops (~30-45s saved per link). Two server rules learned
-# live shape this code:
-#   1. complete enforces wall-clock timers -> 6.3s margins (GATE_API_WAIT).
-#   2. complete validates the Turnstile token's challenge_ts ("Please wait
-#      for the timer to complete" on an instant auto-pass token) -> reset
-#      the widget on the step-2 page and solve again so the token is
-#      minted late, like a real user's. Proven: 400,400 -> reset -> 200.
-# Returns the /go/ URL, or None on ANY miss (caller falls back to clicks).
-# Never raises.
-
-_API_SESSION_JS = r"""async (arg) => {
-  const t0 = Date.now();
-  const code = arg.code, waitMs = arg.waitMs || 6300;
-  const fp = Array.from({length: 32}, () =>
-    '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
-  const post = async (path, body) => {
-    const r = await fetch(path, {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)});
-    let j = {};
-    try { j = await r.json(); } catch (e) { j = {}; }
-    return {status: r.status, body: j};
-  };
-  try {
-    let s = await post('/api/session', {code: code, fingerprint: fp});
-    if (!s.body || s.body.error || !s.body.sessionId)
-      return {ok: false, stage: 'session',
-              detail: String((s.body && s.body.error) || ('http-' + s.status)).slice(0, 160)};
-    const sid1 = s.body.sessionId;
-    await new Promise((r) => setTimeout(r, waitMs));
-    s = await post('/api/session/rebind', {fingerprint: fp});
-    if (!s.body || s.body.error)
-      return {ok: false, stage: 'rebind',
-              detail: String((s.body && s.body.error) || ('http-' + s.status)).slice(0, 160)};
-    await new Promise((r) => setTimeout(r, waitMs));
-    return {ok: true, sessionId: s.body.sessionId || sid1, fp: fp,
-            ms: Date.now() - t0};
-  } catch (e) { return {ok: false, stage: 'exception', detail: String(e).slice(0, 160)}; }
-}"""
-
-_API_TOKEN_JS = r"""async (ms) => {
-  const t0 = Date.now();
-  const budget = ms || 20000;
-  let tok = '';
-  while (Date.now() - t0 < budget) {
-    try {
-      if (window.turnstile && window.turnstile.getResponse)
-        tok = window.turnstile.getResponse() || '';
-    } catch (e) {}
-    if (tok) break;
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return {token: tok, ms: Date.now() - t0};
-}"""
-
-_API_RESET_JS = r"""() => {
-  try {
-    if (window.turnstile && window.turnstile.reset) {
-      window.turnstile.reset();
-      try { window.turnstile.execute(); } catch (e) {}
-      return 'ok';
-    }
-  } catch (e) { return 'err:' + String(e).slice(0, 80); }
-  return 'no-widget';
-}"""
-
-_API_COMPLETE_JS = r"""async (arg) => {
-  try {
-    const r = await fetch('/api/session/complete', {method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({fingerprint: arg.fp, turnstileToken: arg.token})});
-    let j = {};
-    try { j = await r.json(); } catch (e) { j = {}; }
-    return {status: r.status, token: (j && j.token) || '',
-            error: (j && j.error) || ''};
-  } catch (e) { return {status: 0, token: '', error: String(e).slice(0, 160)}; }
-}"""
-
-
-async def _gate_via_api(page, ctx, short_link_url: str) -> Optional[str]:
-    try:
-        m = re.search(r"/r/([A-Za-z0-9]+)", short_link_url or "")
-        if not m:
-            return None
-        code = m.group(1)
-        base = (short_link_url.split("/r/")[0] or "").rstrip("/")
-        if not base:
-            return None
-        t0 = time.time()
-        r1 = await page.evaluate(_API_SESSION_JS,
-                                 {"code": code, "waitMs": int(GATE_API_WAIT * 1000)})
-        if not isinstance(r1, dict) or not r1.get("ok") or not r1.get("sessionId"):
-            print(f"[link_exec] api fast path: session phase missed "
-                  f"({(r1 or {}).get('stage')}:{(r1 or {}).get('detail')})")
-            return None
-        sid = str(r1["sessionId"])
-        fp = str(r1.get("fp") or "")
-        print(f"[link_exec] api fast path: session {sid[:8]}.. in "
-              f"{(r1.get('ms') or 0) / 1000:.1f}s")
-        # Step-2 page hosts the Turnstile widget; navigate directly (the
-        # manual ?step=2&sid= shape) instead of clicking Continue.
-        try:
-            await page.goto(f"{base}/r/{code}?step=2&sid={sid}",
-                            wait_until="domcontentloaded", timeout=45000)
-        except Exception as exc:
-            print(f"[link_exec] api fast path: step-2 nav failed: {exc!r}")
-            return None
-        try:
-            await page.wait_for_selector(".cf-turnstile", timeout=12000)
-        except Exception:
-            pass
-        r2 = await page.evaluate(_API_TOKEN_JS, 20000)
-        if not isinstance(r2, dict) or not r2.get("token"):
-            print("[link_exec] api fast path: no turnstile token (interactive?)")
-            return None
-        try:
-            print(f"[link_exec] api fast path: widget reset "
-                  f"({await page.evaluate(_API_RESET_JS)})")
-        except Exception:
-            pass
-        r3 = await page.evaluate(_API_TOKEN_JS, 25000)
-        fresh = (r3 or {}).get("token") or ""
-        if not fresh:
-            print("[link_exec] api fast path: no fresh token after reset")
-            return None
-        for attempt in range(3):
-            r4 = await page.evaluate(_API_COMPLETE_JS, {"fp": fp, "token": fresh})
-            r4 = r4 if isinstance(r4, dict) else {}
-            if r4.get("token"):
-                print(f"[link_exec] api fast path: complete 200 in "
-                      f"{time.time() - t0:.1f}s total")
-                return f"{base}/go/{sid}?t={r4['token']}"
-            err = str(r4.get("error") or "")
-            print(f"[link_exec] api fast path: complete try{attempt} "
-                  f"status={r4.get('status')} err={err[:80]!r}")
-            if "timer" in err.lower() and attempt < 2:
-                await asyncio.sleep(5.0)
-                continue
-            break
-        return None
-    except Exception as exc:
-        print(f"[link_exec] api fast path failed: {exc!r}")
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 
@@ -921,7 +760,7 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         # Wait for the gate UI to settle. After CF clears, the title
         # briefly says 'Loading <url>' while the socket.io connection
         # establishes and the Generate button becomes clickable.
-        deadline_settle = time.time() + (3.0 if GATE_API_FAST else 15.0)
+        deadline_settle = time.time() + 15.0
         while time.time() < deadline_settle:
             try:
                 t = (await page.title()) or ""
@@ -945,10 +784,8 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             pass
         await _close_ad_popups(ctx, page)
 
-        # Ad impression wait (skip if 0, or when the API fast path runs --
-        # it needs CF clearance, not rendered ads). After this, the gate
-        # is ready.
-        if ad_impression_wait > 0 and not GATE_API_FAST:
+        # Ad impression wait (skip if 0). After this, the gate is ready.
+        if ad_impression_wait > 0:
             print(f"[link_exec] waiting {ad_impression_wait}s for ad impressions...")
             await _wait_for_ad_impressions(page, max_wait=ad_impression_wait)
 
@@ -960,41 +797,6 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         if not on_gate:
             print(f"[link_exec] not on gate (DOM check); body[:200]={body[:200]!r}")
             return await _extract_destination(page, ctx)
-
-        # API fast path first: same server steps via in-page fetch (no
-        # clicks, reloads, modals). On ANY miss, fall through to the
-        # click flow below untouched.
-        if GATE_API_FAST:
-            try:
-                _go = await _gate_via_api(page, ctx, short_link_url)
-            except Exception as exc:
-                print(f"[link_exec] api fast path error: {exc!r}")
-                _go = None
-            if _go:
-                try:
-                    await page.goto(_go, wait_until="domcontentloaded", timeout=60000)
-                    await asyncio.sleep(6.0)
-                except Exception:
-                    pass
-                # Same-tab /go/ lands on the hub page: parse + share via
-                # cache, upgrade to the final URL, else deep-link wait.
-                try:
-                    from xdmovies.extractor import extract_hub_details as _ehd2
-                    _h2 = _ehd2(await page.content() or "")
-                    if _h2.title or _h2.final_url:
-                        try:
-                            note_hub_details(page.url or _go, _h2.final_url, _h2.title, _h2.size)
-                        except Exception:
-                            pass
-                        if _h2.final_url and _is_destination_url(_h2.final_url) \
-                                and not _is_ad_url(_h2.final_url):
-                            print(f"[link_exec] api fast path hub parse -> {_h2.final_url[:80]}")
-                            return _h2.final_url
-                except Exception:
-                    pass
-                return await _wait_for_hubcloud_deep_link(page, max_wait=final_wait, ctx=ctx) \
-                    or await _extract_destination(page, ctx)
-            print("[link_exec] api fast path missed; continuing with clicks")
 
         # STEP 1: click Generate. Counter starts at 6; we need >6s + ad
         # load. Loop with periodic popup-close + paused-notice refocus
