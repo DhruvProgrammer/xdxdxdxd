@@ -20,10 +20,11 @@ from typing import List, Tuple
 
 _LINK_XDMOVIES_RE = r"link\.xdmovies\.wtf/download/[A-Za-z0-9_\-]+"
 # Direct hub links printed straight on newer movie/series pages
-# (pack-card / episode-card anchors, e.g. hubcloud.one/drive/...).
+# (pack-card / episode-card anchors, e.g. hubcloud.one/drive/... or the
+# newer hubcloud.one/video/<id> download-item cards seen 2026-09-07).
 _DIRECT_HUB_RE = (
     r"(?:hubcloud|hubdrive|gdflix|gofile|vcloud|fdrive)\.[a-zA-Z.]+"
-    r"/(?:drive|file|d)/[A-Za-z0-9_\-]+"
+    r"/(?:drive|file|d|video)/[A-Za-z0-9_\-]+"
 )
 _GDRIVE_RE = r"drive\.google\.com/[A-Za-z0-9_/\-]+"
 _HREF_URL_RE = r"https?://(?:" + _LINK_XDMOVIES_RE + r"|" + _DIRECT_HUB_RE + r"|" + _GDRIVE_RE + r")"

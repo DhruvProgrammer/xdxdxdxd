@@ -517,6 +517,15 @@ _SCRAPECHAN_PENDING: Dict[int, float] = {}
 _SCRAPECHAN_PENDING_TTL = 600.0
 
 
+# /search pick cache: user_id -> (timestamp, query, [SearchResult]).
+# Entries expire after 5 minutes. In-memory only; a restart drops pending
+# picks (user just re-sends /search).
+_SEARCH_CACHE: Dict[int, Tuple[float, str, list]] = {}
+_SEARCH_CACHE_TTL = 300.0
+_SEARCH_FETCH_LIMIT = 30
+_SEARCH_PAGE_SIZE = 5
+
+
 def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
     """(channel_id, title) from a message forwarded out of a channel.
 
@@ -546,6 +555,48 @@ def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
     except Exception:
         pass
     return None, ""
+
+
+# --------------------------------------------------------------------------
+# Search pagination helpers (module-level; used by _cmd_search/_on_search_pick)
+# --------------------------------------------------------------------------
+
+def _search_page_keyboard(results, page: int):
+    """(page, total_pages, InlineKeyboardMarkup) for one 5-per-page slice.
+    Page is 1-based and clamped. Module-level (must stay outside class Bot)."""
+    total_pages = max(1, (len(results) + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * _SEARCH_PAGE_SIZE
+    rows = []
+    for idx in range(start, min(start + _SEARCH_PAGE_SIZE, len(results))):
+        res = results[idx]
+        icon = "🎬" if res.kind == "movie" else "📺"
+        label = f"{icon} {res.title}"
+        if res.year:
+            label += f" ({res.year})"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"search:pick:{idx}")])  # type: ignore[misc]
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"search:page:{page - 1}"))  # type: ignore[misc]
+    nav.append(InlineKeyboardButton("❌ Close", callback_data="search:close"))  # type: ignore[misc]
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"search:page:{page + 1}"))  # type: ignore[misc]
+    rows.append(nav)
+    return page, total_pages, InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+
+def _search_page_text(query: str, results, page: int, total_pages: int) -> str:
+    n_series = sum(1 for r in results if getattr(r, "kind", "") == "series")
+    n_movies = len(results) - n_series
+    text = (f"🔎search query:{_html_escape(query)}\n"
+            f"📺Series:{n_series}\n"
+            f"🎥Movies:{n_movies}\n"
+            f"\n📑current page:{page}")
+    if total_pages > 1:
+        text += f"/{total_pages}"
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -1393,6 +1444,23 @@ class Bot:
         except Exception:
             _LOG.exception("error reply failed")
 
+    async def _drop_enqueue_note(self, job: Job) -> None:
+        """Delete a job's "Queued position #N" / "Starting now" note.
+
+        Called when the job starts running (the progress message takes
+        over), so the chat never shows a stale position. Idempotent and
+        never raises; also clears the id so terminate-time cleanup skips it.
+        """
+        try:
+            if job.enqueue_msg_id and self._bot is not None:
+                try:
+                    await _drop_msg(self._bot, job.chat_id, job.enqueue_msg_id)
+                except Exception:
+                    pass
+                job.enqueue_msg_id = None
+        except Exception:
+            pass
+
     # ---- dispatcher ------------------------------------------------------
     async def _dispatcher(self) -> None:
         _LOG.info("dispatcher started")
@@ -1404,6 +1472,12 @@ class Bot:
                     "starting job user=%d url=%s queue_depth=%d",
                     job.user_id, job.url, self._queue_depth(),
                 )
+                # Clean chat: the "Queued position #N" / "Starting now"
+                # note served its purpose once the job actually starts --
+                # the progress message takes over from here. Drop it now
+                # (not at terminate) so waiting users don't stare at a
+                # stale position. Never breaks the job if delete fails.
+                await self._drop_enqueue_note(job)
                 try:
                     await self._run_for_user(job)
                 except asyncio.CancelledError:
@@ -1467,6 +1541,7 @@ class Bot:
             "Send me an xdmovies URL and I'll resolve every download link on it all the way "
             "to its final destination (HubCloud / GDrive / Gofile / etc.).\n\n"
             "/start -- show this help\n"
+            "/search -- find a movie/series, tap to scrape (e.g. /search lucky baskhar)\n"
             "/status -- bot health + keep-alive\n"
             "/queue -- show who's waiting\n"
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
@@ -2076,6 +2151,126 @@ class Bot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _cmd_search(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        uid = update.effective_user.id
+        if not bot_config.is_allowed(uid, self.cfg):
+            return  # silent ignore
+        query = " ".join(context.args or []).strip()
+        if not query:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "Usage: <code>/search lucky baskhar</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            from xdmovies.search import SearchUnavailable, search_titles
+            results = await search_titles(query, limit=_SEARCH_FETCH_LIMIT)
+        except Exception as exc:
+            _LOG.warning("search failed for %r: %r", query, exc)
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "[FAIL] search is unavailable right now -- try again later.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not results:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                f"No matches for <code>{_html_escape(query)}</code>. "
+                "Try the TMDB ID from themoviedb.org.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _SEARCH_CACHE[uid] = (time.time(), query, results)
+        page, total_pages, keyboard = _search_page_keyboard(results, 1)
+        await update.message.reply_text(
+            _search_page_text(query, results, page, total_pages),
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _on_search_pick(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        uid = query.from_user.id
+        data = query.data or ""
+        parts = data.split(":")
+        if parts[:2] == ["search", "close"]:
+            # ❌ Close: remove the whole results list, drop the cache.
+            _SEARCH_CACHE.pop(uid, None)
+            if query.message is not None:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            return
+        if len(parts) != 3 or parts[0] != "search" or parts[1] not in ("pick", "page"):
+            return
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            return
+        entry = _SEARCH_CACHE.get(uid)
+        if entry is None or time.time() - entry[0] > _SEARCH_CACHE_TTL:
+            _SEARCH_CACHE.pop(uid, None)
+            if query.message is not None:
+                try:
+                    await query.edit_message_text("⌛ Search expired -- send /search again.")
+                except Exception:
+                    pass
+            return
+        _ts, cached_query, results = entry
+        if parts[1] == "page":
+            page, total_pages, keyboard = _search_page_keyboard(results, idx)
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        _search_page_text(cached_query, results, page, total_pages),
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            return
+        if idx < 0 or idx >= len(results):
+            return
+        picked = results[idx]
+        # Same busy rule as pasted URLs: one job per user at a time.
+        _q_snapshot = await self._snapshot_queue()
+        queued = sum(1 for j in _q_snapshot if j.user_id == uid)
+        running = self.current is not None and self.current.user_id == uid
+        if running or queued > 0:
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        "⏳ busy on your previous job -- wait for the result, then tap again (or /search again).")
+                except Exception:
+                    pass
+            return
+        _nm, _un = _display_name(update.effective_user)
+        job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
+                  user_name=_nm, username=_un)
+        pos = await self._enqueue(job)
+        _SEARCH_CACHE.pop(uid, None)
+        # Clean chat: delete the results list now that a pick was made.
+        # The confirm note below still shows what was queued. Delete may
+        # fail (message too old, rights); never let that break the pick.
+        if query.message is not None:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, picked.url, pos)
+
     async def _on_text(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
@@ -2163,6 +2358,7 @@ class Bot:
             from telegram import BotCommand
             await application.bot.set_my_commands([
                 BotCommand("start", "show welcome card"),
+                BotCommand("search", "find a movie/series, tap to scrape"),
                 BotCommand("status", "show bot health"),
                 BotCommand("queue", "show running + queued jobs"),
                 BotCommand("cancel", "stop my running/queued job(s)"),
@@ -2251,6 +2447,11 @@ class Bot:
         app.add_handler(CommandHandler("restart", self._cmd_restart))
         app.add_handler(CommandHandler("scrapeall", self._cmd_scrapeall))
         app.add_handler(CommandHandler("scrapeallchannel", self._cmd_scrapeallchannel))
+        app.add_handler(CommandHandler("search", self._cmd_search))
+        app.add_handler(CallbackQueryHandler(
+            self._on_search_pick,
+            pattern=r"^search:(pick|page):\d+$|^search:close$",
+        ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
             pattern=r"^scrapeall:(select|resume|start):(all|movies|series)$|^scrapeall:cancel:-$",

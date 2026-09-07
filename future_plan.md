@@ -236,3 +236,132 @@ The rollback restores the exact pre-change behavior. No data is lost; no other s
 - **README updates** describing the VPS deploy. Excluded — user said "Just the VPS Cloudflare fix."
 - **Healthcheck** on the fortress container. Excluded.
 - **Persistent browser profile volume** for Fortress. Included as a `volumes:` entry, but the profile is optional (cookie reuse across container restarts is a nice-to-have, not a correctness requirement).
+
+---
+
+# ACTIVE PLAN — Public Colab Solve API (added 2026-09-07; supersedes archived content above)
+
+> **Status:** planned, not yet built. Everything above this line is `[ARCHIVED]`
+> v2/v3-era material (Fortress sidecar, SquidProxy, `deploy/cantarella`) and
+> does not describe the current stack (CloakBrowser + systemd + no VPN).
+> **Date drafted:** 2026-09-07
+> **Scope (locked in by user):** public bypass API for Google Colab users.
+> Anyone pastes ~5 lines into Colab; the VPS does the 60-90s browser work;
+> Colab polls; the direct link is returned as JSON.
+
+## 1. Goal
+
+A shared HTTP endpoint on the VPS (`132.145.15.58`) that accepts a
+gate/movie URL and returns the final direct link, so individuals can solve
+from Google Colab (or curl) without running any browser code themselves.
+The Telegram bot keeps working directly and untouched; the API imports the
+same flow code but runs as a separate service so traffic spikes never stall
+the Telegram queue.
+
+## 2. Architecture
+
+```
+colab / curl ──HTTPS──▶ Caddy (auto-TLS) ──▶ bypass-api:8090 ──▶ job queue ──▶ browser pool
+                                                                          (CloakBrowser, persistent,
+                                                                           cap 2 concurrent)
+                                                     │── API keys + quotas (anonymous + keyed tiers)
+                                                     │── SSRF host allowlist
+                                                     └── reuses link_exec / extractor /
+                                                         cookie_store / hub cache
+```
+
+- **Async jobs, not sync requests.** `POST /api/v1/bypass {"url": ...}` →
+  `{"job_id": ..., "position": N}` in ~1s;
+  `GET /api/v1/result/<job_id>` polls `pending | working | done | error`.
+  Colab cells and plain HTTP clients cannot hold 90s connections reliably.
+- **Persistent browser pool.** One CloakBrowser process, one context per
+  job, cap 2 concurrent (RAM is the ceiling). Saves the ~3-5s launch cost
+  per request vs the bot's launch-per-link pattern.
+- **Reuse, don't rewrite.** Workers call the existing tested flow
+  (`execute_button_flow`, hub parse/cache). Every bot fix benefits the API.
+
+## 3. API contract (v1)
+
+- `POST /api/v1/bypass` — `{"url": "..."}` (+ `Authorization: Bearer <key>`
+  for the keyed tier) → `{"job_id": "...", "position": 0}`
+- `GET /api/v1/result/<job_id>` →
+  `pending | working | done | error` plus
+  `final_url / title / size / elapsed_s` or typed `error`
+  (`unsupported_host`, `cf_challenged_retry_later`, `timeout`,
+  `no_destination`, `rate_limited_reset_after`, `queued_behind_N`)
+- `GET /healthz`, `GET /queue` (key-gated; shows load)
+- JSON-only, CORS open (`*`), snippet prints queue position + ETA so
+  polling never looks hung.
+
+## 4. Access tiers
+
+- **Anonymous:** strict per-IP limits (start ~3 solves/day, 1 concurrent) —
+  enough to try, useless to abuse at scale. Keys can't stay secret in
+  public notebooks, so anonymous abuse control is rate-based, not auth-based.
+- **Keyed (free, DM'd):** higher quota (start ~50/day). Per-user keys so one
+  abuser loses one key, not the service.
+
+## 5. Security (non-negotiable for public use)
+
+1. **SSRF allowlist.** Only gate/movie/hub hosts accepted
+   (`latestnewsonline.sbs`, `top.xdmovies.wtf` / `xdmovies.wtf`, `hubcloud`,
+   `hubdrive`, `gamerxyt`, `gdflix`, …). Everything else (including cloud
+   metadata `169.254.169.254` and internal ranges) → `unsupported_host`.
+2. **Limits:** per-IP + per-key rate windows, max 2 concurrent solves
+   VPS-wide, queue depth cap with `busy_retry_later`, 3-minute per-job kill.
+3. **IP-reputation guard:** every public solve burns the VPS IP's standing
+   with Cloudflare/hub hosts. Monitor solve success rate; auto-throttle the
+   anonymous tier on dips. One env kill-switch (`BYPASS_PUBLIC=0`) drops to
+   keyed-only instantly.
+4. **Logging:** hashed IPs (not raw), response tokens redacted like the bot
+   token is today.
+
+## 6. Deployment
+
+- Same VPS, new unit `bypass-api.service`, `aiohttp` (matches
+  `solve_server.py`, no new deps), port `8090` on localhost only; **Caddy**
+  in front for automatic HTTPS. Requires a domain/subdomain — raw-IP HTTPS
+  won't validate, and public Colab users need a trustworthy URL.
+- Secrets in the `.env` pattern: `BYPASS_API_KEYS`, `BYPASS_MAX_CONCURRENT`,
+  quotas. Coexists with `xdmovies-bot` (different port, shared imports).
+
+## 7. Throughput reality (read before promising anything)
+
+2 concurrent x ~75s per solve = **under ~100 solves/hour total**. Fine for
+individuals, not for a crowd — quotas must reflect that. A wave of
+anonymous users also increases Cloudflare friction for the owner's own bot;
+that is what the auto-throttle + kill-switch are for.
+
+## 8. Build phases
+
+1. **Core service** — aiohttp app: auth, job queue, worker, result store.
+   Mock-test locally with fixtures **including an evil-URL refusal suite**
+   (metadata IP, internal hosts, non-gate domains — all must refuse).
+2. **Colab snippet + docs** — copy-paste `requests` submit/poll snippet;
+   deploy unit + Caddy; live curl test + real Colab notebook test.
+3. **Watch a week** — success-rate / queue-depth metrics; tune quotas or
+   throttle. Decision rule: API healthy + escalation-solve ~0 → token
+   system removable; escalations solve → keep.
+
+## 9. Open items (need owner input)
+
+- Domain/subdomain for HTTPS (required for public trust).
+- Anonymous quota comfort: open-but-tiny (~3/day) to start, or keyed-only
+  at launch with anonymous added later?
+- Bot calls API internally (single path) vs stays direct (recommended v1:
+  stays direct — fewer moving parts in the working system).
+
+## 10. Parked findings (measured 2026-09-07, do not re-learn)
+
+- `_gate_via_api` recipe (in-page session/rebind/complete + widget reset
+  for a late-minted Turnstile token): **HUB-OK 47.3s local** vs click flow
+  73.1s-to-failure on the same gate code. Reverted (`eb8820b`) after VPS
+  showed +~60s additive cost on miss (datacenter Turnstile demands
+  interaction; polls burn 20s+25s before fallback). Retry with tight poll
+  budgets or VPS-side disable; prototype at
+  `Temp/opencode/proto_api_fastpath.py` (outside repo).
+- Gate `challenge_ts` rule: instant auto-pass tokens get
+  `400 "Please wait for the timer to complete"`; token must be minted late.
+- Gate codes are reusable for session creation; JWT is IP-locked, ~1h TTL.
+- Token-system waits (bot.py: 120s movie / 240s gate / 240s fallback):
+  decision deferred pending VPS escalation-fire metrics (measure-first).
