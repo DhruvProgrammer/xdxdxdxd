@@ -365,3 +365,61 @@ that is what the auto-throttle + kill-switch are for.
 - Gate codes are reusable for session creation; JWT is IP-locked, ~1h TTL.
 - Token-system waits (bot.py: 120s movie / 240s gate / 240s fallback):
   decision deferred pending VPS escalation-fire metrics (measure-first).
+
+## 11. Parked — wpformat-bot (formatter bot, deferred, added 2026-09-08)
+
+> **Status:** planned, not built. Owner deferred on 2026-09-08 ("for now
+> i am not doing it"). No code, no token, no deploy until re-activated.
+
+### Goal
+
+A second Telegram bot that removes all retyping between the xdmovies bot
+and the WordPress movie site. Owner forwards a Bot-1 resolve message;
+Bot-2 replies with paste-ready text for the movie post's Download Links
+meta box. **Bot-1 is frozen** — it is never modified for this project
+(rendered-text parsing with pinned fixtures instead).
+
+### Output spec (locked)
+
+Movie-post Download Links grammar, one per line (per the meta-box
+placeholder `4K ULTRA|https://example.com/movie-4k.mp4|2.1 GB`):
+
+```text
+🎬 The Assessment (2025)
+TMDB: 1317088
+
+720p BluRay|https://gamerxyt…|916.78 MB
+1080p BluRay|https://gamerxyt…|2.91 GB
+```
+
+- Quality labels condensed from filenames to the box's style
+  (`1080p BluRay`, `2160p WEB-DL`, `4K ULTRA` …). Codec/audio detail
+  (`x265`, `DDP 5.1`) stays out. Exact condensation mapping awaiting
+  owner's taste check.
+- URL is always the final resolved URL (gamerxyt/hub), never a gate or
+  movie-page link. Missing size → line still emitted with blank size +
+  `⚠️` note, never silently dropped.
+- Header block (clean `Name (Year)` + TMDB ID when known) feeds the
+  existing TMDB importer step.
+- **Franited Links is explicitly out** — dropped from the chain by owner
+  on 2026-09-08. No shorten step; paste goes straight to the post.
+
+### Architecture (when built)
+
+- Separate repo `wpformat-bot/` (`wpbot/bot.py`, `wpbot/formatter.py`,
+  `requirements.txt` with `python-telegram-bot>=21,<22`), separate token,
+  separate systemd unit (`wpformat-bot.service`), same VPS. Polling only
+  (no ports). Zero shared code/state with the xdmovies bot.
+- Owner-only allow-list, strangers silently ignored (same pattern).
+- Parser: pure functions + `SAMPLES.md` fixtures from real forwarded
+  messages; unparseable lines quoted back under `⚠️ review manually`.
+- No site access, no credentials, no writes — worst-case failure is a
+  bad reply, never a corrupted post.
+
+### Still needed to build
+
+1. 2–3 real forwarded Bot-1 resolve messages (parser fixtures).
+2. Quality-label taste answer (short vs fuller labels).
+3. Second bot token from BotFather + VPS deploy approval.
+4. (Later, optional) TMDB API clean-name resolution; direct WP posting
+   only after further study — out of v1 scope.

@@ -66,13 +66,17 @@ async def _is_cf_challenge_page(page) -> bool:
 
 
 async def _try_auto_nudge(page, ctx, url: str) -> bool:
-    """One auto-bypass attempt on a challenged movie page.
+    """Auto-bypass attempts on a challenged movie page.
 
     Mirrors the proven solve_server._auto_nudge: give CF a chance to
-    auto-verify, else click the Turnstile checkbox once, then re-check.
+    auto-verify, else click the Turnstile checkbox, then re-check.
+    Backup layers (added 2026-09-08): a missed first click no longer
+    goes straight to the human solve-link -- up to 3 clicks re-scanning
+    frames each time (widgets often render late; multiple frames may
+    exist), then one page reload + fresh cycle as a last resort.
     On a fresh solve, saves the NEW cf_clearance (IP+UA bound to this
     browser) so next runs and keep-alive reuse it. Returns True when the
-    challenge is gone. Never raises; worst case costs ~20s on a page
+    challenge is gone. Never raises; worst case costs ~35s on a page
     that stays blocked (caller then raises CFChallengeError as before).
     """
     try:
@@ -108,34 +112,42 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
         except Exception:
             return False
 
-    try:
-        for _ in range(8):
-            if await clear():
-                return True
-            await asyncio.sleep(1.0)
-        if await fresh_cookie():
-            return await clear()
+    # Backup-nudge click points, rotated per attempt (a click that
+    # lands beside the checkbox is the classic single-shot miss).
+    _NUDGE_POINTS = ((30, 32), (18, 32), (42, 32))
+
+    async def _click_turnstile_frame(attempt: int):
+        """Click one Turnstile frame, rotating frames AND points per
+        attempt. Re-scans frames every call (widgets often render after
+        the first scan). Returns (clicked, frames_found): a failed click
+        still counts as frames_found (retry the next frame), only an
+        empty scan aborts the retry loop."""
         try:
+            frames = []
             for fr in page.frames:
                 try:
                     u = (fr.url or "").lower()
                 except Exception:
                     continue
                 if "challenges.cloudflare.com" in u and "turnstile" in u:
-                    try:
-                        await fr.click("body", position={"x": 30, "y": 32}, delay=80, timeout=5000)
-                    except Exception:
-                        pass
-                    break
+                    frames.append(fr)
         except Exception:
-            pass
-        for _ in range(8):
-            if await clear():
-                break
-            await asyncio.sleep(1.0)
-        if not await clear():
-            return False
-        val = await fresh_cookie()
+            return False, False
+        if not frames:
+            return False, False
+        fr = frames[attempt % len(frames)]
+        x, y = _NUDGE_POINTS[attempt % len(_NUDGE_POINTS)]
+        try:
+            await fr.click("body", position={"x": x, "y": y}, delay=80, timeout=5000)
+            return True, True
+        except Exception:
+            return False, True
+
+    async def _save_cookie() -> None:
+        try:
+            val = await fresh_cookie()
+        except Exception:
+            return
         if val and set_cookies_for_domain is not None:
             try:
                 ua = await page.evaluate("navigator.userAgent")
@@ -145,6 +157,55 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
                 set_cookies_for_domain(_normalize_domain(url), f"cf_clearance={val}", user_agent=ua)
             except Exception:
                 pass
+
+    try:
+        for _ in range(8):
+            if await clear():
+                return True
+            await asyncio.sleep(1.0)
+        if await fresh_cookie():
+            if await clear():
+                await _save_cookie()
+                return True
+        # Backup nudges: up to 3 clicks, re-scanning frames each time,
+        # short-circuiting the moment CF verifies or a fresh cookie lands.
+        # Only an empty frame scan aborts early; a failed click retries
+        # the next frame.
+        for attempt in range(3):
+            _clicked, _found = await _click_turnstile_frame(attempt)
+            for _ in range(4):
+                if await clear():
+                    break
+                if await fresh_cookie():
+                    break
+                await asyncio.sleep(1.0)
+            if await clear():
+                await _save_cookie()
+                return True
+            if not _found:
+                break  # no widget rendered; further clicks pointless
+        # Last resort: one reload + fresh cycle. A re-rendered challenge
+        # is frequently solvable when the first render was not.
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            return False
+        for _ in range(6):
+            if await clear():
+                break
+            await asyncio.sleep(1.0)
+        if await fresh_cookie():
+            if await clear():
+                await _save_cookie()
+                return True
+        await _click_turnstile_frame(0)
+        for _ in range(6):
+            if await clear():
+                break
+            await asyncio.sleep(1.0)
+        if not await clear():
+            return False
+        await _save_cookie()
         return True
     except Exception:
         return False
@@ -206,9 +267,10 @@ async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> 
         html = await page.content()
         if is_chal:
             # Auto-nudge first: CF often auto-verifies within seconds and
-            # an interactive widget can still be coaxed with one checkbox
-            # click (same pattern as the gate flow). Only a page that
-            # survives the nudge raises CFChallengeError as before.
+            # an interactive widget can still be coaxed with checkbox
+            # clicks (up to 3 rotating attempts + one reload cycle inside
+            # _try_auto_nudge). Only a page that survives all of that
+            # raises CFChallengeError as before.
             try:
                 if await _try_auto_nudge(page, ctx, url):
                     html = await page.content()

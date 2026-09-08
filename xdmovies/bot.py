@@ -525,6 +525,11 @@ _SEARCH_CACHE_TTL = 300.0
 _SEARCH_FETCH_LIMIT = 30
 _SEARCH_PAGE_SIZE = 5
 
+# .txt batch search: max titles read per file (mirrors the per-message
+# link cap). Oversize files are rejected before download.
+_TXT_MAX_LINES = 10
+_TXT_MAX_BYTES = 65536
+
 
 def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
     """(channel_id, title) from a message forwarded out of a channel.
@@ -561,6 +566,9 @@ def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
 # Search pagination helpers (module-level; used by _cmd_search/_on_search_pick)
 # --------------------------------------------------------------------------
 
+# (no cap on accept-all per owner: unlimited, deduped; the single
+# worker resolves serially so this only affects queue length)
+
 def _search_page_keyboard(results, page: int):
     """(page, total_pages, InlineKeyboardMarkup) for one 5-per-page slice.
     Page is 1-based and clamped. Module-level (must stay outside class Bot)."""
@@ -578,6 +586,12 @@ def _search_page_keyboard(results, page: int):
             label = label[:57] + "..."
         rows.append([InlineKeyboardButton(label, callback_data=f"search:pick:{idx}")])  # type: ignore[misc]
     nav = []
+    if len(results) > 1:
+        # Bulk row above the nav: enqueue everything (capped). Only
+        # shown when there is actually a choice to bulk-accept.
+        nav.append(InlineKeyboardButton("✅ Accept all", callback_data="search:acceptall"))  # type: ignore[misc]
+        rows.append(nav)
+        nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"search:page:{page - 1}"))  # type: ignore[misc]
     nav.append(InlineKeyboardButton("❌ Close", callback_data="search:close"))  # type: ignore[misc]
@@ -1542,6 +1556,7 @@ class Bot:
             "to its final destination (HubCloud / GDrive / Gofile / etc.).\n\n"
             "/start -- show this help\n"
             "/search -- find a movie/series, tap to scrape (e.g. /search lucky baskhar)\n"
+            "Tip: send a .txt file (one title per line) to search them all at once\n"
             "/status -- bot health + keep-alive\n"
             "/queue -- show who's waiting\n"
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
@@ -2179,8 +2194,7 @@ class Bot:
         if not results:
             await _send_safe(
                 context.bot, update.effective_chat.id,
-                f"No matches for <code>{_html_escape(query)}</code>. "
-                "Try the TMDB ID from themoviedb.org.",
+                f"Not found: <code>{_html_escape(query)}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2212,6 +2226,60 @@ class Bot:
                     await query.message.delete()
                 except Exception:
                     pass
+            return
+        if parts[:2] == ["search", "acceptall"]:
+            # ✅ Accept all: enqueue every result (deduped, capped) as
+            # individual jobs, same as pasting the links. List is deleted
+            # for a clean chat; one summary message replaces it.
+            entry_all = _SEARCH_CACHE.get(uid)
+            if entry_all is None or time.time() - entry_all[0] > _SEARCH_CACHE_TTL:
+                _SEARCH_CACHE.pop(uid, None)
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text("⌛ Search expired -- send /search again.")
+                    except Exception:
+                        pass
+                return
+            _results_all = entry_all[2]
+            _q_snapshot = await self._snapshot_queue()
+            _queued = sum(1 for j in _q_snapshot if j.user_id == uid)
+            _running = self.current is not None and self.current.user_id == uid
+            if _running or _queued > 0:
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text(
+                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
+                    except Exception:
+                        pass
+                return
+            seen_urls: set = set()
+            jobs = []
+            for res in _results_all:
+                # No cap: the owner explicitly wants unlimited accept-all.
+                # Dupes still skipped; the single worker resolves serially.
+                if res.url in seen_urls:
+                    continue
+                seen_urls.add(res.url)
+                _nm, _un = _display_name(update.effective_user)
+                job = Job(user_id=uid, chat_id=update.effective_chat.id, url=res.url,
+                          user_name=_nm, username=_un)
+                await self._enqueue(job)
+                jobs.append(job)
+            _SEARCH_CACHE.pop(uid, None)
+            if query.message is not None:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            skipped = len(_results_all) - len(jobs)
+            lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
+            for idx, job in enumerate(jobs, 1):
+                icon, title = _pretty_title(job.url)
+                lines.append(f"{idx}. {icon} {title}")
+            if skipped > 0:
+                lines.append(f"⚠️ +{skipped} duplicates skipped.")
+            await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
+                             parse_mode=ParseMode.HTML)
             return
         if len(parts) != 3 or parts[0] != "search" or parts[1] not in ("pick", "page"):
             return
@@ -2270,6 +2338,121 @@ class Bot:
             except Exception:
                 pass
         job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, picked.url, pos)
+
+    async def _on_document(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """Handle an uploaded .txt file: one movie/series title per line.
+
+        Searches every title and replies with ONE merged paginated
+        pick-list (same buttons/cache/pick flow as /search). Skips blanks,
+        caps lines at _TXT_MAX_LINES. Not a command, so the menu is
+        untouched; access control identical to /search (silent ignore).
+        """
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        uid = update.effective_user.id
+        if not bot_config.is_allowed(uid, self.cfg):
+            return  # silent ignore
+        doc = getattr(update.message, "document", None)
+        file_name = str(getattr(doc, "file_name", "") or "")
+        if doc is None or not file_name.lower().endswith(".txt"):
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "Send a <code>.txt</code> file with one movie/series title per line.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            if int(getattr(doc, "file_size", 0) or 0) > _TXT_MAX_BYTES:
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    "[FAIL] .txt too big (max 64KB). Split it and resend.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            tg_file = await context.bot.get_file(doc.file_id)
+            raw = await tg_file.download_as_bytearray()
+        except Exception as exc:
+            _LOG.warning("txt download failed: %r", exc)
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "[FAIL] could not read that file -- try again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            text = bytes(raw).decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        titles = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                titles.append(line)
+        dropped = max(0, len(titles) - _TXT_MAX_LINES)
+        titles = titles[:_TXT_MAX_LINES]
+        if not titles:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "Empty file -- put one movie/series title per line, e.g.\n"
+                "<code>Lucky Baskhar\nThe Assessment</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            from xdmovies.search import search_titles
+        except Exception as exc:
+            _LOG.warning("search import failed: %r", exc)
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "[FAIL] search is unavailable right now -- try again later.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        flat = []
+        no_match = []
+        try:
+            for title in titles:
+                try:
+                    found = await search_titles(title, limit=5)
+                except Exception as exc:
+                    raise exc
+                if found:
+                    flat.extend(found)
+                else:
+                    no_match.append(title)
+        except Exception as exc:
+            _LOG.warning("txt batch search failed: %r", exc)
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "[FAIL] search is unavailable right now -- try again later.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not flat:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "Not found.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        label = f"📄 {file_name} ({len(titles)} titles)"
+        _SEARCH_CACHE[uid] = (time.time(), label, flat)
+        page, total_pages, keyboard = _search_page_keyboard(flat, 1)
+        msg_text = _search_page_text(label, flat, page, total_pages)
+        # NOTE: suffix lines below show only on page 1 (page turns
+        # re-render via _search_page_text). Accepted: keeps nav simple.
+        suffix = ""
+        if no_match:
+            shown = ", ".join(no_match[:5])
+            more = f" +{len(no_match) - 5} more" if len(no_match) > 5 else ""
+            suffix += f"\n❌ Not found: {shown}{more}"
+        if dropped:
+            suffix += f"\n⚠️ +{dropped} lines ignored (max {_TXT_MAX_LINES})."
+        await update.message.reply_text(
+            msg_text + suffix,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
 
     async def _on_text(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -2450,7 +2633,7 @@ class Bot:
         app.add_handler(CommandHandler("search", self._cmd_search))
         app.add_handler(CallbackQueryHandler(
             self._on_search_pick,
-            pattern=r"^search:(pick|page):\d+$|^search:close$",
+            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
@@ -2460,6 +2643,7 @@ class Bot:
             self._on_scrapechan_choice,
             pattern=r"^scrapechan:(select|resume|start):(all|movies|series)$|^scrapechan:cancel:-$",
         ))
+        app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         return app
 
