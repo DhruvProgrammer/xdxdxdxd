@@ -450,7 +450,7 @@ async def _finalize_gate_card(card, dest: str, result) -> str:
     return dest
 
 
-MAX_LINKS_PER_MESSAGE = 10
+MAX_LINKS_PER_MESSAGE = 10000
 
 
 def _extract_links(text: str, limit: int = MAX_LINKS_PER_MESSAGE) -> Tuple[List[str], int]:
@@ -518,16 +518,20 @@ _SCRAPECHAN_PENDING_TTL = 600.0
 
 
 # /search pick cache: user_id -> (timestamp, query, [SearchResult]).
-# Entries expire after 5 minutes. In-memory only; a restart drops pending
-# picks (user just re-sends /search).
+# Entries expire after 20 minutes -- must comfortably exceed the
+# 15-minute channel-confirm window or late Yes taps would find the
+# cache gone. In-memory only; a restart drops pending picks (user just
+# re-sends /search).
 _SEARCH_CACHE: Dict[int, Tuple[float, str, list]] = {}
-_SEARCH_CACHE_TTL = 300.0
+_SEARCH_CACHE_TTL = 1200.0
 _SEARCH_FETCH_LIMIT = 30
 _SEARCH_PAGE_SIZE = 5
 
-# .txt batch search: max titles read per file (mirrors the per-message
-# link cap). Oversize files are rejected before download.
-_TXT_MAX_LINES = 10
+# .txt batch search: max titles read per file. Each title costs a live
+# search (~1s), so an 800-line file means ~15 min before the list
+# appears -- raise via XDMOVIES_TXT_MAX_LINES if you accept the wait.
+# Oversize files are rejected before download.
+_TXT_MAX_LINES = int(os.environ.get("XDMOVIES_TXT_MAX_LINES", "10000") or "10000")
 _TXT_MAX_BYTES = 65536
 
 
@@ -569,6 +573,19 @@ def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
 # (no cap on accept-all per owner: unlimited, deduped; the single
 # worker resolves serially so this only affects queue length)
 
+# Accept-all channel confirm: user_id -> (token, chat_id, message_id,
+# user_name, username). Tapping ✅ Accept all asks "to channel?" with a
+# 15-minute timeout that defaults to NO (scrape in DM). The token
+# invalidates stale timeout tasks (re-tap restarts the clock).
+_SEARCH_CONFIRM: Dict[int, tuple] = {}
+_SEARCH_CONFIRM_TIMEOUT = 900.0
+
+def _search_confirm_human_timeout() -> str:
+    if _SEARCH_CONFIRM_TIMEOUT >= 60:
+        mins = _SEARCH_CONFIRM_TIMEOUT / 60
+        return f"{mins:.0f} min" if mins == int(mins) else f"{mins:.1f} min"
+    return f"{_SEARCH_CONFIRM_TIMEOUT:.0f}s"
+
 def _search_page_keyboard(results, page: int):
     """(page, total_pages, InlineKeyboardMarkup) for one 5-per-page slice.
     Page is 1-based and clamped. Module-level (must stay outside class Bot)."""
@@ -579,9 +596,14 @@ def _search_page_keyboard(results, page: int):
     for idx in range(start, min(start + _SEARCH_PAGE_SIZE, len(results))):
         res = results[idx]
         icon = "🎬" if res.kind == "movie" else "📺"
-        label = f"{icon} {res.title}"
-        if res.year:
-            label += f" ({res.year})"
+        title = (res.title or "").strip()
+        year = (res.year or "").strip()
+        # API titles sometimes already end with the year ("Sweetpea
+        # (2024)") -- don't print it twice.
+        if year and not title.endswith(f"({year})"):
+            label = f"{icon} {title} ({year})"
+        else:
+            label = f"{icon} {title}"
         if len(label) > 60:
             label = label[:57] + "..."
         rows.append([InlineKeyboardButton(label, callback_data=f"search:pick:{idx}")])  # type: ignore[misc]
@@ -2206,6 +2228,90 @@ class Bot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _acceptall_enqueue(self, uid: int, chat_id: int, results,
+                                 user_name: str, username: str,
+                                 to_channel: int = 0) -> int:
+        """Enqueue every result (deduped, unlimited) + send the summary.
+
+        to_channel=0 scrapes to the user's DM; otherwise each job carries
+        post_to_channel + silent (same shape as /scrapeallchannel
+        children) so batches land in the channel. Returns jobs enqueued.
+        Never raises (summary send is best-effort).
+        """
+        seen_urls: set = set()
+        jobs = []
+        for res in results:
+            if res.url in seen_urls:
+                continue
+            seen_urls.add(res.url)
+            job = Job(user_id=uid, chat_id=chat_id, url=res.url,
+                      user_name=user_name, username=username,
+                      post_to_channel=to_channel, silent=bool(to_channel))
+            try:
+                await self._enqueue(job)
+            except Exception:
+                continue
+            jobs.append(job)
+        skipped = len(results) - len(jobs)
+        lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
+        for idx, job in enumerate(jobs, 1):
+            try:
+                icon, title = _pretty_title(job.url)
+            except Exception:
+                icon, title = "🔗", job.url
+            lines.append(f"{idx}. {icon} {title}")
+        if skipped > 0:
+            lines.append(f"⚠️ +{skipped} duplicates skipped.")
+        try:
+            if self._bot is not None:
+                await _send_safe(self._bot, chat_id, "\n".join(lines),
+                                 parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return len(jobs)
+
+    async def _acceptall_confirm_timeout(self, uid: int, token) -> None:
+        """60s default-NO for the channel confirm: no answer in time means
+        scrape in DM. Token-invalidated by re-taps/answers. Never raises."""
+        try:
+            await asyncio.sleep(_SEARCH_CONFIRM_TIMEOUT)
+        except Exception:
+            return
+        try:
+            cur = _SEARCH_CONFIRM.get(uid)
+            if cur is None or cur[0] is not token:
+                return  # answered in time or superseded by a re-tap
+            _, chat_id, message_id, user_name, username = cur
+            _SEARCH_CONFIRM.pop(uid, None)
+            entry = _SEARCH_CACHE.pop(uid, None)
+            if entry is None:
+                return
+            _ts, _label, results = entry
+            if self._bot is None:
+                return
+            try:
+                await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                pass
+            # Re-check busy: the user may have started something meanwhile.
+            try:
+                _snap = await self._snapshot_queue()
+                _q = sum(1 for j in _snap if j.user_id == uid)
+                _r = self.current is not None and self.current.user_id == uid
+            except Exception:
+                _q, _r = 0, False
+            if _r or _q > 0:
+                try:
+                    await _send_safe(self._bot, chat_id,
+                                     "⏳ timed out with no answer and you're busy -- tap ✅ Accept all again when free.")
+                except Exception:
+                    pass
+                return
+            await self._acceptall_enqueue(uid, chat_id, results, user_name, username,
+                                          to_channel=0)
+        except Exception:
+            pass
+
     async def _on_search_pick(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         query = update.callback_query
         if query is None:
@@ -2219,8 +2325,10 @@ class Bot:
         data = query.data or ""
         parts = data.split(":")
         if parts[:2] == ["search", "close"]:
-            # ❌ Close: remove the whole results list, drop the cache.
+            # ❌ Close: remove the whole results list, drop the cache
+            # (and any pending channel-confirm for it).
             _SEARCH_CACHE.pop(uid, None)
+            _SEARCH_CONFIRM.pop(uid, None)
             if query.message is not None:
                 try:
                     await query.message.delete()
@@ -2228,9 +2336,9 @@ class Bot:
                     pass
             return
         if parts[:2] == ["search", "acceptall"]:
-            # ✅ Accept all: enqueue every result (deduped, capped) as
-            # individual jobs, same as pasting the links. List is deleted
-            # for a clean chat; one summary message replaces it.
+            # ✅ Accept all: don't enqueue yet -- ask "scrape to channel?"
+            # first. 60s of silence defaults to NO (DM scrape). Cache is
+            # kept until the answer (or timeout) consumes it.
             entry_all = _SEARCH_CACHE.get(uid)
             if entry_all is None or time.time() - entry_all[0] > _SEARCH_CACHE_TTL:
                 _SEARCH_CACHE.pop(uid, None)
@@ -2240,7 +2348,7 @@ class Bot:
                     except Exception:
                         pass
                 return
-            _results_all = entry_all[2]
+            _ts_all, _label_all, _results_all = entry_all
             _q_snapshot = await self._snapshot_queue()
             _queued = sum(1 for j in _q_snapshot if j.user_id == uid)
             _running = self.current is not None and self.current.user_id == uid
@@ -2252,34 +2360,104 @@ class Bot:
                     except Exception:
                         pass
                 return
-            seen_urls: set = set()
-            jobs = []
-            for res in _results_all:
-                # No cap: the owner explicitly wants unlimited accept-all.
-                # Dupes still skipped; the single worker resolves serially.
-                if res.url in seen_urls:
-                    continue
-                seen_urls.add(res.url)
-                _nm, _un = _display_name(update.effective_user)
-                job = Job(user_id=uid, chat_id=update.effective_chat.id, url=res.url,
-                          user_name=_nm, username=_un)
-                await self._enqueue(job)
-                jobs.append(job)
+            _tok = object()
+            _nm0, _un0 = _display_name(update.effective_user)
+            _SEARCH_CONFIRM[uid] = (_tok, update.effective_chat.id,
+                                    query.message.message_id if query.message is not None else 0,
+                                    _nm0, _un0)
+            _kb_yn = InlineKeyboardMarkup([[  # type: ignore[misc]
+                InlineKeyboardButton("✅ Yes, to channel", callback_data="search:tochan:yes"),  # type: ignore[misc]
+                InlineKeyboardButton("❌ No, here in DM", callback_data="search:tochan:no"),  # type: ignore[misc]
+            ]])
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        f"Scrape <b>{len(_results_all)} links</b> to your channel?"
+                        f" (No answer in {_search_confirm_human_timeout()} = No, scrape here.)",
+                        reply_markup=_kb_yn,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._acceptall_confirm_timeout(uid, _tok))
+            except Exception:
+                pass
+            return
+        if len(parts) == 3 and parts[0] == "search" and parts[1] == "tochan" \
+                and parts[2] in ("yes", "no"):
+            # Answer (or nothing -- the timeout task owns the default-NO).
+            _cur = _SEARCH_CONFIRM.pop(uid, None)
+            if _cur is None:
+                return  # already answered / timed out; ignore double taps
+            _tok_got = _cur[0]
+            entry_yn = _SEARCH_CACHE.get(uid)
+            if entry_yn is None or time.time() - entry_yn[0] > _SEARCH_CACHE_TTL:
+                _SEARCH_CACHE.pop(uid, None)
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text("⌛ Search expired -- send /search again.")
+                    except Exception:
+                        pass
+                return
+            _ts_yn, _label_yn, _results_yn = entry_yn
+            try:
+                _snap_yn = await self._snapshot_queue()
+                _q_yn = sum(1 for j in _snap_yn if j.user_id == uid)
+                _r_yn = self.current is not None and self.current.user_id == uid
+            except Exception:
+                _q_yn, _r_yn = 0, False
+            if _r_yn or _q_yn > 0:
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text(
+                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
+                    except Exception:
+                        pass
+                return
+            _to_channel = 0
+            _chan_note = ""
+            if parts[2] == "yes":
+                try:
+                    from xdmovies.scrape_all import load_channel
+                    _ch = load_channel()
+                except Exception:
+                    _ch = None
+                if _ch is None or not int(getattr(_ch, "channel_id", 0) or 0):
+                    _SEARCH_CACHE.pop(uid, None)
+                    if query.message is not None:
+                        try:
+                            await query.edit_message_text(
+                                "No channel set -- send /scrapeallchannel and forward "
+                                "a channel message first, then accept again.")
+                        except Exception:
+                            pass
+                    return
+                _to_channel = int(_ch.channel_id)
+                try:
+                    _chan_note = f" → <b>{_html_escape(getattr(_ch, 'title', '') or str(_to_channel))}</b>"
+                except Exception:
+                    _chan_note = ""
             _SEARCH_CACHE.pop(uid, None)
             if query.message is not None:
                 try:
                     await query.message.delete()
                 except Exception:
                     pass
-            skipped = len(_results_all) - len(jobs)
-            lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
-            for idx, job in enumerate(jobs, 1):
-                icon, title = _pretty_title(job.url)
-                lines.append(f"{idx}. {icon} {title}")
-            if skipped > 0:
-                lines.append(f"⚠️ +{skipped} duplicates skipped.")
-            await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
-                             parse_mode=ParseMode.HTML)
+            _nm_yn, _un_yn = _display_name(update.effective_user)
+            _n = await self._acceptall_enqueue(uid, update.effective_chat.id,
+                                               _results_yn, _nm_yn, _un_yn,
+                                               to_channel=_to_channel)
+            if _to_channel and _n:
+                try:
+                    if self._bot is not None:
+                        await _send_safe(self._bot, update.effective_chat.id,
+                                         f"📢 Scraping to channel{_chan_note}. Progress lands there; "
+                                         f"this chat stays quiet.",
+                                         parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
             return
         if len(parts) != 3 or parts[0] != "search" or parts[1] not in ("pick", "page"):
             return
@@ -2329,6 +2507,7 @@ class Bot:
                   user_name=_nm, username=_un)
         pos = await self._enqueue(job)
         _SEARCH_CACHE.pop(uid, None)
+        _SEARCH_CONFIRM.pop(uid, None)
         # Clean chat: delete the results list now that a pick was made.
         # The confirm note below still shows what was queued. Delete may
         # fail (message too old, rights); never let that break the pick.
@@ -2429,9 +2608,12 @@ class Bot:
             )
             return
         if not flat:
+            msg = "Not found."
+            if dropped:
+                msg += f"\n⚠️ +{dropped} lines ignored (max {_TXT_MAX_LINES})."
             await _send_safe(
                 context.bot, update.effective_chat.id,
-                "Not found.",
+                msg,
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2633,7 +2815,7 @@ class Bot:
         app.add_handler(CommandHandler("search", self._cmd_search))
         app.add_handler(CallbackQueryHandler(
             self._on_search_pick,
-            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$",
+            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:tochan:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
