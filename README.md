@@ -6,7 +6,7 @@ ad-gate in the path **without asking the user to do anything** in the common
 case. A manual solve-link fallback exists for the rare hard block.
 
 > **Caveat:** the bot connects from the VPS IP directly
-> (`132.145.15.58`). Cloudflare's datacenter-ASN fingerprinting is stricter
+> (`{to your VPS ip}`). Cloudflare's datacenter-ASN fingerprinting is stricter
 > than on residential IPs. Everything below is tuned for exactly that
 > environment. Routing CloakBrowser through a residential SOCKS5 proxy
 > remains possible via `proxy={...}` at the `launch_chromium()` call sites.
