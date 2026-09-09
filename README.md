@@ -155,7 +155,7 @@ python -m compileall xdmovies # syntax sweep (no test framework exists)
 ### VPS (recommended) — full guide in [`DEPLOY.md`](./DEPLOY.md)
 
 ```bash
-ssh dhruv@132.145.15.58
+ssh user@132.149.35.78
 cd ~/xdmovies_bot_repo && git pull
 sudo bash deploy.sh          # apt + venv + CloakBrowser + systemd unit
 nano xdmovies/.env            # TELEGRAM_BOT_TOKEN + TELEGRAM_OWNER_ID
