@@ -58,15 +58,55 @@ _LANG_RE = re.compile(
 
 @dataclass
 class Card:
-    """One download entry as the page renders it."""
+    """One download entry as the page renders it.
+
+    kind mirrors the title element's class: "episode" (episode-title),
+    "pack" (pack-title), "custom" (custom-title), or "" when the page
+    doesn't label it. Powers the Episodes / Packs-Zips content filter.
+    """
     title: str = ""
     size: str = ""
     language: str = ""
     file_name: str = ""
     url: str = ""
+    kind: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _kind_from_class(cls: str) -> str:
+    low = (cls or "").lower()
+    if "pack-title" in low:
+        return "pack"
+    if "episode-title" in low:
+        return "episode"
+    if "custom-title" in low:
+        return "custom"
+    return ""
+
+
+def filter_cards_by_content(cards: List[Card], content: str) -> List[Card]:
+    """Keep only episode or pack cards for the accept-all content choice.
+
+    content is "all" | "episodes" | "packs". "all" (and anything unknown)
+    returns everything.
+
+    Mixed .txt lists (movies + series) are safe by design:
+    - "custom" cards (movie pages / single custom links) are kept under
+      BOTH filters -- movies are always fully extracted, whatever the
+      user picked. Only series episode/pack sections get narrowed.
+    - Cards with NO kind info (older markup, gate-direct single cards)
+      are always kept: filtering is impossible, so everything is
+      returned rather than wiping the job to zero.
+    """
+    if content not in ("episodes", "packs"):
+        return list(cards)
+    want = {"episode", "custom"} if content == "episodes" else {"pack", "custom"}
+    kinds = {c.kind for c in cards if c.kind}
+    if not kinds:
+        return list(cards)
+    return [c for c in cards if not c.kind or c.kind in want]
 
 
 def _strip_tags(s: str) -> str:
@@ -213,11 +253,11 @@ def extract_cards(html: str) -> List[Card]:
     if not anchors:
         return []
 
-    title_results: List[Tuple[int, str, int]] = []
+    title_results: List[Tuple[int, str, int, str]] = []
     for m in _TITLE_OPEN_RE.finditer(html):
         text, end_pos = _read_tag_text(html, m.start())
         if text and text.strip():
-            title_results.append((m.start(), text, end_pos))
+            title_results.append((m.start(), text, end_pos, m.group("cls") or ""))
 
     out: List[Card] = []
     seen: set = set()
@@ -243,12 +283,15 @@ def extract_cards(html: str) -> List[Card]:
         window = html[window_left:window_right]
 
         # Title: the most recent title element whose start is inside the
-        # window AND before the anchor.
+        # window AND before the anchor. Its class also decides the card
+        # kind (episode / pack / custom) for the content filter.
         title = ""
+        kind = ""
         while t_idx < len(title_results) and title_results[t_idx][0] <= a_start:
-            t_start, t_text, _ = title_results[t_idx]
+            t_start, t_text, _, t_cls = title_results[t_idx]
             if t_start >= window_left and t_text:
                 title = t_text
+                kind = _kind_from_class(t_cls)
             t_idx += 1
         title = title.strip() if title else ""
 
@@ -261,6 +304,7 @@ def extract_cards(html: str) -> List[Card]:
             language=language,
             file_name=title,
             url=url,
+            kind=kind,
         ))
 
     return out

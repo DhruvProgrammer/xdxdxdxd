@@ -563,6 +563,18 @@ _SEARCH_CACHE_TTL = 1200.0
 _SEARCH_FETCH_LIMIT = 30
 _SEARCH_PAGE_SIZE = 5
 
+# Accept-all content choice: which cards of each series page to resolve.
+# "all" keeps everything (previous behavior). "episodes"/"packs" keeps
+# only cards whose title element was classed episode-title/pack-title.
+# Shown after ✅ Accept all, before the scrape-to-channel question.
+_CONTENT_FILTERS = ("all", "episodes", "packs")
+_CONTENT_LABEL = {
+    "all": "All (EP+Pack)",
+    "episodes": "Episodes only",
+    "packs": "Packs/Zips only",
+}
+_CONTENT_CALLBACK = {"all": "all", "ep": "episodes", "pack": "packs"}
+
 # .txt batch search: max titles read per file. Each title costs a live
 # search (~1s), so an 800-line file means ~15 min before the list
 # appears -- raise via XDMOVIES_TXT_MAX_LINES if you accept the wait.
@@ -717,6 +729,11 @@ class Job:
     # Running card progress for /queue + per-card INFO logs.
     cards_total: int = 0
     cards_done: int = 0
+    # Accept-all content choice: "all" | "episodes" | "packs". Filters the
+    # extracted cards before resolution (episode-title vs pack-title
+    # cards). Default "all" preserves previous behavior everywhere
+    # (single picks, pasted URLs, scrape-all children).
+    card_filter: str = "all"
 
 
 class Bot:
@@ -926,6 +943,37 @@ class Bot:
             job.error = f"extract: {exc!r}"
             await self._fail(job, session_id)
             return
+
+        # Accept-all content choice (Episodes / Packs-Zips / All): narrow
+        # the extracted cards before resolving. Pages with no kind info
+        # (and gate-direct single cards) pass through untouched.
+        if getattr(job, "card_filter", "all") in ("episodes", "packs"):
+            from xdmovies.extractor import filter_cards_by_content
+            _kept = filter_cards_by_content(cards, job.card_filter)
+            if not _kept and cards:
+                _label = _CONTENT_LABEL.get(job.card_filter, job.card_filter)
+                _LOG.info(
+                    "job card filter %s matched 0/%d cards for %s",
+                    job.card_filter, len(cards), job.url,
+                )
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"[FAIL] no {_html_escape(_label)} links found on that page "
+                    f"(title: <code>{_html_escape((result.page_title or '').strip()[:80])}</code>). "
+                    f"The page exists but has no {_html_escape(_label.lower())} section.",
+                    parse_mode=ParseMode.HTML,
+                )
+                job.status = "done"
+                job.finished_at = time.time()
+                self.last_solve_ago = 0.0
+                return
+            if len(_kept) != len(cards):
+                _LOG.info(
+                    "job card filter %s: %d/%d cards kept for %s",
+                    job.card_filter, len(_kept), len(cards), job.url,
+                )
+            cards = _kept
+            result.cards = _kept
 
         if not cards:
             # Distinguish "xdmovies served a stub/error page" from
@@ -2475,14 +2523,19 @@ class Bot:
 
     async def _acceptall_enqueue(self, uid: int, chat_id: int, results,
                                  user_name: str, username: str,
-                                 to_channel: int = 0) -> int:
+                                 to_channel: int = 0,
+                                 card_filter: str = "all") -> int:
         """Enqueue every result (deduped, unlimited) + send the summary.
 
         to_channel=0 scrapes to the user's DM; otherwise each job carries
         post_to_channel + silent (same shape as /scrapeallchannel
-        children) so batches land in the channel. Returns jobs enqueued.
+        children) so batches land in the channel. card_filter ("all" |
+        "episodes" | "packs") rides on each Job so _run_for_user resolves
+        only episode/pack cards. Returns jobs enqueued.
         Never raises (summary send is best-effort).
         """
+        if card_filter not in _CONTENT_FILTERS:
+            card_filter = "all"
         seen_urls: set = set()
         jobs = []
         for res in results:
@@ -2491,7 +2544,8 @@ class Bot:
             seen_urls.add(res.url)
             job = Job(user_id=uid, chat_id=chat_id, url=res.url,
                       user_name=user_name, username=username,
-                      post_to_channel=to_channel, silent=bool(to_channel))
+                      post_to_channel=to_channel, silent=bool(to_channel),
+                      card_filter=card_filter)
             try:
                 await self._enqueue(job)
             except Exception:
@@ -2499,6 +2553,8 @@ class Bot:
             jobs.append(job)
         skipped = len(results) - len(jobs)
         lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
+        if card_filter != "all":
+            lines[0] += f" ({_html_escape(_CONTENT_LABEL[card_filter])})"
         for idx, job in enumerate(jobs, 1):
             try:
                 icon, title = _pretty_title(job.url)
@@ -2526,7 +2582,10 @@ class Bot:
             cur = _SEARCH_CONFIRM.get(uid)
             if cur is None or cur[0] is not token:
                 return  # answered in time or superseded by a re-tap
-            _, chat_id, message_id, user_name, username = cur
+            _, chat_id, message_id, user_name, username = cur[:5]
+            _filter_to = cur[5] if len(cur) > 5 else "all"
+            if _filter_to not in _CONTENT_FILTERS:
+                _filter_to = "all"
             _SEARCH_CONFIRM.pop(uid, None)
             entry = _SEARCH_CACHE.pop(uid, None)
             if entry is None:
@@ -2553,7 +2612,7 @@ class Bot:
                     pass
                 return
             await self._acceptall_enqueue(uid, chat_id, results, user_name, username,
-                                          to_channel=0)
+                                          to_channel=0, card_filter=_filter_to)
         except Exception:
             pass
 
@@ -2581,9 +2640,9 @@ class Bot:
                     pass
             return
         if parts[:2] == ["search", "acceptall"]:
-            # ✅ Accept all: don't enqueue yet -- ask "scrape to channel?"
-            # first. 60s of silence defaults to NO (DM scrape). Cache is
-            # kept until the answer (or timeout) consumes it.
+            # ✅ Accept all: don't enqueue yet -- first ask WHAT to scrape
+            # (All / Episodes / Packs-Zips), then "scrape to channel?".
+            # Cache is kept until the answers (or timeout) consume it.
             entry_all = _SEARCH_CACHE.get(uid)
             if entry_all is None or time.time() - entry_all[0] > _SEARCH_CACHE_TTL:
                 _SEARCH_CACHE.pop(uid, None)
@@ -2605,11 +2664,57 @@ class Bot:
                     except Exception:
                         pass
                 return
+            _kb_content = InlineKeyboardMarkup([  # type: ignore[misc]
+                [InlineKeyboardButton("✅ All (EP+Pack)", callback_data="search:content:all")],  # type: ignore[misc]
+                [InlineKeyboardButton("🎞️ Episodes only", callback_data="search:content:ep")],  # type: ignore[misc]
+                [InlineKeyboardButton("🗜️ Packs/Zips only", callback_data="search:content:pack")],  # type: ignore[misc]
+                [InlineKeyboardButton("❌ Close", callback_data="search:close")],  # type: ignore[misc]
+            ])
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        f"Scrape <b>{len(_results_all)} links</b> -- what should I resolve?",
+                        reply_markup=_kb_content,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            return
+        if len(parts) == 3 and parts[0] == "search" and parts[1] == "content" \
+                and parts[2] in ("all", "ep", "pack"):
+            # Content choice: store the filter, then ask "scrape to
+            # channel?" exactly as before. The confirm entry carries the
+            # filter through to enqueue (and to the timeout default).
+            entry_ct = _SEARCH_CACHE.get(uid)
+            if entry_ct is None or time.time() - entry_ct[0] > _SEARCH_CACHE_TTL:
+                _SEARCH_CACHE.pop(uid, None)
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text("⌛ Search expired -- send /search again.")
+                    except Exception:
+                        pass
+                return
+            _ts_ct, _label_ct, _results_ct = entry_ct
+            try:
+                _snap_ct = await self._snapshot_queue()
+                _q_ct = sum(1 for j in _snap_ct if j.user_id == uid)
+                _r_ct = self.current is not None and self.current.user_id == uid
+            except Exception:
+                _q_ct, _r_ct = 0, False
+            if _r_ct or _q_ct > 0:
+                if query.message is not None:
+                    try:
+                        await query.edit_message_text(
+                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
+                    except Exception:
+                        pass
+                return
+            _filter = _CONTENT_CALLBACK[parts[2]]
             _tok = object()
             _nm0, _un0 = _display_name(update.effective_user)
             _SEARCH_CONFIRM[uid] = (_tok, update.effective_chat.id,
                                     query.message.message_id if query.message is not None else 0,
-                                    _nm0, _un0)
+                                    _nm0, _un0, _filter)
             _kb_yn = InlineKeyboardMarkup([[  # type: ignore[misc]
                 InlineKeyboardButton("✅ Yes, to channel", callback_data="search:tochan:yes"),  # type: ignore[misc]
                 InlineKeyboardButton("❌ No, here in DM", callback_data="search:tochan:no"),  # type: ignore[misc]
@@ -2617,7 +2722,8 @@ class Bot:
             if query.message is not None:
                 try:
                     await query.edit_message_text(
-                        f"Scrape <b>{len(_results_all)} links</b> to your channel?"
+                        f"Scrape <b>{len(_results_ct)} links</b> "
+                        f"({_html_escape(_CONTENT_LABEL[_filter])}) to your channel?"
                         f" (No answer in {_search_confirm_human_timeout()} = No, scrape here.)",
                         reply_markup=_kb_yn,
                         parse_mode=ParseMode.HTML,
@@ -2637,6 +2743,11 @@ class Bot:
             if _cur is None:
                 return  # already answered / timed out; ignore double taps
             _tok_got = _cur[0]
+            # 6-tuple (token, chat_id, message_id, name, username, filter);
+            # len-guard keeps it tolerant if the shape ever changes.
+            _filter_yn = _cur[5] if len(_cur) > 5 else "all"
+            if _filter_yn not in _CONTENT_FILTERS:
+                _filter_yn = "all"
             entry_yn = _SEARCH_CACHE.get(uid)
             if entry_yn is None or time.time() - entry_yn[0] > _SEARCH_CACHE_TTL:
                 _SEARCH_CACHE.pop(uid, None)
@@ -2693,7 +2804,8 @@ class Bot:
             _nm_yn, _un_yn = _display_name(update.effective_user)
             _n = await self._acceptall_enqueue(uid, update.effective_chat.id,
                                                _results_yn, _nm_yn, _un_yn,
-                                               to_channel=_to_channel)
+                                               to_channel=_to_channel,
+                                               card_filter=_filter_yn)
             if _to_channel and _n:
                 try:
                     if self._bot is not None:
@@ -2767,7 +2879,9 @@ class Bot:
         """Handle an uploaded .txt file: one movie/series title per line.
 
         Searches every title and replies with ONE merged paginated
-        pick-list (same buttons/cache/pick flow as /search). Skips blanks,
+        pick-list (same buttons/cache/pick flow as /search). ✅ Accept all
+        asks WHAT to resolve (All / Episodes / Packs-Zips) and then the
+        scrape-to-channel question. Skips blanks,
         caps lines at _TXT_MAX_LINES. Not a command, so the menu is
         untouched; access control identical to /search (silent ignore).
         """
@@ -3060,7 +3174,7 @@ class Bot:
         app.add_handler(CommandHandler("search", self._cmd_search))
         app.add_handler(CallbackQueryHandler(
             self._on_search_pick,
-            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:tochan:(yes|no)$",
+            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:content:(all|ep|pack)$|^search:tochan:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
