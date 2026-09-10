@@ -318,3 +318,118 @@ def extract_cards_from_html(html: str) -> List[Card]:
 def quick_extract(html: str) -> List[Tuple[str, str]]:
     """Legacy-shape helper: [(url, title), ...] for old call sites."""
     return [(c.url, c.title) for c in extract_cards(html)]
+
+
+# ---------------------------------------------------------------------------
+# Quality grouping for the /qmode series picker (/qmode ON + /series/ URL).
+# Cards are bucketed by (season, quality, codec) parsed from the card
+# title, e.g. "Season 1 1080p H.265". Titles that carry no recognizable
+# markers land in the "Other" bucket (season 0, quality/codec "").
+# Pure function, no I/O. Page order is preserved inside each bucket.
+# ---------------------------------------------------------------------------
+
+_SEASON_RES = (
+    re.compile(r"\bseason\s*(\d{1,2})\b", re.IGNORECASE),
+    # S01 in "S01", "S01E01", "S1" (lookahead: episode marker or word end;
+    # plain \b fails on S01E01 since 1->E has no boundary).
+    re.compile(r"\bS(\d{1,2})(?=E\d{1,3}\b|\b)"),
+)
+_QUALITY_RES = (
+    ("2160p", re.compile(r"\b2160p\b|\b4k\b", re.IGNORECASE)),
+    ("1080p", re.compile(r"\b1080p\b", re.IGNORECASE)),
+    ("720p", re.compile(r"\b720p\b", re.IGNORECASE)),
+    ("480p", re.compile(r"\b480p\b", re.IGNORECASE)),
+)
+_CODEC_RES = (
+    ("H.265", re.compile(r"\b(?:h\.?265|x265|hevc)\b", re.IGNORECASE)),
+    ("H.264", re.compile(r"\b(?:h\.?264|x264)\b", re.IGNORECASE)),
+)
+
+# Sort rank so buckets list best quality first (2160p H.265 at top).
+_QUALITY_RANK = {"2160p": 0, "1080p": 1, "720p": 2, "480p": 3, "": 4}
+_CODEC_RANK = {"H.265": 0, "H.264": 1, "": 2}
+
+
+@dataclass
+class QualityGroup:
+    """One toggle row-set in the picker: all cards of one season +
+    quality + codec. `cards` keeps page order."""
+    season: int = 0  # 0 = unknown -> rendered as "Other" section
+    quality: str = ""
+    codec: str = ""
+    cards: List[Card] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.cards is None:
+            self.cards = []
+
+    @property
+    def label(self) -> str:
+        if self.season <= 0 and not self.quality and not self.codec:
+            return f"Other ({len(self.cards)})"
+        parts = []
+        if self.season > 0:
+            parts.append(f"S{self.season}")
+        if self.quality:
+            parts.append(self.quality)
+        if self.codec:
+            parts.append(self.codec)
+        return f"{' '.join(parts)} ({len(self.cards)})".strip()
+
+    @property
+    def section(self) -> str:
+        return f"Season {self.season}" if self.season > 0 else "Other"
+
+
+def _parse_quality_key(title: str) -> Tuple[int, str, str]:
+    t = title or ""
+    season = 0
+    for rx in _SEASON_RES:
+        m = rx.search(t)
+        if m:
+            try:
+                season = int(m.group(1))
+            except (TypeError, ValueError):
+                season = 0
+            break
+    quality = ""
+    for name, rx in _QUALITY_RES:
+        if rx.search(t):
+            quality = name
+            break
+    codec = ""
+    for name, rx in _CODEC_RES:
+        if rx.search(t):
+            codec = name
+            break
+    return season, quality, codec
+
+
+def group_cards_by_quality(cards: List[Card]) -> List[QualityGroup]:
+    """Bucket cards into ordered QualityGroups for the picker.
+
+    Buckets sort by season asc, then quality desc (2160p first), then
+    codec (H.265 before H.264); the catch-all Other bucket sorts last.
+    Cards that share identical (season, quality, codec) stay together
+    in page order.
+    """
+    buckets: dict = {}
+    order: List[Tuple[int, str, str]] = []
+    for c in cards or []:
+        key = _parse_quality_key(c.title)
+        if key not in buckets:
+            buckets[key] = QualityGroup(season=key[0], quality=key[1], codec=key[2])
+            order.append(key)
+        buckets[key].cards.append(c)
+
+    def _rank(key: Tuple[int, str, str]):
+        season, quality, codec = key
+        season_rank = season if season > 0 else 10**6
+        return (
+            season_rank,
+            _QUALITY_RANK.get(quality, 4),
+            _CODEC_RANK.get(codec, 2),
+            order.index(key),
+        )
+
+    return [buckets[k] for k in sorted(order, key=_rank)]

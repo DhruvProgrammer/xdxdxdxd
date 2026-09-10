@@ -628,6 +628,91 @@ def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
 _SEARCH_CONFIRM: Dict[int, tuple] = {}
 _SEARCH_CONFIRM_TIMEOUT = 900.0
 
+# /qmode series quality picker: pid -> {uid, chat_id, msg_id,
+# groups (List[QualityGroup]), selected (set[int]), event, verdict}.
+# Entries live only for the pick window (30s); answered/timed-out
+# pickers are popped. In-memory only -- the ON/OFF setting itself is
+# persisted in qmode_store, the transient picker state is not.
+_QPICK: Dict[str, dict] = {}
+QPICK_TIMEOUT = 30.0
+# Telegram caps a message at ~100 buttons; way below that we give up
+# on choosing and resolve everything rather than paginating a picker.
+QPICK_MAX_GROUPS = 40
+
+
+def _fit_button(s: str, limit: int = 60) -> str:
+    """Truncate to a byte budget (Bot API button text is 1-64 bytes;
+    char counting overruns on non-ASCII scraped titles)."""
+    if len(s.encode("utf-8")) <= limit:
+        return s
+    out = s
+    while out and len((out + "...").encode("utf-8")) > limit:
+        out = out[:-1]
+    return (out + "...") if out else s[:0]
+
+
+def _qpick_keyboard(pid: str, groups, selected) -> "InlineKeyboardMarkup":
+    """Toggle grid, 2 buttons per row + Done/Cancel footer. Callback
+    payloads stay far under the 64-byte Telegram limit
+    (`qp:<8hex>:t:<gi>`)."""
+    rows = []
+    row = []
+    for gi, g in enumerate(groups):
+        label = _fit_button(f"{'✅ ' if gi in selected else ''}{g.label}")
+        row.append(InlineKeyboardButton(label, callback_data=f"qp:{pid}:t:{gi}"))  # type: ignore[misc]
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("✅ Done", callback_data=f"qp:{pid}:done"),  # type: ignore[misc]
+        InlineKeyboardButton("❌ Cancel", callback_data=f"qp:{pid}:cancel"),  # type: ignore[misc]
+    ])
+    return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+
+def _qpick_text(page_title: str, groups) -> str:
+    """Picker body (HTML): season headers + usage line. Group labels
+    are page-scraped text, so they are escaped at render time."""
+    lines = ["What quality you want?"]
+    if page_title:
+        lines.append(f"<b>{_html_escape(page_title.strip()[:80])}</b>")
+    last_section = None
+    for g in groups:
+        if g.section != last_section:
+            lines.append(f"<b>{_html_escape(g.section)}:</b>")
+            last_section = g.section
+    lines.append("Tap to select (✅). Done with nothing picked = all. 30s = all.")
+    return "\n".join(lines)
+
+
+async def _send_markup_safe(bot, chat_id: int, text: str, reply_markup) -> Optional[int]:
+    """_send_safe equivalent for messages carrying an inline keyboard:
+    HTML first, plain-text retry (markup kept) on BadRequest. Returns
+    the message_id or None."""
+    if bot is None:
+        return None
+    try:
+        msg = await bot.send_message(
+            chat_id=chat_id, text=text,
+            reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        return msg.message_id
+    except _TelegramError.BadRequest:
+        _LOG.warning("picker send BadRequest -- retrying plain")
+        try:
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=text.replace("<b>", "").replace("</b>", ""),
+                reply_markup=reply_markup)
+            return msg.message_id
+        except Exception:
+            _LOG.exception("picker plain-text retry also failed")
+            return None
+    except Exception:
+        _LOG.exception("picker send failed")
+        return None
+
 def _search_confirm_human_timeout() -> str:
     if _SEARCH_CONFIRM_TIMEOUT >= 60:
         mins = _SEARCH_CONFIRM_TIMEOUT / 60
@@ -1034,6 +1119,30 @@ class Bot:
             except Exception as _e:
                 _LOG.debug(f"keep_alive touch failed: {_e!r}")
             return
+
+        # /qmode quality picker (series only, qmode ON, 2+ groups):
+        # narrow the card list before the resolve loop. None = the user
+        # cancelled at the picker (or /cancel fired mid-pick).
+        try:
+            _picked = await self._ask_quality(
+                job, cards, page_title=(result.page_title or ""))
+        except Exception:
+            _LOG.exception("quality picker failed (non-fatal) -- resolving all")
+            _picked = list(cards)
+        if _picked is None:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            return
+        if [c.url for c in _picked] != [c.url for c in cards]:
+            _LOG.info(
+                "quality picker: %d/%d cards kept for %s",
+                len(_picked), len(cards), job.url,
+            )
+            cards = _picked
+            try:
+                result.cards = _picked
+            except Exception:
+                pass
 
         n = len(cards)
         await self._set_progress(
@@ -2160,6 +2269,210 @@ class Bot:
             except Exception:
                 pass
 
+    async def _cmd_qmode(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        if not bot_config.is_allowed(update.effective_user.id, self.cfg):
+            return  # silent (bot convention)
+        from xdmovies import qmode_store
+        on = qmode_store.is_qmode_on(update.effective_user.id)
+        keyboard = InlineKeyboardMarkup([  # type: ignore[misc]
+            [InlineKeyboardButton("✅ Yes", callback_data="qmode:set:yes")],  # type: ignore[misc]
+            [InlineKeyboardButton("❌ No", callback_data="qmode:set:no")],  # type: ignore[misc]
+        ])
+        text = (
+            "Do you want to enable quality mode?\n"
+            f"Currently: <b>{'ON' if on else 'OFF'}</b>\n"
+            "ON = series links show a quality picker before resolving. "
+            "OFF = resolve everything as today."
+        )
+        try:
+            await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        except _TelegramError.BadRequest:
+            try:
+                await update.message.reply_text(
+                    text.replace("<b>", "").replace("</b>", ""),
+                    reply_markup=keyboard)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _on_qmode_choice(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        data = query.data or ""
+        if data not in ("qmode:set:yes", "qmode:set:no"):
+            return
+        from xdmovies import qmode_store
+        on = qmode_store.set_qmode(query.from_user.id, data == "qmode:set:yes")
+        text = (
+            f"Quality mode: <b>{'ON' if on else 'OFF'}</b>\n"
+            + ("Series links will now ask which quality to resolve."
+               if on else "Series links resolve everything as before.")
+        )
+        if query.message is not None:
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(text.replace("<b>", "").replace("</b>", ""))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def _on_qpick(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        parts = (query.data or "").split(":")
+        if len(parts) < 3 or parts[0] != "qp":
+            return
+        pid = parts[1]
+        st = _QPICK.get(pid)
+        if st is None:
+            if query.message is not None:
+                try:
+                    await query.edit_message_text("⌛ picker expired -- resend the link.")
+                except Exception:
+                    pass
+            return
+        if query.from_user.id != st.get("uid"):
+            return  # only the requester's taps count
+        action = parts[2]
+        if action == "done" and len(parts) == 3:
+            st["verdict"] = "done"
+            st["event"].set()
+        elif action == "cancel" and len(parts) == 3:
+            st["verdict"] = "cancel"
+            st["event"].set()
+        elif action == "t" and len(parts) == 4 and parts[3].isdigit():
+            gi = int(parts[3])
+            groups = st.get("groups") or []
+            if 0 <= gi < len(groups):
+                sel = st.get("selected")
+                if sel is None:
+                    sel = st["selected"] = set()
+                if gi in sel:
+                    sel.discard(gi)
+                else:
+                    sel.add(gi)
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=_qpick_keyboard(pid, groups, sel))
+                except _TelegramError.BadRequest:
+                    pass  # MessageNotModified on rapid double-tap
+                except Exception:
+                    pass
+        # anything else: malformed payload, ignore
+
+    async def _ask_quality(self, job: "Job", cards, page_title: str = "") -> Optional[list]:
+        """Series quality picker. Returns the cards to resolve, or None
+        when the user cancelled at the picker.
+
+        Skipped (all cards returned) when: job is silent/channel-routed
+        (scrape-all children must never stall), URL is not /series/,
+        qmode is OFF for this user, or fewer than 2 quality groups.
+        """
+        from xdmovies.extractor import group_cards_by_quality
+        from xdmovies import qmode_store
+        try:
+            if job.silent or job.post_to_channel:
+                return list(cards)
+            if "/series/" not in (job.url or "").lower():
+                return list(cards)
+            if not qmode_store.is_qmode_on(job.user_id):
+                return list(cards)
+        except Exception:
+            return list(cards)
+        try:
+            groups = group_cards_by_quality(cards)
+        except Exception:
+            _LOG.exception("quality grouping failed (non-fatal) -- resolving all")
+            return list(cards)
+        if len(groups) <= 1:
+            return list(cards)
+        if len(groups) > QPICK_MAX_GROUPS:
+            await _send_safe(
+                self._bot, job.chat_id,
+                f"Too many quality groups ({len(groups)}) to pick from -- resolving all {len(cards)} links.",
+                parse_mode=ParseMode.HTML,
+            )
+            return list(cards)
+        pid = uuid.uuid4().hex[:8]
+        while pid in _QPICK:  # 32-bit id; re-roll on the freak collision
+            pid = uuid.uuid4().hex[:8]
+        ev = asyncio.Event()
+        _QPICK[pid] = {
+            "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
+            "groups": groups, "selected": set(), "event": ev, "verdict": None,
+        }
+        try:
+            msg_id = await _send_markup_safe(
+                self._bot, job.chat_id,
+                _qpick_text(page_title, groups),
+                _qpick_keyboard(pid, groups, set()),
+            )
+        except Exception:
+            msg_id = None
+        if msg_id is None:
+            _QPICK.pop(pid, None)
+            return list(cards)
+        _QPICK[pid]["msg_id"] = msg_id
+        verdict = None
+        selected: set = set()
+        try:
+            deadline = time.time() + QPICK_TIMEOUT
+            while time.time() < deadline:
+                if job.cancel_event.is_set():
+                    _QPICK.get(pid, {})["verdict"] = "cancel"
+                    break
+                try:
+                    await asyncio.wait_for(ev.wait(), 1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            st = _QPICK.pop(pid, None) or {}
+            verdict = st.get("verdict")
+            selected = set(st.get("selected") or set())
+        finally:
+            # Cleanup runs even on task-cancel/shutdown so the picker
+            # entry never leaks and the message is never orphaned.
+            _QPICK.pop(pid, None)
+            await _drop_msg(self._bot, job.chat_id, msg_id)
+        if verdict == "cancel" or job.cancel_event.is_set():
+            await _send_safe(self._bot, job.chat_id, "🛑 quality pick cancelled -- job stopped.")
+            return None
+        if verdict == "done" and selected:
+            picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
+            if not picked:
+                return list(cards)
+            await _send_safe(
+                self._bot, job.chat_id,
+                f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
+                parse_mode=ParseMode.HTML,
+            )
+            return picked
+        if verdict != "done":
+            await _send_safe(
+                self._bot, job.chat_id,
+                f"⏳ no choice in {QPICK_TIMEOUT:.0f}s -- resolving all <b>{len(cards)}</b> links.",
+                parse_mode=ParseMode.HTML,
+            )
+        return list(cards)
+
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
@@ -3089,6 +3402,7 @@ class Bot:
                 BotCommand("restart", "restart the whole bot (owner only)"),
                 BotCommand("scrapeall", "scrape all movies or series"),
                 BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
+                BotCommand("qmode", "toggle quality picker for series"),
             ])
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
@@ -3184,6 +3498,15 @@ class Bot:
             self._on_scrapechan_choice,
             pattern=r"^scrapechan:(select|resume|start):(all|movies|series)$|^scrapechan:cancel:-$",
         ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_qmode_choice,
+            pattern=r"^qmode:set:(yes|no)$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_qpick,
+            pattern=r"^qp:[0-9a-f]{8}:(t:\d+|done|cancel)$",
+        ))
+        app.add_handler(CommandHandler("qmode", self._cmd_qmode))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         return app
