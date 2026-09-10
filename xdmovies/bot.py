@@ -159,6 +159,42 @@ URL_RE = re.compile(
 # "(...continued)" prefix.
 MSG_LIMIT = 4000
 
+# Budget per results message in the append-only batch flow. Stays under
+# MSG_LIMIT with room for the title header (first message) and the live
+# progress footer (open message). Block-granular sealing keeps every
+# send/edit far below the sizes that were timing out on mega-series.
+_BATCH_CHUNK_BUDGET = MSG_LIMIT - 400
+_BATCH_SEP = "─" * 25
+
+
+def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optional[str]) -> str:
+    """Render one numbered result block.
+
+    Byte-identical to the per-card section of Bot._format_batch_text, so
+    global numbering (1..N) is preserved when messages are appended
+    incrementally across many Telegram messages. No caps: every card is
+    rendered; large series simply span more messages.
+    """
+    title_text = _html_escape(card.title or "(untitled)")
+    block = [f"<b>{idx}) {title_text}</b>"]
+    if card.size:
+        block.append(f"Size: {_html_escape(card.size)}")
+    if card.language:
+        block.append(f"Language: {_html_escape(card.language)}")
+    if card.file_name and card.file_name != card.title:
+        block.append(f"File: {_html_escape(card.file_name)}")
+    if dest:
+        # Plain URL, no <code> tags (user preference): Telegram
+        # clients auto-link bare URLs. Still entity-escaped so a
+        # `&` in query strings can't trip HTML parsing; the
+        # displayed/tappable link is unaffected.
+        block.append(f"→ {_html_escape(dest)}")
+    elif err:
+        block.append(f"[FAIL] {_html_escape(err)}")
+    else:
+        block.append("⏳ resolving...")
+    return "\n".join(block)
+
 
 # --------------------------------------------------------------------------
 # Text helpers
@@ -672,6 +708,15 @@ class Job:
     # Batched results message -- we edit a single Telegram message instead of
     # sending one per card. List because long outputs may need >1 message.
     batch_msg_ids: List[int] = field(default_factory=list)
+    # Incremental batch state (append-only results delivery): number of
+    # cards already sealed into sent messages. _send_or_edit_batch only
+    # renders/sends cards[sealed:] so per-card Telegram work stays O(1)
+    # no matter how big the series gets. No caps: every card is still
+    # delivered, just across more messages instead of re-sending all.
+    batch_sealed_count: int = 0
+    # Running card progress for /queue + per-card INFO logs.
+    cards_total: int = 0
+    cards_done: int = 0
 
 
 class Bot:
@@ -963,6 +1008,10 @@ class Bot:
         # CF clear attaches to the session; cards 2..N hit the cache and
         # skip the ~30s solve entirely.
         shared_session = f"tg_job_{job.user_id}_{uuid.uuid4().hex[:8]}"
+        # Progress counters for /queue + per-card INFO logs. The batch flow
+        # reads cards_total for its "x/y delivered" footer.
+        job.cards_total = n
+        job.cards_done = 0
         for i, card in enumerate(cards, 1):
             if job.cancel_event.is_set():
                 await _send_safe(
@@ -993,7 +1042,7 @@ class Bot:
                     try:
                         await self._send_or_edit_batch(job, result.page_title, results, in_progress_idx=i)
                     except Exception:
-                        _LOG.exception("batch edit failed at card %d/%d", i, n)
+                        _LOG.debug("batch edit failed at card %d/%d", i, n)
                     continue
             except Exception:
                 pass
@@ -1096,7 +1145,7 @@ class Bot:
                                         try:
                                             await self._send_or_edit_batch(job, result.page_title, results, in_progress_idx=i)
                                         except Exception:
-                                            _LOG.exception("batch edit failed at card %d/%d", i, n)
+                                            _LOG.debug("batch edit failed at card %d/%d", i, n)
                                         continue
                                 except: pass
                                 try:
@@ -1111,7 +1160,7 @@ class Bot:
                                                 try:
                                                     await self._send_or_edit_batch(job, result.page_title, results, in_progress_idx=i)
                                                 except Exception:
-                                                    _LOG.exception("batch edit failed at card %d/%d", i, n)
+                                                    _LOG.debug("batch edit failed at card %d/%d", i, n)
                                                 continue
                                         except: pass
                                 except: pass
@@ -1132,7 +1181,7 @@ class Bot:
             try:
                 await self._send_or_edit_batch(job, result.page_title, results, in_progress_idx=i)
             except Exception:
-                _LOG.exception("batch edit failed at card %d/%d", i, n)
+                _LOG.debug("batch edit failed at card %d/%d", i, n)
 
         # summary
         elapsed = time.time() - started
@@ -1337,34 +1386,103 @@ class Bot:
           ─────────────────────────
           2) <title> ...
         """
-        sep = "─" * 25
+        sep = _BATCH_SEP
         title_esc = _html_escape(page_title or "(untitled)")
         out: List[str] = [f"<b>{title_esc}:</b>"]
         for i, (card, dest, err) in enumerate(cards, 1):
-            title_text = _html_escape(card.title or "(untitled)")
-            block = [f"<b>{i}) {title_text}</b>"]
-            if card.size:
-                block.append(f"Size: {_html_escape(card.size)}")
-            if card.language:
-                block.append(f"Language: {_html_escape(card.language)}")
-            if card.file_name and card.file_name != card.title:
-                block.append(f"File: {_html_escape(card.file_name)}")
-            if dest:
-                # Plain URL, no <code> tags (user preference): Telegram
-                # clients auto-link bare URLs. Still entity-escaped so a
-                # `&` in query strings can't trip HTML parsing; the
-                # displayed/tappable link is unaffected.
-                block.append(f"→ {_html_escape(dest)}")
-            elif err:
-                block.append(f"[FAIL] {_html_escape(err)}")
-            else:
-                block.append("⏳ resolving...")
-            out.append("\n".join(block))
+            out.append(_format_card_block(i, card, dest, err))
             out.append(sep)
         # remove trailing separator for clean look
         if out and out[-1] == sep:
             out.pop()
         return "\n\n".join(out)
+
+    async def _tg_send_text(self, target: int, text: str) -> Optional[int]:
+        """Send one text chunk with TimedOut backoff + BadRequest fallback.
+
+        TimedOut (the mega-series batch killer) is retried 3x with
+        exponential backoff and logged at WARNING, not ERROR, so one
+        slow Telegram roundtrip no longer floods xdmovies_bot_errors.log.
+        BadRequest falls back to plain text once. Never raises.
+        """
+        if not text or self._bot is None:
+            return None
+        delay = 2.0
+        for attempt in range(3):
+            try:
+                msg = await self._bot.send_message(
+                    chat_id=target, text=text, parse_mode=ParseMode.HTML
+                )
+                try:
+                    return msg.message_id
+                except Exception:
+                    return None
+            except _TelegramError.BadRequest as exc:
+                _LOG.warning("batch HTML send failed (%s) -- retrying plain", exc)
+                try:
+                    msg = await self._bot.send_message(chat_id=target, text=text)
+                    try:
+                        return msg.message_id
+                    except Exception:
+                        return None
+                except Exception as exc2:
+                    _LOG.warning("batch plain send failed: %r", exc2)
+                    return None
+            except _TelegramError.TimedOut:
+                _LOG.warning(
+                    "batch send TimedOut (attempt %d/3) -- backing off %.0fs",
+                    attempt + 1, delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            except Exception as exc:
+                _LOG.warning("batch send failed: %r", exc)
+                return None
+        _LOG.warning("batch send gave up after 3 TimedOut attempts (non-fatal)")
+        return None
+
+    async def _tg_edit_text(self, target: int, message_id: int, text: str) -> bool:
+        """Edit one message with TimedOut backoff. Never raises."""
+        if not text or self._bot is None:
+            return False
+        delay = 2.0
+        for attempt in range(3):
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=target,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+            except _TelegramError.BadRequest as exc:
+                # "message is not modified" is harmless when the
+                # text didn't change yet
+                if "not modified" in str(exc).lower():
+                    return True
+                _LOG.warning("batch HTML edit failed (%s) -- retrying plain", exc)
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=target, message_id=message_id, text=text
+                    )
+                    return True
+                except Exception as exc2:
+                    _LOG.warning("batch plain edit failed: %r", exc2)
+                    return False
+            except _TelegramError.TimedOut:
+                _LOG.warning(
+                    "batch edit TimedOut (attempt %d/3) -- backing off %.0fs",
+                    attempt + 1, delay,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            except Exception as exc:
+                _LOG.warning("batch edit failed: %r", exc)
+                return False
+        _LOG.warning("batch edit gave up after 3 TimedOut attempts (non-fatal)")
+        return False
 
     async def _send_or_edit_batch(
         self,
@@ -1373,10 +1491,19 @@ class Bot:
         cards: List[Tuple["Card", Optional[str], Optional[str]]],
         in_progress_idx: Optional[int] = None,
     ) -> None:
-        """Send the batched results message once, then edit it as cards complete.
+        """Append-only results delivery: sealed messages are never touched.
 
-        If the rendered text exceeds Telegram's per-message limit, we split
-        into multiple messages and edit each in place.
+        Previously every card re-rendered the ENTIRE accumulated text and,
+        once it spanned N messages, deleted all N and re-sent them -- O(total)
+        Telegram traffic per card. On a 200+ episode series each update grew
+        to megabytes of sends that timed out every ~60s for hours (the
+        "scraping again and again" stall; the job was actually progressing).
+
+        Now only cards[job.batch_sealed_count:] are rendered. Full leading
+        chunks are sent once and sealed; only the small open tail message is
+        edited per card. Same content, no caps -- big series just span more
+        messages. Never raises: Telegram-side failures are WARNING-level and
+        retried on the next card.
         """
         if self._bot is None:
             _LOG.debug("batch skipped: bot not yet initialized")
@@ -1387,49 +1514,155 @@ class Bot:
         target = job.post_to_channel or job.chat_id
         if getattr(job, "silent", False) and not job.post_to_channel:
             return
-        full_text = self._format_batch_text(page_title, cards)
-        chunks = _split_text(full_text)
         try:
-            # If we already have N messages stored and the chunk count matches,
-            # edit them in place. Otherwise send fresh and replace the list.
-            existing = job.batch_msg_ids
-            if existing and len(existing) == len(chunks):
-                for msg_id, chunk in zip(existing, chunks):
-                    try:
-                        await self._bot.edit_message_text(
-                            chat_id=target,
-                            message_id=msg_id,
-                            text=chunk,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except _TelegramError.BadRequest as exc:
-                        # "message is not modified" is harmless when the
-                        # text didn't change yet
-                        if "not modified" in str(exc).lower():
-                            continue
-                        raise
-            else:
-                # Length changed (more cards added) -- replace the batch.
-                # First, delete the previous batch if it existed.
-                for old_id in existing:
-                    try:
-                        await self._bot.delete_message(chat_id=target, message_id=old_id)
-                    except Exception:
-                        pass
-                new_ids: List[int] = []
-                for chunk in chunks:
-                    try:
-                        msg = await self._bot.send_message(
-                            chat_id=target, text=chunk, parse_mode=ParseMode.HTML
-                        )
-                        new_ids.append(msg.message_id)
-                    except _TelegramError.BadRequest as exc:
-                        _LOG.warning("batch HTML failed (%s) -- retrying plain", exc)
-                        msg = await self._bot.send_message(chat_id=target, text=chunk)
-                        new_ids.append(msg.message_id)
-                job.batch_msg_ids = new_ids
+            job.cards_done = len(cards)
         except Exception:
-            _LOG.exception("batch send/edit failed")
+            pass
+        try:
+            sealed = max(0, int(getattr(job, "batch_sealed_count", 0) or 0))
+        except Exception:
+            sealed = 0
+        tail = list(cards[sealed:])
+        if not tail:
+            if job.batch_msg_ids:
+                return  # duplicate tick, nothing new -- skip Telegram entirely
+            if not cards:
+                return
+            # Sealed pointer ran past the list (shouldn't happen); re-render all.
+            sealed = 0
+            tail = list(cards)
+        try:
+            first_ever = not job.batch_msg_ids
+            title_esc = _html_escape(page_title or "(untitled)")
+            title_header = f"<b>{title_esc}:</b>"
+            blocks = [
+                _format_card_block(sealed + k + 1, card, dest, err)
+                for k, (card, dest, err) in enumerate(tail)
+            ]
+            # Greedy block-granular chunking of the tail. Deterministic from
+            # the same sealed start, so the previous open message is always a
+            # prefix of chunk 0 -- it can be edited, never re-sent.
+            join_sep = f"\n\n{_BATCH_SEP}\n\n"
+            chunks: List[List[int]] = []  # tail indexes per chunk
+            cur: List[int] = []
+            cur_len = (len(title_header) + 2) if first_ever else 0
+            for j, blk in enumerate(blocks):
+                if not cur:
+                    # First block of a chunk: bare, except the very first
+                    # chunk which follows the title header ("\n\n").
+                    add = len(blk) + (len("\n\n") if (first_ever and not chunks) else 0)
+                else:
+                    add = len(join_sep) + len(blk)
+                if cur and cur_len + add > _BATCH_CHUNK_BUDGET:
+                    chunks.append(cur)
+                    cur = [j]
+                    cur_len = len(blk)
+                else:
+                    cur.append(j)
+                    cur_len += add
+            if cur:
+                chunks.append(cur)
+
+            def _render_chunk(ci: int) -> str:
+                idxs = chunks[ci]
+                body = join_sep.join(blocks[j] for j in idxs)
+                if ci == 0 and first_ever:
+                    return f"{title_header}\n\n{body}"
+                return body
+
+            total = int(getattr(job, "cards_total", 0) or 0)
+            done_open = sealed + sum(len(c) for c in chunks)
+            footer = ""
+            if total and done_open < total:
+                footer = f"\n\n⏳ <i>{done_open}/{total} delivered so far…</i>"
+
+            if len(chunks) == 1:
+                text = _render_chunk(0) + footer
+                if len(text) > MSG_LIMIT:
+                    # One pathological block (giant URL): transport-split it,
+                    # content still fully delivered, cards still sealed.
+                    for piece in _split_text(text):
+                        mid = await self._tg_send_text(target, piece)
+                        if mid is not None:
+                            job.batch_msg_ids.append(mid)
+                    job.batch_sealed_count = sealed + len(tail)
+                elif first_ever:
+                    mid = await self._tg_send_text(target, text)
+                    if mid is not None:
+                        job.batch_msg_ids = [mid]
+                else:
+                    await self._tg_edit_text(target, job.batch_msg_ids[-1], text)
+            else:
+                # Chunk 0 overlaps the previous open message: edit it.
+                # Middle chunks are full: send + seal. Last chunk is the
+                # new open tail (sent fresh; edited from here on).
+                head = _render_chunk(0)
+                if len(head) > MSG_LIMIT:
+                    # Pathological single block (giant URL): transport-split
+                    # it so sealing still advances; content fully delivered.
+                    pieces = _split_text(head)
+                    if not first_ever and pieces:
+                        # Old open message holds this chunk's prefix: edit it
+                        # with the first piece instead of duplicating.
+                        ok = await self._tg_edit_text(target, job.batch_msg_ids[-1], pieces[0])
+                        if not ok:
+                            return  # retry next card; nothing sealed
+                        for piece in pieces[1:]:
+                            mid = await self._tg_send_text(target, piece)
+                            if mid is not None:
+                                job.batch_msg_ids.append(mid)
+                    else:
+                        for piece in pieces:
+                            mid = await self._tg_send_text(target, piece)
+                            if mid is not None:
+                                if not job.batch_msg_ids:
+                                    job.batch_msg_ids = [mid]
+                                else:
+                                    job.batch_msg_ids.append(mid)
+                    sealed_now = sealed + len(chunks[0])
+                elif first_ever:
+                    mid0 = await self._tg_send_text(target, head)
+                    if mid0 is not None:
+                        job.batch_msg_ids = [mid0]
+                    else:
+                        return  # send failed, retry next card; nothing sealed
+                    sealed_now = sealed + len(chunks[0])
+                else:
+                    ok = await self._tg_edit_text(target, job.batch_msg_ids[-1], head)
+                    if not ok:
+                        return  # edit failed, retry next card; nothing sealed
+                    sealed_now = sealed + len(chunks[0])
+                for ci in range(1, len(chunks) - 1):
+                    mid = await self._tg_send_text(target, _render_chunk(ci))
+                    if mid is None:
+                        job.batch_sealed_count = sealed_now
+                        return  # partial progress sealed; rest next card
+                    job.batch_msg_ids.append(mid)
+                    sealed_now += len(chunks[ci])
+                job.batch_sealed_count = sealed_now
+                last_idx = len(chunks) - 1
+                last_text = _render_chunk(last_idx) + footer
+                if len(last_text) > MSG_LIMIT:
+                    for piece in _split_text(last_text):
+                        mid = await self._tg_send_text(target, piece)
+                        if mid is not None:
+                            job.batch_msg_ids.append(mid)
+                    job.batch_sealed_count = sealed + len(tail)
+                else:
+                    mid = await self._tg_send_text(target, last_text)
+                    if mid is not None:
+                        job.batch_msg_ids.append(mid)
+                        # Open tail cards stay unsealed (edited in place next
+                        # card); only the middle full chunks sealed above.
+            _LOG.info(
+                "batch updated: %d cards in %d msg(s): %.60s",
+                len(cards), len(job.batch_msg_ids), (page_title or ""),
+            )
+        except Exception as exc:
+            # Non-fatal by design: the card is already resolved and kept in
+            # `results`; the next card's tick re-renders the tail. WARNING,
+            # not ERROR -- Telegram slowness must not flood the errors log.
+            _LOG.warning("batch update failed (non-fatal, retried next card): %r", exc)
 
 
     async def _fail(self, job: Job, session_id: str) -> None:
@@ -1681,6 +1914,18 @@ class Bot:
                 f"{icon} {title}",
                 f"👤 {_user_mention(c.user_id, c.user_name, c.username)}{elapsed}",
             ]
+            # Card-level progress so a mega-series (100+ links, hours of
+            # work) never looks stuck: "📦 cards 137/240 delivered".
+            try:
+                total = int(getattr(c, "cards_total", 0) or 0)
+            except Exception:
+                total = 0
+            if total:
+                try:
+                    done = int(getattr(c, "cards_done", 0) or 0)
+                except Exception:
+                    done = 0
+                lines.append(f"📦 cards <b>{done}/{total}</b> delivered")
         # Audit finding M4: take an atomic snapshot under the queue
         # lock instead of draining/reputting. The previous drain loop
         # could race the dispatcher's popleft() and reorder jobs.
