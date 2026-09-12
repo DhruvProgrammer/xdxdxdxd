@@ -819,6 +819,11 @@ class Job:
     # cards). Default "all" preserves previous behavior everywhere
     # (single picks, pasted URLs, scrape-all children).
     card_filter: str = "all"
+    # Urgent lane: 0 = normal FIFO, 1 = urgent (user link sent while a
+    # channel scrape runs). Urgent jobs are stored in Bot._urgent and
+    # drained at movie boundaries inside _run_scrape_all, then the
+    # scrape resumes. Never set directly — use _enqueue(..., urgent=True).
+    priority: int = 0
 
 
 class Bot:
@@ -845,6 +850,11 @@ class Bot:
         # `dispatcher loop error; sleeping 1s` loop.
         self._queue_cond = asyncio.Condition(self._queue_lock)
         self.queue: collections.deque[Job] = collections.deque()
+        # Urgent lane: resolve jobs sent while a scrape_all is running.
+        # Shares _queue_cond/_queue_lock so snapshots + waits stay atomic.
+        # Drained movie-by-movie inside _run_scrape_all; _pick_next also
+        # prefers it so a queued-but-not-started scrape can't starve it.
+        self._urgent: collections.deque[Job] = collections.deque()
         self.current: Optional[Job] = None
         self.last_solve_ago: Optional[float] = None
         self.error_count: int = 0
@@ -866,28 +876,116 @@ class Bot:
     def _queue_depth(self) -> int:
         return len(self.queue)
 
-    async def _enqueue(self, job: Job) -> int:
+    def _urgent_depth(self) -> int:
+        return len(self._urgent)
+
+    def _total_depth(self) -> int:
+        return len(self.queue) + len(self._urgent)
+
+    def _is_scrape_running(self) -> bool:
+        cur = self.current
+        return cur is not None and getattr(cur, "job_type", "") == "scrape_all"
+
+    async def _enqueue(self, job: Job, urgent: bool = False) -> int:
         async with self._queue_cond:
-            self.queue.append(job)
+            if urgent:
+                job.priority = 1
+                self._urgent.append(job)
+            else:
+                job.priority = 0
+                self.queue.append(job)
             # Wake the dispatcher (if blocked in _pick_next waiting for
             # the queue to become non-empty).
             self._queue_cond.notify_all()
-            return len(self.queue)
+            return len(self._urgent) + len(self.queue)
+
+    async def _pop_urgent(self) -> Optional[Job]:
+        """Pop one urgent job (FIFO). None when empty. Never blocks."""
+        async with self._queue_cond:
+            if not self._urgent:
+                return None
+            return self._urgent.popleft()
+
+    def _has_urgent_sync(self) -> bool:
+        return len(self._urgent) > 0
 
     async def _pick_next(self) -> Job:
-        # Block until the queue has at least one job, then atomically
-        # pop the leftmost. Replaces the previous `popleft()` which raised
-        # IndexError on every empty-queue iteration, flooding the log
-        # with `dispatcher loop error; sleeping 1s`.
+        # Block until either lane has a job, then atomically pop.
+        # Urgent lane first so a queued-but-not-started scrape can't
+        # starve an urgent link. Replaces the previous `popleft()` which
+        # raised IndexError on every empty-queue iteration, flooding the
+        # log with `dispatcher loop error; sleeping 1s`.
         async with self._queue_cond:
-            while not self.queue:
+            while not self.queue and not self._urgent:
                 await self._queue_cond.wait()
+            if self._urgent:
+                return self._urgent.popleft()
             return self.queue.popleft()
 
     async def _snapshot_queue(self) -> List[Job]:
         """Atomic snapshot under the queue lock."""
         async with self._queue_lock:
             return list(self.queue)
+
+    async def _snapshot_urgent(self) -> List[Job]:
+        """Atomic snapshot of the urgent lane."""
+        async with self._queue_lock:
+            return list(self._urgent)
+
+    async def _drain_urgent(self, parent_job: Job) -> int:
+        """Run every queued urgent job inline, then return count.
+
+        Called at movie boundaries inside _run_scrape_all (after the
+        current movie hit 10/10 + save_checkpoint). Keeps a single
+        `current` (the scrape stays current) so no extra browser slots
+        are used and the dispatcher stays blocked. Each urgent runs the
+        full _run_for_user flow (solve-links, batch, summary) with its
+        own fresh cancel_event. Cancelled urgents are skipped. Never
+        raises — one failing urgent never aborts the scrape.
+        """
+        ran = 0
+        while True:
+            if parent_job.cancel_event.is_set():
+                break
+            urgent = await self._pop_urgent()
+            if urgent is None:
+                break
+            if urgent.cancel_event.is_set():
+                continue
+            try:
+                if self._bot is not None and not getattr(urgent, "silent", False):
+                    try:
+                        await self._set_progress(
+                            urgent,
+                            "⚡ <b>Urgent link</b> — running now (channel scrape paused).",
+                        )
+                    except Exception:
+                        pass
+                await self._drop_enqueue_note(urgent)
+                try:
+                    await self._run_for_user(urgent)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    _LOG.exception("urgent job failed: %s", urgent.url)
+                    try:
+                        urgent.error = f"{exc.__class__.__name__}: {exc}"
+                        urgent.status = "cancelled" if urgent.cancel_event.is_set() else "error"
+                        urgent.finished_at = time.time()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        await self._drop_job_clutter(urgent)
+                    except Exception:
+                        pass
+                ran += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOG.exception("urgent drain loop error (non-fatal)")
+                continue
+        return ran
 
     # ---- progress messages ----------------------------------------------
     async def _set_progress(self, job: Job, text: str) -> None:
@@ -1493,6 +1591,44 @@ class Bot:
                     job.failed += 1
                     _LOG.exception("scrapeall item failed: %s", url)
                 save_checkpoint(state)
+                # Urgent lane (movie boundary): the current movie just hit
+                # 10/10 + checkpoint. If a user sent an urgent link while
+                # it resolved, run all urgents now, then resume the scrape
+                # with the next movie. Never aborts the finished movie.
+                try:
+                    if self._has_urgent_sync() and not job.cancel_event.is_set():
+                        try:
+                            if self._bot is not None:
+                                await _send_safe(
+                                    self._bot, job.chat_id,
+                                    "⏸ <b>Channel scrape paused</b> — ⚡ urgent link(s) running now. "
+                                    "Resuming right after.",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                        except Exception:
+                            pass
+                        try:
+                            _n_urg = await self._drain_urgent(job)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            _LOG.exception("urgent drain failed (non-fatal)")
+                            _n_urg = 0
+                        if not job.cancel_event.is_set():
+                            try:
+                                if self._bot is not None:
+                                    await _send_safe(
+                                        self._bot, job.chat_id,
+                                        f"▶️ <b>Channel scrape resumed</b> — {int(_n_urg or 0)} urgent job(s) done. "
+                                        f"Continuing <b>{kind}</b> page <b>{page_number}</b>.",
+                                        parse_mode=ParseMode.HTML,
+                                    )
+                            except Exception:
+                                pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _LOG.exception("urgent pause/resume note failed (non-fatal)")
 
             if job.cancel_event.is_set():
                 break
@@ -1986,8 +2122,14 @@ class Bot:
         last = "n/a"
         if self.last_solve_ago is not None:
             last = f"{int(self.last_solve_ago)}s ago"
-        depth = self._queue_depth()
+        depth = self._total_depth()
+        try:
+            _urg_n = self._urgent_depth()
+        except Exception:
+            _urg_n = 0
         cur = "idle" if self.current is None else f"running (user {self.current.user_id})"
+        if _urg_n:
+            cur += f" + ⚡{_urg_n} urgent waiting"
         # cookie status
         try:
             from xdmovies.cookie_store import status_text as _cookie_status
@@ -2054,7 +2196,7 @@ class Bot:
             return
         if not bot_config.is_allowed(update.effective_user.id, self.cfg):
             return
-        if self.current is None and self._queue_depth() == 0:
+        if self.current is None and self._total_depth() == 0:
             await _send_safe(context.bot, update.effective_chat.id,
                 "📋 <b>Queue Status</b>\n\n✅ All clear -- nothing running.",
                 parse_mode=ParseMode.HTML)
@@ -2086,6 +2228,16 @@ class Bot:
         # Audit finding M4: take an atomic snapshot under the queue
         # lock instead of draining/reputting. The previous drain loop
         # could race the dispatcher's popleft() and reorder jobs.
+        try:
+            urgents = await self._snapshot_urgent()
+        except Exception:
+            urgents = []
+        if urgents:
+            lines += ["", f"⚡ <b>Urgent up next ({len(urgents)})</b> — runs after current movie 10/10"]
+            for idx, j in enumerate(urgents, 1):
+                icon, title = _pretty_title(j.url)
+                lines.append(f"<b>{idx}.</b> {icon} {title}")
+                lines.append(f"     👤 {_user_mention(j.user_id, j.user_name, j.username)} • waiting {_fmt_dur(now - j.enqueued_at)}")
         items = await self._snapshot_queue()
         if items:
             lines += ["", f"⏳ <b>Up next ({len(items)})</b>"]
@@ -2119,7 +2271,12 @@ class Bot:
         # the previous drain-and-reput race where the dispatcher could
         # start a job mid-refill and reorder the queue.
         items = await self._snapshot_queue()
+        try:
+            urgent_items = await self._snapshot_urgent()
+        except Exception:
+            urgent_items = []
         kept: List[Job] = []
+        kept_urgent: List[Job] = []
         async with self._queue_cond:
             self.queue.clear()
             for j in items:
@@ -2133,6 +2290,23 @@ class Bot:
                     kept.append(j)
             for j in kept:
                 self.queue.append(j)
+            # Urgent lane: same per-user cancel so a ⚡ job can be
+            # withdrawn while the scrape is still paused on it.
+            try:
+                self._urgent.clear()
+                for j in urgent_items:
+                    if j.user_id == uid:
+                        j.cancel_event.set()
+                        j.status = "cancelled"
+                        j.finished_at = time.time()
+                        cancelled_queued += 1
+                        removed_jobs.append((cancelled_queued, j.url))
+                    else:
+                        kept_urgent.append(j)
+                for j in kept_urgent:
+                    self._urgent.append(j)
+            except Exception:
+                pass
             # Wake the dispatcher if it was blocked in _pick_next
             # waiting for a non-empty queue.
             self._queue_cond.notify_all()
@@ -2198,6 +2372,10 @@ class Bot:
             except Exception:
                 items = []
             try:
+                try:
+                    urgent_items = await self._snapshot_urgent()
+                except Exception:
+                    urgent_items = []
                 async with self._queue_cond:
                     for j in items:
                         try:
@@ -2206,7 +2384,18 @@ class Bot:
                             j.finished_at = time.time()
                         except Exception:
                             pass
+                    for j in urgent_items:
+                        try:
+                            j.cancel_event.set()
+                            j.status = "cancelled"
+                            j.finished_at = time.time()
+                        except Exception:
+                            pass
                     self.queue.clear()
+                    try:
+                        self._urgent.clear()
+                    except Exception:
+                        pass
                     try:
                         self._queue_cond.notify_all()
                     except Exception:
@@ -2588,7 +2777,7 @@ class Bot:
         cid, title = _extract_forwarded_channel(message)
         if cid is None:
             try:
-                txt = ((message.text or "").strip())
+                txt = ((getattr(message, "text", None) or getattr(message, "caption", None) or "").strip())
                 import re as _re
                 if _re.match(r"^-100\d{5,}$", txt):
                     cid, title = int(txt), ""
@@ -2914,6 +3103,11 @@ class Bot:
             try:
                 _snap = await self._snapshot_queue()
                 _q = sum(1 for j in _snap if j.user_id == uid)
+                try:
+                    _uq = await self._snapshot_urgent()
+                    _q += sum(1 for j in _uq if j.user_id == uid)
+                except Exception:
+                    pass
                 _r = self.current is not None and self.current.user_id == uid
             except Exception:
                 _q, _r = 0, False
@@ -2968,6 +3162,11 @@ class Bot:
             _ts_all, _label_all, _results_all = entry_all
             _q_snapshot = await self._snapshot_queue()
             _queued = sum(1 for j in _q_snapshot if j.user_id == uid)
+            try:
+                _uq_all = await self._snapshot_urgent()
+                _queued += sum(1 for j in _uq_all if j.user_id == uid)
+            except Exception:
+                pass
             _running = self.current is not None and self.current.user_id == uid
             if _running or _queued > 0:
                 if query.message is not None:
@@ -3011,6 +3210,11 @@ class Bot:
             try:
                 _snap_ct = await self._snapshot_queue()
                 _q_ct = sum(1 for j in _snap_ct if j.user_id == uid)
+                try:
+                    _uq_ct = await self._snapshot_urgent()
+                    _q_ct += sum(1 for j in _uq_ct if j.user_id == uid)
+                except Exception:
+                    pass
                 _r_ct = self.current is not None and self.current.user_id == uid
             except Exception:
                 _q_ct, _r_ct = 0, False
@@ -3074,6 +3278,11 @@ class Bot:
             try:
                 _snap_yn = await self._snapshot_queue()
                 _q_yn = sum(1 for j in _snap_yn if j.user_id == uid)
+                try:
+                    _uq_yn = await self._snapshot_urgent()
+                    _q_yn += sum(1 for j in _uq_yn if j.user_id == uid)
+                except Exception:
+                    pass
                 _r_yn = self.current is not None and self.current.user_id == uid
             except Exception:
                 _q_yn, _r_yn = 0, False
@@ -3160,9 +3369,42 @@ class Bot:
         if idx < 0 or idx >= len(results):
             return
         picked = results[idx]
+        # Urgent lane: search pick while a channel scrape runs jumps
+        # ahead (movie-boundary preempt). Otherwise same busy rule as
+        # pasted URLs: one job per user at a time.
+        if self._is_scrape_running():
+            _nm, _un = _display_name(update.effective_user)
+            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
+                      user_name=_nm, username=_un, priority=1)
+            try:
+                pos = await self._enqueue(job, urgent=True)
+            except Exception:
+                pos = 1
+            _SEARCH_CACHE.pop(uid, None)
+            _SEARCH_CONFIRM.pop(uid, None)
+            if query.message is not None:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            try:
+                job.enqueue_msg_id = await _send_safe(
+                    self._bot, update.effective_chat.id,
+                    "⚡ <b>Urgent queued</b> — runs after the current movie finishes 10/10, "
+                    "then the channel scrape resumes.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
         # Same busy rule as pasted URLs: one job per user at a time.
         _q_snapshot = await self._snapshot_queue()
         queued = sum(1 for j in _q_snapshot if j.user_id == uid)
+        try:
+            _uq_snapshot = await self._snapshot_urgent()
+            queued += sum(1 for j in _uq_snapshot if j.user_id == uid)
+        except Exception:
+            pass
         running = self.current is not None and self.current.user_id == uid
         if running or queued > 0:
             if query.message is not None:
@@ -3308,6 +3550,117 @@ class Bot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _enqueue_urgent_links(self, uid: int, chat_id: int,
+                                    urls: List[str], user_name: str = "",
+                                    username: str = "") -> List[Job]:
+        """Enqueue resolve URLs into the urgent lane (FIFO). Never raises."""
+        jobs: List[Job] = []
+        try:
+            for u in urls or []:
+                try:
+                    job = Job(user_id=uid, chat_id=chat_id, url=u,
+                              user_name=user_name, username=username,
+                              priority=1)
+                    await self._enqueue(job, urgent=True)
+                    jobs.append(job)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return jobs
+
+    async def _resolve_channel_title(self, uid: int, chat_id: int, raw_title: str,
+                                     user_name: str = "", username: str = "") -> bool:
+        """Search + auto best-match enqueue for a channel-post title.
+
+        Returns True when a job was enqueued (normal or urgent), False
+        when search found nothing / unavailable (caller already replied).
+        Never raises — all failures reply inline.
+        """
+        try:
+            from xdmovies.channel_post import pick_best_match
+            from xdmovies.search import SearchUnavailable, search_titles
+        except Exception as exc:
+            _LOG.warning("channel title search import failed: %r", exc)
+            await _send_safe(
+                self._bot, chat_id,
+                "[FAIL] search is unavailable right now -- try again later.",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        try:
+            results = await search_titles(raw_title, limit=5)
+        except Exception as exc:
+            _LOG.warning("channel title search failed for %r: %r", raw_title, exc)
+            await _send_safe(
+                self._bot, chat_id,
+                "[FAIL] search is unavailable right now -- try again later.",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        if not results:
+            await _send_safe(
+                self._bot, chat_id,
+                f"Not found: <code>{_html_escape(raw_title)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        try:
+            picked = pick_best_match(raw_title, results)
+        except Exception:
+            picked = results[0] if results else None
+        if picked is None:
+            await _send_safe(
+                self._bot, chat_id,
+                f"Not found: <code>{_html_escape(raw_title)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        try:
+            url = getattr(picked, "url", "")
+            title = getattr(picked, "title", "") or raw_title
+            if not url:
+                raise ValueError("empty pick url")
+        except Exception:
+            await _send_safe(
+                self._bot, chat_id,
+                f"Not found: <code>{_html_escape(raw_title)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        urgent = self._is_scrape_running()
+        job = Job(user_id=uid, chat_id=chat_id, url=url,
+                  user_name=user_name, username=username,
+                  priority=1 if urgent else 0)
+        try:
+            pos = await self._enqueue(job, urgent=urgent)
+        except Exception:
+            await _send_safe(self._bot, chat_id, "[FAIL] could not queue that title -- try again.")
+            return False
+        try:
+            if urgent:
+                job.enqueue_msg_id = await _send_safe(
+                    self._bot, chat_id,
+                    f"🔎 <code>{_html_escape(raw_title)}</code> → <b>{_html_escape(title)}</b>\n"
+                    f"⚡ <b>Urgent queued</b> (position #{pos} urgent) — runs after the current movie finishes 10/10, "
+                    f"then the channel scrape resumes.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                try:
+                    job.enqueue_msg_id = await self._confirm_enqueued(
+                        types.SimpleNamespace(bot=self._bot), chat_id, url, pos)
+                except Exception:
+                    job.enqueue_msg_id = await _send_safe(
+                        self._bot, chat_id,
+                        f"🔎 <code>{_html_escape(raw_title)}</code> → <b>{_html_escape(title)}</b>\n"
+                        f"📥 Queued.",
+                        parse_mode=ParseMode.HTML,
+                    )
+        except Exception:
+            pass
+        return True
+
     async def _on_text(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
@@ -3321,55 +3674,134 @@ class Bot:
                 return
         except Exception:
             pass
-        text = (update.message.text or "").strip()
+        # Photo/video forwards carry the post in caption, plain DMs in
+        # text. Read both so forwarded channel cards work.
+        try:
+            msg = update.message
+            text = ((getattr(msg, "text", None) or getattr(msg, "caption", None) or "")).strip()
+        except Exception:
+            text = ""
         urls, dropped = _extract_links(text)
-        if not urls:
-            await _send_safe(
-                context.bot, update.effective_chat.id,
-                "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
-                "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        # Audit finding M3: count jobs the user already has queued
-        # (not just the one running) so the busy check covers the whole
-        # queue. The `behind` math previously read "pos - 1" which gave
-        # 0 even with a job running + this one queued, so the user saw
-        # "queued behind 0 job(s)" while still waiting.
-        _q_snapshot = await self._snapshot_queue()
-        queued = sum(1 for j in _q_snapshot if j.user_id == uid)
-
-        running = self.current is not None and self.current.user_id == uid
-        if running or queued > 0:
-            await _send_safe(
-                context.bot, update.effective_chat.id,
-                "⏳ busy on your previous job -- wait for the result",
-            )
-            return
-
-        depth = self._queue_depth()
         _nm, _un = _display_name(update.effective_user)
-        if len(urls) == 1:
-            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=urls[0],
-                      user_name=_nm, username=_un)
-            pos = await self._enqueue(job)
-            job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, urls[0], pos)
+        # Urgent lane: any allowed user sending a resolve link while a
+        # channel scrape runs jumps ahead (movie-boundary preempt inside
+        # _run_scrape_all). Bypasses the per-user busy guard on purpose.
+        if urls and self._is_scrape_running():
+            try:
+                jobs = await self._enqueue_urgent_links(
+                    uid, update.effective_chat.id, urls, _nm, _un)
+            except Exception:
+                jobs = []
+            if not jobs:
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    "[FAIL] could not queue those links -- try again.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            lines = ["⚡ <b>Urgent queued</b> — runs after the current movie finishes 10/10, then the channel scrape resumes."]
+            for idx, job in enumerate(jobs, 1):
+                try:
+                    icon, title = _pretty_title(job.url)
+                except Exception:
+                    icon, title = "🔗", job.url
+                lines.append(f"{idx}. {icon} {title}")
+            if dropped:
+                lines.append(f"⚠️ +{dropped} more ignored (max {MAX_LINKS_PER_MESSAGE}/message).")
+            await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
+                             parse_mode=ParseMode.HTML)
             return
-        jobs = []
-        for url in urls:
-            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=url,
-                      user_name=_nm, username=_un)
-            await self._enqueue(job)
-            jobs.append(job)
-        lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
-        for idx, job in enumerate(jobs, 1):
-            icon, title = _pretty_title(job.url)
-            lines.append(f"{idx}. {icon} {title}")
-        if dropped:
-            lines.append(f"⚠️ +{dropped} more ignored (max {MAX_LINKS_PER_MESSAGE}/message).")
-        await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
-                         parse_mode=ParseMode.HTML)
+        if urls:
+            # Audit finding M3: count jobs the user already has queued
+            # (not just the one running) so the busy check covers the whole
+            # queue. The `behind` math previously read "pos - 1" which gave
+            # 0 even with a job running + this one queued, so the user saw
+            # "queued behind 0 job(s)" while still waiting.
+            _q_snapshot = await self._snapshot_queue()
+            queued = sum(1 for j in _q_snapshot if j.user_id == uid)
+            try:
+                _uq_snapshot = await self._snapshot_urgent()
+                queued += sum(1 for j in _uq_snapshot if j.user_id == uid)
+            except Exception:
+                pass
+
+            running = self.current is not None and self.current.user_id == uid
+            if running or queued > 0:
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    "⏳ busy on your previous job -- wait for the result",
+                )
+                return
+
+            depth = self._queue_depth()
+            if len(urls) == 1:
+                job = Job(user_id=uid, chat_id=update.effective_chat.id, url=urls[0],
+                          user_name=_nm, username=_un)
+                pos = await self._enqueue(job)
+                job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, urls[0], pos)
+                return
+            jobs = []
+            for url in urls:
+                job = Job(user_id=uid, chat_id=update.effective_chat.id, url=url,
+                          user_name=_nm, username=_un)
+                await self._enqueue(job)
+                jobs.append(job)
+            lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
+            for idx, job in enumerate(jobs, 1):
+                icon, title = _pretty_title(job.url)
+                lines.append(f"{idx}. {icon} {title}")
+            if dropped:
+                lines.append(f"⚠️ +{dropped} more ignored (max {MAX_LINKS_PER_MESSAGE}/message).")
+            await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
+                             parse_mode=ParseMode.HTML)
+            return
+
+        # No URLs — maybe a forwarded XDMovies channel post
+        # (photo+caption). Extract the title and auto-scrape it.
+        try:
+            from xdmovies.channel_post import parse_channel_title
+            _chan_title = parse_channel_title(text)
+        except Exception:
+            _chan_title = None
+        if _chan_title:
+            # Same busy rule as pasted URLs, except the scrape-running
+            # case goes urgent (handled inside _resolve_channel_title).
+            if not self._is_scrape_running():
+                try:
+                    _q2 = await self._snapshot_queue()
+                    _queued2 = sum(1 for j in _q2 if j.user_id == uid)
+                    try:
+                        _uq2 = await self._snapshot_urgent()
+                        _queued2 += sum(1 for j in _uq2 if j.user_id == uid)
+                    except Exception:
+                        pass
+                    _running2 = self.current is not None and self.current.user_id == uid
+                    if _running2 or _queued2 > 0:
+                        await _send_safe(
+                            context.bot, update.effective_chat.id,
+                            "⏳ busy on your previous job -- wait for the result",
+                        )
+                        return
+                except Exception:
+                    pass
+            try:
+                await self._resolve_channel_title(
+                    uid, update.effective_chat.id, _chan_title, _nm, _un)
+            except Exception:
+                _LOG.exception("channel title resolve failed")
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    "[FAIL] could not resolve that title -- try again.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        await _send_safe(
+            context.bot, update.effective_chat.id,
+            "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
+            "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     # ---- lifecycle -------------------------------------------------------
     async def _post_init(self, application: "Application") -> None:
@@ -3508,7 +3940,13 @@ class Bot:
         ))
         app.add_handler(CommandHandler("qmode", self._cmd_qmode))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
+        # TEXT covers plain DMs, CAPTION covers forwarded channel
+        # photo+caption posts (filters are disjoint in PTB v21).
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+        try:
+            app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, self._on_text))
+        except Exception:
+            pass
         return app
 
     async def _start_dispatcher_after_polling(self) -> None:
