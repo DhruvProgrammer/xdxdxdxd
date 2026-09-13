@@ -2036,8 +2036,9 @@ class Bot:
         result goes to the channel set via /scrapeallchannel, in addition
         to the user's DM -- no modes, no opt-in. Channel jobs themselves
         already target the channel, so they are skipped (no double post).
-        Failures are silent + logged (bot may not be admin yet).
-        Never raises.
+        Channel gets clean links only (no timing/summary footer -- that
+        stays in the user's DM). Failures are silent + logged (bot may
+        not be admin yet). Never raises.
         """
         try:
             if getattr(job, "silent", False) or getattr(job, "post_to_channel", 0):
@@ -2067,10 +2068,8 @@ class Bot:
             except Exception:
                 _LOG.warning("channel mirror batch failed (non-fatal)", exc_info=True)
                 return
-            try:
-                await _send_safe(self._bot, cid, summary, parse_mode=ParseMode.HTML)
-            except Exception:
-                _LOG.warning("channel mirror summary failed (non-fatal)", exc_info=True)
+            # No summary footer to the channel -- clean links only.
+            # (Timing + OK/FAIL stats still go to the user's DM.)
         except Exception:
             _LOG.warning("channel mirror failed (non-fatal)", exc_info=True)
 
