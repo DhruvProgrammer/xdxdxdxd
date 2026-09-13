@@ -1521,6 +1521,11 @@ class Bot:
                 )
         except Exception:
             _LOG.exception("summary send failed")
+        # Auto-channel mirror: same batch + summary to the preset channel.
+        try:
+            await self._mirror_job_to_channel(job, result.page_title, results, summary)
+        except Exception:
+            pass
 
         job.status = "done" if job.failed == 0 else "done_with_errors"
         job.finished_at = time.time()
@@ -2022,6 +2027,52 @@ class Bot:
             # `results`; the next card's tick re-renders the tail. WARNING,
             # not ERROR -- Telegram slowness must not flood the errors log.
             _LOG.warning("batch update failed (non-fatal, retried next card): %r", exc)
+
+
+    async def _mirror_job_to_channel(self, job: "Job", page_title: str, results, summary: str) -> None:
+        """Mirror a finished paste-link job to the preset channel.
+
+        Auto-channel mode (user choice): every movie/series/gate/download
+        result goes to the channel set via /scrapeallchannel, in addition
+        to the user's DM -- no modes, no opt-in. Channel jobs themselves
+        already target the channel, so they are skipped (no double post).
+        Failures are silent + logged (bot may not be admin yet).
+        Never raises.
+        """
+        try:
+            if getattr(job, "silent", False) or getattr(job, "post_to_channel", 0):
+                return
+            if not results:
+                return
+            try:
+                from xdmovies.scrape_all import load_channel
+                ch = load_channel()
+            except Exception:
+                ch = None
+            cid = getattr(ch, "channel_id", 0) if ch else 0
+            if not cid or cid == job.chat_id:
+                return
+            if self._bot is None:
+                return
+            try:
+                mjob = Job(user_id=job.user_id, chat_id=cid, url=job.url)
+            except Exception:
+                return
+            try:
+                mjob.cards_total = int(getattr(job, "cards_total", 0) or len(results))
+            except Exception:
+                pass
+            try:
+                await self._send_or_edit_batch(mjob, page_title, results)
+            except Exception:
+                _LOG.warning("channel mirror batch failed (non-fatal)", exc_info=True)
+                return
+            try:
+                await _send_safe(self._bot, cid, summary, parse_mode=ParseMode.HTML)
+            except Exception:
+                _LOG.warning("channel mirror summary failed (non-fatal)", exc_info=True)
+        except Exception:
+            _LOG.warning("channel mirror failed (non-fatal)", exc_info=True)
 
 
     async def _fail(self, job: Job, session_id: str) -> None:
@@ -2669,6 +2720,16 @@ class Bot:
                 return list(cards)
         except Exception:
             return list(cards)
+        # Auto-channel mode: a preset channel is set, so every paste-link
+        # job mirrors there with zero questions -- skip the picker and
+        # resolve everything (user chose: no modes, post all).
+        try:
+            from xdmovies.scrape_all import load_channel as _load_chan
+            _ch = _load_chan()
+            if _ch is not None and getattr(_ch, "channel_id", 0):
+                return list(cards)
+        except Exception:
+            pass
         try:
             groups = group_cards_by_quality(cards)
         except Exception:
