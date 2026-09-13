@@ -151,7 +151,7 @@ except ImportError:  # pragma: no cover
 # to the gate drive (saves a full browser + page load per link).
 URL_RE = re.compile(
     r"https?://(?:top\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
-    r"|https?://latestnewsonline\.sbs/r/[A-Za-z0-9]+",
+    r"|https?://latestnewsonline\.sbs/r/[A-Za-z0-9_-]+",
     re.IGNORECASE,
 )
 
