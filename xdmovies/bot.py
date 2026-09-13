@@ -653,11 +653,11 @@ _SEARCH_CONFIRM_TIMEOUT = 900.0
 
 # /qmode series quality picker: pid -> {uid, chat_id, msg_id,
 # groups (List[QualityGroup]), selected (set[int]), event, verdict}.
-# Entries live only for the pick window (30s); answered/timed-out
+# Entries live only for the pick window (2m); answered/timed-out
 # pickers are popped. In-memory only -- the ON/OFF setting itself is
 # persisted in qmode_store, the transient picker state is not.
 _QPICK: Dict[str, dict] = {}
-QPICK_TIMEOUT = 30.0
+QPICK_TIMEOUT = 120.0
 # Telegram caps a message at ~100 buttons; way below that we give up
 # on choosing and resolve everything rather than paginating a picker.
 QPICK_MAX_GROUPS = 40
@@ -675,8 +675,8 @@ def _fit_button(s: str, limit: int = 60) -> str:
 
 
 def _qpick_keyboard(pid: str, groups, selected) -> "InlineKeyboardMarkup":
-    """Toggle grid, 2 buttons per row + Done/Cancel footer. Callback
-    payloads stay far under the 64-byte Telegram limit
+    """Toggle grid, 2 buttons per row + Select All / Done / Cancel footer.
+    Callback payloads stay far under the 64-byte Telegram limit
     (`qp:<8hex>:t:<gi>`)."""
     rows = []
     row = []
@@ -689,10 +689,43 @@ def _qpick_keyboard(pid: str, groups, selected) -> "InlineKeyboardMarkup":
     if row:
         rows.append(row)
     rows.append([
+        InlineKeyboardButton("☑️ Select All", callback_data=f"qp:{pid}:all"),  # type: ignore[misc]
+    ])
+    rows.append([
         InlineKeyboardButton("✅ Done", callback_data=f"qp:{pid}:done"),  # type: ignore[misc]
         InlineKeyboardButton("❌ Cancel", callback_data=f"qp:{pid}:cancel"),  # type: ignore[misc]
     ])
     return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+
+def _best_picker_title(page_title: str, job_url: str = "") -> str:
+    """Full title for the picker header.
+
+    og:title is cleanest, but when it parses short (e.g. "India" for
+    "Indias Got Latent" -- apostrophe/entity split) the URL slug still
+    holds the full name. Prefer the longer informative one.
+    """
+    try:
+        base = (page_title or "").strip()
+        slug_title = ""
+        try:
+            from xdmovies.pipeline import _title_from_slug
+            slug_title = (_title_from_slug(job_url or "") or "").strip()
+        except Exception:
+            slug_title = ""
+        if slug_title:
+            if not base:
+                return slug_title
+            try:
+                if len(slug_title.split()) > len(base.split()) and (
+                    len(base.split()) <= 1 or len(slug_title) > len(base) + 6
+                ):
+                    return slug_title
+            except Exception:
+                pass
+        return base
+    except Exception:
+        return (page_title or "").strip()
 
 
 def _qpick_text(page_title: str, groups) -> str:
@@ -706,7 +739,7 @@ def _qpick_text(page_title: str, groups) -> str:
         if g.section != last_section:
             lines.append(f"<b>{_html_escape(g.section)}:</b>")
             last_section = g.section
-    lines.append("Tap to select (✅). Done with nothing picked = all. 30s = all.")
+    lines.append("Tap to select (✅) or Select All. Done = resolve picked (empty = all). 2m no choice = cancel.")
     return "\n".join(lines)
 
 
@@ -2580,6 +2613,23 @@ class Bot:
         elif action == "cancel" and len(parts) == 3:
             st["verdict"] = "cancel"
             st["event"].set()
+        elif action == "all" and len(parts) == 3:
+            try:
+                groups = st.get("groups") or []
+                sel = st.get("selected")
+                if sel is None:
+                    sel = st["selected"] = set()
+                for gi in range(len(groups)):
+                    sel.add(gi)
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=_qpick_keyboard(pid, groups, sel))
+                except _TelegramError.BadRequest:
+                    pass  # MessageNotModified on rapid double-tap
+                except Exception:
+                    pass
+            except Exception:
+                pass
         elif action == "t" and len(parts) == 4 and parts[3].isdigit():
             gi = int(parts[3])
             groups = st.get("groups") or []
@@ -2644,7 +2694,7 @@ class Bot:
         try:
             msg_id = await _send_markup_safe(
                 self._bot, job.chat_id,
-                _qpick_text(page_title, groups),
+                _qpick_text(_best_picker_title(page_title, job.url), groups),
                 _qpick_keyboard(pid, groups, set()),
             )
         except Exception:
@@ -2690,9 +2740,10 @@ class Bot:
         if verdict != "done":
             await _send_safe(
                 self._bot, job.chat_id,
-                f"⏳ no choice in {QPICK_TIMEOUT:.0f}s -- resolving all <b>{len(cards)}</b> links.",
+                "⏳ no choice in 2m -- job cancelled.",
                 parse_mode=ParseMode.HTML,
             )
+            return None
         return list(cards)
 
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -3970,7 +4021,7 @@ class Bot:
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_qpick,
-            pattern=r"^qp:[0-9a-f]{8}:(t:\d+|done|cancel)$",
+            pattern=r"^qp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
         ))
         app.add_handler(CommandHandler("qmode", self._cmd_qmode))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
