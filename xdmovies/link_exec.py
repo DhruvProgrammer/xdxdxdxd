@@ -302,21 +302,19 @@ async def _close_ad_popups(ctx, gate_page) -> Optional[str]:
 async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
     """Step-1 fast-path: skip the 6s Generate counter via /api/session/rebind.
 
-    Proven live: the gate creates its session on the Generate click
-    (POST /api/session {code, fingerprint} -> {sessionId, token}), and
-    the server does NOT enforce the 6s counter -- POSTing
-    /api/session/rebind {code, fingerprint} ~500ms later with the SAME
-    values the page itself used advances the session server-side. We
-    then navigate straight to /r/<code>?step=2&sid=<id>, landing on the
-    Turnstile stage with the counter + Continue click bypassed (~3-4s
-    net saved per link).
+    Robust v2: the original version aborted (fallback to classic UI drive)
+    on ANY single-point miss -- expect_response timeout, post_data None on
+    CloakBrowser, or missing fingerprint. On the VPS those misses happen
+    (xvfb timing + adapter differences) so it "followed the procedure".
 
-    Safety: the fingerprint is replayed verbatim from the page's own
-    session request (never a dummy value), the POST runs inside the
-    page context (same cookies/UA/origin), and ANY failure returns
-    False so the caller falls back to the classic Generate-counter-
-    Continue UI drive. Never raises; never blocks ads; step 2
-    (Turnstile + Go) is untouched.
+    v2 never aborts early:
+      1. Capture the page's own session POST if possible (real fp).
+      2. JS fallback: localStorage / window fingerprint.
+      3. Dummy fallback: 'a'*32 (proven live to return sessionId today).
+    Each candidate fp is tried against /api/session/rebind in turn; the
+    first sessionId wins and we jump to ?step=2&sid=. Only if ALL
+    candidates fail do we return False (classic drive). Never raises;
+    never blocks ads.
     """
     try:
         from urllib.parse import urlparse
@@ -327,16 +325,17 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
             _code = ""
         if not _code:
             return False
-        # 1. One Generate click (synthetic-first, no pop-under), while
-        # listening for the page's own session-creation POST.
         try:
             if not await _wait_visible(page, "#generateBtn", max_wait=12.0):
                 print("[link_exec] rebind skip: #generateBtn never visible")
                 return False
         except Exception:
             return False
+
         session_body = None
-        session_post = None
+        _posted = {}
+        _clicked = False
+        # --- 1. Best-effort capture of the page's own session POST ---
         try:
             def _is_session_create(r):
                 try:
@@ -347,72 +346,138 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
                 except Exception:
                     return False
 
-            async with page.expect_response(_is_session_create, timeout=20000) as _resp_info:
+            try:
+                async with page.expect_response(_is_session_create, timeout=20000) as _resp_info:
+                    _clicked = await _synthetic_click(page, "#generateBtn")
+                    if not _clicked:
+                        _clicked = await _real_click(page, "#generateBtn", max_wait=5.0)
+                    if not _clicked:
+                        print("[link_exec] rebind skip: Generate click failed (capture path)")
+            except Exception as exc:
+                # expect_response itself unsupported/timed-out on this
+                # adapter -- fall through to plain click + dummy rebind.
+                print(f"[link_exec] rebind skip: capture wait miss ({exc!r}) -- will try dummy")
+            try:
+                _resp = await _resp_info.value  # type: ignore[possibly-unbound]
+            except Exception as exc:
+                _resp = None
+                print(f"[link_exec] rebind skip: session response unreadable ({exc!r})")
+            if _resp is not None:
+                try:
+                    session_body = await _resp.json()
+                except Exception:
+                    session_body = None
+                # post_data has 3 spellings across Playwright versions /
+                # CloakBrowser adapter -- try them all.
+                _post_raw = None
+                try:
+                    _req = getattr(_resp, "request", None)
+                    if _req is not None:
+                        for _attr in ("post_data_json", "post_data", "post_data_buffer"):
+                            try:
+                                _v = getattr(_req, _attr, None)
+                                _v = _v() if callable(_v) else _v
+                                if _v:
+                                    _post_raw = _v
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    _post_raw = None
+                try:
+                    if isinstance(_post_raw, dict):
+                        _posted = _post_raw
+                    elif isinstance(_post_raw, (bytes, bytearray)):
+                        _posted = json.loads(bytes(_post_raw).decode("utf-8", "ignore") or "{}")
+                    elif _post_raw:
+                        _posted = json.loads(_post_raw)
+                    else:
+                        _posted = {}
+                except Exception:
+                    _posted = {}
+        except Exception as exc:
+            print(f"[link_exec] rebind skip: capture block miss ({exc!r}) -- will try dummy")
+
+        # Ensure at least one Generate click happened (creates the server
+        # session even if our capture missed it).
+        if not _clicked:
+            try:
                 _clicked = await _synthetic_click(page, "#generateBtn")
                 if not _clicked:
                     _clicked = await _real_click(page, "#generateBtn", max_wait=5.0)
-                if not _clicked:
-                    print("[link_exec] rebind skip: Generate click failed")
-                    return False
-            try:
-                _resp = await _resp_info.value
-            except Exception as exc:
-                print(f"[link_exec] rebind skip: session response unreadable ({exc!r})")
-                return False
-            try:
-                session_body = await _resp.json()
             except Exception:
-                session_body = None
-            try:
-                session_post = (_resp.request.post_data if _resp.request else None)
-            except Exception:
-                session_post = None
-        except Exception as exc:
-            print(f"[link_exec] rebind skip: no session POST observed ({exc!r})")
-            return False
+                pass
         try:
             await _close_ad_popups(ctx, page)
         except Exception:
             pass
-        if not isinstance(session_body, dict) or not session_body.get("sessionId"):
-            print("[link_exec] rebind skip: session response had no sessionId")
-            return False
+
+        _real_fp = ""
+        _req_code = _code
         try:
-            _posted = json.loads(session_post) if session_post else {}
+            _real_fp = (isinstance(_posted, dict) and _posted.get("fingerprint")) or ""
+            _req_code = (isinstance(_posted, dict) and _posted.get("code")) or _code
         except Exception:
-            _posted = {}
-        _fp = _posted.get("fingerprint") or ""
-        _req_code = _posted.get("code") or _code
-        if not _fp:
-            print("[link_exec] rebind skip: session POST had no fingerprint")
-            return False
-        # 2. Rebind ~500ms later with the page's own {code, fingerprint}.
+            pass
+
+        # --- 2. JS fingerprint fallback (page's own storage/globals) ---
+        _js_fp = ""
+        try:
+            _js_fp = await page.evaluate("""() => {
+                try {
+                    const ls = (k) => { try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } };
+                    const ss = (k) => { try { return sessionStorage.getItem(k) || ''; } catch(e){ return ''; } };
+                    return ls('fingerprint') || ls('fp') || ls('visitorId') || ss('fingerprint') || ss('fp')
+                        || (window.fingerprint || window._fp || window.fp || '');
+                } catch(e){ return ''; }
+            }""") or ""
+            _js_fp = str(_js_fp).strip()
+        except Exception:
+            _js_fp = ""
+
+        # --- 3. Candidate loop: real -> js -> dummy (dummy proven live) ---
+        _cands = []
+        for _c in (_real_fp, _js_fp):
+            try:
+                if _c and len(str(_c)) >= 8 and str(_c) not in _cands:
+                    _cands.append(str(_c))
+            except Exception:
+                pass
+        _cands.append("a" * 32)
+        print(f"[link_exec] rebind skip: trying {len(_cands)} fp candidate(s) "
+              f"(real={'yes' if _real_fp else 'no'}, js={'yes' if _js_fp else 'no'}, dummy=yes)")
+
         await asyncio.sleep(0.5)
-        try:
-            _rebind_text = await page.evaluate(
-                """async (args) => {
-                  const r = await fetch('/api/session/rebind', {
-                    method: 'POST', credentials: 'same-origin',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({code: args.code, fingerprint: args.fp}),
-                  });
-                  return await r.text();
-                }""",
-                {"code": _req_code, "fp": _fp},
-            )
-        except Exception as exc:
-            print(f"[link_exec] rebind skip: rebind eval failed ({exc!r})")
+        _sid2 = ""
+        for _i, _fp_try in enumerate(_cands):
+            try:
+                _rebind_text = await page.evaluate(
+                    """async (args) => {
+                      const r = await fetch('/api/session/rebind', {
+                        method: 'POST', credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({code: args.code, fingerprint: args.fp}),
+                      });
+                      return await r.text();
+                    }""",
+                    {"code": _req_code, "fp": _fp_try},
+                )
+            except Exception as exc:
+                print(f"[link_exec] rebind skip: rebind eval failed cand#{_i} ({exc!r})")
+                continue
+            try:
+                _rebind = json.loads(_rebind_text or "")
+            except Exception:
+                _rebind = {}
+            if isinstance(_rebind, dict) and _rebind.get("sessionId") and not _rebind.get("error"):
+                _sid2 = str(_rebind["sessionId"])
+                print(f"[link_exec] rebind skip: cand#{_i} accepted (sid={_sid2[:8]}...)")
+                break
+            print(f"[link_exec] rebind skip: cand#{_i} refused ({str(_rebind)[:120]})")
+        if not _sid2:
+            print("[link_exec] rebind skip: all fp candidates refused -- classic drive")
             return False
-        try:
-            _rebind = json.loads(_rebind_text or "")
-        except Exception:
-            _rebind = {}
-        if not isinstance(_rebind, dict) or not _rebind.get("sessionId") or _rebind.get("error"):
-            print(f"[link_exec] rebind skip: server refused ({str(_rebind)[:120]})")
-            return False
-        _sid2 = str(_rebind["sessionId"])
-        # 3. Jump straight to step 2. The long Turnstile/Go wait downstream
-        # handles the rest; a quick sanity check here only logs.
+        # 4. Jump straight to step 2.
         try:
             _cur = page.url or ""
             _bp = urlparse(_cur or short_link_url)
