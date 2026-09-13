@@ -477,7 +477,7 @@ async def _enrich_hub_dest(dest: str, card) -> str:
             _LOG.info("hub dest enriched to final: %s", _rf[:100])
             dest = _rf
         try:
-            if _rt and (not card.title or card.title == "Gate link"):
+            if _rt and (not card.title or card.title in ("Gate link", "Download link")):
                 card.title = _rt
                 card.file_name = card.file_name or _rt
             if _rs and not card.size:
@@ -501,8 +501,8 @@ async def _finalize_gate_card(card, dest: str, result) -> str:
         pass
     try:
         if (result is not None
-                and getattr(result, "page_title", "") in ("Gate link", "", "(untitled)")
-                and card.title and card.title != "Gate link"):
+                and getattr(result, "page_title", "") in ("Gate link", "Download link", "", "(untitled)")
+                and card.title and card.title not in ("Gate link", "Download link")):
             result.page_title = card.title
     except Exception:
         pass
@@ -1094,9 +1094,10 @@ class Bot:
                 # job with NO movie page fetch, but KEEP the follow hop
                 # (it redirects to the latestnews gate). The per-card
                 # loop below follows it then drives the gate -- same as
-                # a movie-page card.
-                cards = [Card(title="Download link", file_name="", url=job.url)]
-                result = types.SimpleNamespace(page_title="Download link", html_len=0, cards=cards)
+                # a movie-page card. Title starts empty so hub enrichment
+                # fills the real filename (same as gate-direct).
+                cards = [Card(title="", file_name="", url=job.url)]
+                result = types.SimpleNamespace(page_title="Gate link", html_len=0, cards=cards)
             else:
                 result = await _extract_with_diagnostics(  # type: ignore[misc]
                 job.url, session_id=session_id, headless=self.headless
