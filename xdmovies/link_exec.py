@@ -10,7 +10,6 @@ bot can prompt the user to solve and send a fresh cookie.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import sys
 import time
@@ -297,324 +296,6 @@ async def _close_ad_popups(ctx, gate_page) -> Optional[str]:
     if found_dest:
         print(f"[link_exec] destination found in popup tab: {found_dest[:100]}")
     return found_dest
-
-
-async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
-    """Step-1 fast-path: skip the 6s Generate counter via /api/session/rebind.
-
-    Proven live: the gate creates its session on the Generate click
-    (POST /api/session {code, fingerprint} -> {sessionId, token}), and
-    the server does NOT enforce the 6s counter -- POSTing
-    /api/session/rebind {code, fingerprint} ~500ms later with the SAME
-    values the page itself used advances the session server-side. We
-    then navigate straight to /r/<code>?step=2&sid=<id>, landing on the
-    Turnstile stage with the counter + Continue click bypassed (~3-4s
-    net saved per link).
-
-    Safety: the fingerprint is replayed verbatim from the page's own
-    session request (never a dummy value), the POST runs inside the
-    page context (same cookies/UA/origin), and ANY failure returns
-    False so the caller falls back to the classic Generate-counter-
-    Continue UI drive. Never raises; never blocks ads; step 2
-    (Turnstile + Go) is untouched.
-    """
-    try:
-        from urllib.parse import urlparse
-        try:
-            _pu = urlparse(short_link_url or "")
-            _code = (_pu.path or "").rstrip("/").split("/")[-1].split("?")[0]
-        except Exception:
-            _code = ""
-        if not _code:
-            return False
-        # 1. One Generate click (synthetic-first, no pop-under), while
-        # listening for the page's own session-creation POST.
-        try:
-            if not await _wait_visible(page, "#generateBtn", max_wait=12.0):
-                print("[link_exec] rebind skip: #generateBtn never visible")
-                return False
-        except Exception:
-            return False
-        session_body = None
-        session_post = None
-        try:
-            def _is_session_create(r):
-                try:
-                    u = (r.url or "")
-                    return ("/api/session" in u
-                            and "rebind" not in u
-                            and "complete" not in u)
-                except Exception:
-                    return False
-
-            async with page.expect_response(_is_session_create, timeout=20000) as _resp_info:
-                _clicked = await _synthetic_click(page, "#generateBtn")
-                if not _clicked:
-                    _clicked = await _real_click(page, "#generateBtn", max_wait=5.0)
-                if not _clicked:
-                    print("[link_exec] rebind skip: Generate click failed")
-                    return False
-            try:
-                _resp = await _resp_info.value
-            except Exception as exc:
-                print(f"[link_exec] rebind skip: session response unreadable ({exc!r})")
-                return False
-            try:
-                session_body = await _resp.json()
-            except Exception:
-                session_body = None
-            try:
-                session_post = (_resp.request.post_data if _resp.request else None)
-            except Exception:
-                session_post = None
-        except Exception as exc:
-            print(f"[link_exec] rebind skip: no session POST observed ({exc!r})")
-            return False
-        try:
-            await _close_ad_popups(ctx, page)
-        except Exception:
-            pass
-        if not isinstance(session_body, dict) or not session_body.get("sessionId"):
-            print("[link_exec] rebind skip: session response had no sessionId")
-            return False
-        try:
-            _posted = json.loads(session_post) if session_post else {}
-        except Exception:
-            _posted = {}
-        _fp = _posted.get("fingerprint") or ""
-        _req_code = _posted.get("code") or _code
-        if not _fp:
-            print("[link_exec] rebind skip: session POST had no fingerprint")
-            return False
-        # 2. Rebind ~500ms later with the page's own {code, fingerprint}.
-        await asyncio.sleep(0.5)
-        try:
-            _rebind_text = await page.evaluate(
-                """async (args) => {
-                  const r = await fetch('/api/session/rebind', {
-                    method: 'POST', credentials: 'same-origin',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({code: args.code, fingerprint: args.fp}),
-                  });
-                  return await r.text();
-                }""",
-                {"code": _req_code, "fp": _fp},
-            )
-        except Exception as exc:
-            print(f"[link_exec] rebind skip: rebind eval failed ({exc!r})")
-            return False
-        try:
-            _rebind = json.loads(_rebind_text or "")
-        except Exception:
-            _rebind = {}
-        if not isinstance(_rebind, dict) or not _rebind.get("sessionId") or _rebind.get("error"):
-            print(f"[link_exec] rebind skip: server refused ({str(_rebind)[:120]})")
-            return False
-        _sid2 = str(_rebind["sessionId"])
-        # 3. Jump straight to step 2. The long Turnstile/Go wait downstream
-        # handles the rest; a quick sanity check here only logs.
-        try:
-            _cur = page.url or ""
-            _bp = urlparse(_cur or short_link_url)
-            _base = f"{_bp.scheme or 'https'}://{_bp.netloc or GATE_HOST}"
-            _step2 = f"{_base}/r/{_req_code}?step=2&sid={_sid2}"
-            await page.goto(_step2, wait_until="domcontentloaded", timeout=20000)
-            print(f"[link_exec] rebind skip ok: jumped to step 2 (sid={_sid2[:8]}...)")
-        except Exception as exc:
-            print(f"[link_exec] rebind skip: step-2 nav failed ({exc!r})")
-            return False
-        try:
-            await asyncio.sleep(1.5)
-            _ts = await page.evaluate(
-                "() => { const t=document.getElementById('turnstileContainer');"
-                " return !!(t && !t.classList.contains('hidden')); }")
-            if _ts:
-                print("[link_exec] rebind skip ok: Turnstile stage visible")
-        except Exception:
-            pass
-        return True
-    except Exception as exc:
-        print(f"[link_exec] rebind skip error (falling back to UI drive): {exc!r}")
-        return False
-
-
-async def _try_snippet_widget_complete(page, ctx) -> Optional[str]:
-    """Console snippet replication (no adblocker, dummy fp a*32).
-
-    Forces Turnstile visible like the pasted snippet, then 3-method
-    checkbox click (iframe checkbox / turnstile.execute 3s race /
-    widget .cf-turnstile) -> waits 60s for token via
-    turnstile.getResponse() -> POST /api/session/complete
-    {fingerprint:'a'*32, turnstileToken} -> /go/<sid>?t=... .
-
-    Proven live via loop_until_output.py on this VPS: step1 dummy
-    rebind already ok, and this step2 widget+complete also reached
-    hubcloud on first attempt (a1e37... / 082bbd...). Any failure
-    returns None so caller falls back to nudge+cookie path. Never
-    raises; never blocks ads (user asked no adblocker).
-    """
-    try:
-        # sid + code from current step2 URL (?step=2&sid=...)
-        try:
-            from urllib.parse import urlparse, parse_qs
-            _pu = urlparse(page.url or "")
-            _qs = parse_qs(_pu.query or "")
-            _sid = (_qs.get("sid") or [""])[0] or ""
-            _code = (_pu.path or "").rstrip("/").split("/")[-1].split("?")[0]
-        except Exception as _ex:
-            print(f"[link_exec] snippet: sid parse fail {_ex!r}")
-            _sid = ""; _code = ""
-        if not _sid:
-            print(f"[link_exec] snippet: no sid in url {page.url[:100] if page.url else 'no-url'}")
-            return None
-        print(f"[link_exec] snippet: sid={_sid[:8]}... code={_code}")
-        # Force show like snippet (interval in snippet, here one-shot + interval check)
-        try:
-            await page.evaluate("""()=>{
-              const tc=document.getElementById('turnstileContainer');
-              if(tc){ tc.classList.remove('hidden'); tc.style.cssText='display:block!important;visibility:visible!important;'; }
-              const cw=document.getElementById('counterWrapper'); if(cw) cw.style.display='none';
-              const pb=document.getElementById('progressBar'); if(pb) pb.style.display='none';
-            }""")
-            print(f"[link_exec] snippet: forced turnstile visible")
-        except Exception as _e:
-            print(f"[link_exec] snippet: force show fail {_e!r}")
-            pass
-        # Wait turnstile + iframe like snippet (10s + 10s)
-        _has_ts = False
-        for _ in range(20):
-            try:
-                _has_ts = await page.evaluate("()=> !!window.turnstile")
-            except Exception:
-                _has_ts = False
-            if _has_ts:
-                break
-            await asyncio.sleep(0.5)
-        print(f"[link_exec] snippet: turnstile loaded={_has_ts}")
-        if not _has_ts:
-            print(f"[link_exec] snippet: no turnstile after 10s")
-            return None
-        _has_iframe = False
-        for _ in range(20):
-            try:
-                _has_iframe = await page.evaluate("()=> !!document.querySelector('iframe[src*=\"turnstile\"]')")
-            except Exception:
-                _has_iframe = False
-            if _has_iframe:
-                break
-            await asyncio.sleep(0.5)
-        print(f"[link_exec] snippet: iframe={_has_iframe}")
-        # Even if iframe missing, widget path may still succeed (loop run showed token len 773 with iframe False)
-        await asyncio.sleep(1.0)
-        # Loop clicking until token appears: try frame body click (repo style) + widget click
-        _clicked = False
-        _token = ""
-        _start = time.time()
-        _tick = 0
-        while not _token and (time.time() - _start) < 60:
-            _tick += 1
-            # Periodic forced visibility (snippet does every 100ms)
-            try:
-                await page.evaluate("""()=>{
-                  const tc=document.getElementById('turnstileContainer');
-                  if(tc){ tc.classList.remove('hidden'); tc.style.cssText='display:block!important;visibility:visible!important;'; }
-                }""")
-            except Exception:
-                pass
-            # Try widget/frame clicks each tick
-            try:
-                # Try legitimate Turnstile frame like repo does (more reliable than snippet's contentDocument)
-                _fr = None
-                try:
-                    _fr = await _find_legitimate_turnstile_frame(page)
-                except Exception:
-                    _fr = None
-                if _fr is not None:
-                    try:
-                        await _fr.click("body", position={"x": 30, "y": 32}, delay=80, timeout=3000)
-                        _clicked = True
-                        if _tick == 1 or _tick % 5 == 0:
-                            print(f"[link_exec] snippet: frame click tick {_tick}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            # Snippet methods fallback each tick
-            try:
-                _m1 = await page.evaluate("""()=>{
-                  try{
-                    const iframe=document.querySelector('iframe[src*="turnstile"]');
-                    const d=iframe?.contentDocument || iframe?.contentWindow?.document;
-                    const cb=d?.querySelector('input[type="checkbox"]');
-                    if(cb){ cb.click(); return 'clicked'; }
-                    return 'no-cb';
-                  }catch(e){ return 'blocked'; }
-                }""")
-                if _m1 == "clicked":
-                    _clicked = True
-            except Exception:
-                pass
-            if not _clicked:
-                try:
-                    _m3 = await page.evaluate("()=>{try{const w=document.querySelector('.cf-turnstile'); if(w){w.click(); return 'clicked-widget';} return 'no-widget';}catch(e){return 'fail';}}")
-                    if _m3 == "clicked-widget":
-                        _clicked = True
-                except Exception:
-                    pass
-            # Check token
-            try:
-                _token = await page.evaluate("()=>{try{return window.turnstile? window.turnstile.getResponse(): ''}catch(e){return ''}}")
-            except Exception:
-                _token = ""
-            if not _token:
-                try:
-                    _token = await page.evaluate("()=> window._captchaToken || ''")
-                except Exception:
-                    pass
-            if _token and len(_token) >= 10:
-                break
-            await asyncio.sleep(3.0)
-        print(f"[link_exec] snippet: token len={len(_token or '')} wait={round(time.time()-_start,1)}s clicked={_clicked}")
-        if not _token or len(_token) < 10:
-            print(f"[link_exec] snippet: no token after 60s")
-            return None
-        # Complete with dummy fp like snippet (proved live: dummy ok when token real)
-        try:
-            _txt = await page.evaluate("""async (tok)=>{const r=await fetch('/api/session/complete',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:'a'.repeat(32), turnstileToken: tok})}); return await r.text();}""", _token)
-        except Exception as _e:
-            print(f"[link_exec] snippet: complete eval fail {_e!r}")
-            return None
-        try:
-            _j = json.loads(_txt or "")
-        except Exception as _e:
-            print(f"[link_exec] snippet: complete json fail {_e!r} txt={str(_txt)[:100]}")
-            return None
-        print(f"[link_exec] snippet: complete resp {str(_j)[:200]}")
-        if not isinstance(_j, dict) or not _j.get("token") or _j.get("error"):
-            print(f"[link_exec] snippet: complete error {str(_j.get('error'))[:100] if isinstance(_j,dict) else 'no token'}")
-            return None
-        _tok2 = str(_j["token"])
-        try:
-            from urllib.parse import urlparse as _up2
-            _pu2 = _up2(page.url or "")
-            _base2 = f"{_pu2.scheme or 'https'}://{_pu2.netloc or GATE_HOST}"
-            _go = f"{_base2}/go/{_sid}?t={_tok2}"
-        except Exception:
-            _go = f"https://{GATE_HOST}/go/{_sid}?t={_tok2}"
-        # Verify it reaches a destination (hub) quickly; otherwise just return go URL and let caller handle
-        try:
-            # Quick check: fetch go URL in page context to see if it redirects to hub
-            await page.goto(_go, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(1.5)
-            _cur = page.url or ""
-            if _is_destination_url(_cur) and not _is_ad_url(_cur) and "/go/" not in _cur:
-                return _cur
-            # else return go URL itself (caller will extract)
-            return _go
-        except Exception:
-            return _go
-    except Exception:
-        return None
 
 
 async def _wait_visible(page, selector: str, max_wait: float = 12.0) -> bool:
@@ -1117,29 +798,11 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             print(f"[link_exec] not on gate (DOM check); body[:200]={body[:200]!r}")
             return await _extract_destination(page, ctx)
 
-        # STEP 1 FAST-PATH (rebind skip): one Generate click + direct
-        # /api/session/rebind with the page's own fingerprint jumps
-        # straight to step 2, skipping the 6s counter + Continue click.
-        # Any failure falls through to the classic counter-wait loop
-        # below — the skip can never fail a link the UI drive solves.
-        rebind_skipped = False
-        try:
-            rebind_skipped = bool(await _try_rebind_skip(page, ctx, short_link_url))
-        except Exception as exc:
-            print(f"[link_exec] rebind skip raised (falling back): {exc!r}")
-            rebind_skipped = False
-        if rebind_skipped:
-            print("[link_exec] rebind skip ok -- on step 2, jumping to Turnstile wait")
-            got_continue = True
-        else:
-            print("[link_exec] rebind skip missed — classic Generate-counter-Continue drive")
-
-        # STEP 1 (classic): click Generate. Counter starts at 6; we need
-        # >6s + ad load. Loop with periodic popup-close + paused-notice
-        # refocus so the counter doesn't stall while a popup steals focus.
-        # Skipped entirely when the rebind fast-path already landed step 2.
-        max_generate_attempts = 0 if rebind_skipped else 3
-        got_continue = True if rebind_skipped else False
+        # STEP 1: click Generate. Counter starts at 6; we need >6s + ad
+        # load. Loop with periodic popup-close + paused-notice refocus
+        # so the counter doesn't stall while a popup steals focus.
+        max_generate_attempts = 3
+        got_continue = False
         for generate_attempt in range(1, max_generate_attempts + 1):
             if not await _wait_visible(page, "#generateBtn", max_wait=12.0):
                 print(f"[link_exec] #generateBtn never visible (attempt {generate_attempt})")
@@ -1195,21 +858,18 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         if not got_continue:
             return await _extract_destination(page, ctx)
 
-        # STEP 2: click Continue. Same keep-focused pattern. Skipped when
-        # the rebind fast-path already performed the step-1→2 transition
-        # server-side (we are ON step 2; there is no Continue to click).
-        if not rebind_skipped:
-            if not await _real_click(page, "#continueBtn"):
-                return None
-            await _close_ad_popups(ctx, page)
-            _pop_dest = await _close_ad_popups(ctx, page)
-            if _pop_dest:
-                print(f"[link_exec] destination opened in popup tab after continue: {_pop_dest[:100]}")
-                return _pop_dest
-            try:
-                await page.wait_for_load_state("load", timeout=30000)
-            except Exception:
-                pass
+        # STEP 2: click Continue. Same keep-focused pattern.
+        if not await _real_click(page, "#continueBtn"):
+            return None
+        await _close_ad_popups(ctx, page)
+        _pop_dest = await _close_ad_popups(ctx, page)
+        if _pop_dest:
+            print(f"[link_exec] destination opened in popup tab after continue: {_pop_dest[:100]}")
+            return _pop_dest
+        try:
+            await page.wait_for_load_state("load", timeout=30000)
+        except Exception:
+            pass
 
         # Wait for the gate's Turnstile container to unhide. The Turnstile
         # widget is the second-challenge gate; without a valid fingerprint
@@ -1232,39 +892,6 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             except Exception:
                 pass
             await asyncio.sleep(1.0)
-
-        # ---- Console snippet fast-path: force-show Turnstile + widget click + direct complete (no adblocker, dummy fp) ----
-        # Replicates user's pasted console snippet inside the page context (same cookies/origin).
-        # Any failure falls through to the existing nudge+cookie poll below, so this can never break a link the old path would solve.
-        try:
-            print(f"[link_exec] trying snippet widget complete (forced show + widget click)...")
-            _snippet_dest = await _try_snippet_widget_complete(page, ctx)
-            if _snippet_dest and not _is_ad_url(_snippet_dest) and (_is_destination_url(_snippet_dest) or "/go/" in _snippet_dest):
-                print(f"[link_exec] snippet widget complete ok: {_snippet_dest[:100]}")
-                # If it's a /go/ transit URL, follow it to the hub destination before returning
-                if "/go/" in _snippet_dest and not _is_destination_url(_snippet_dest):
-                    try:
-                        # Follow the go URL to final hub (hubcloud etc) - quick static check first
-                        _rf, _rt, _rs = await resolve_hub_details(_snippet_dest)
-                        if _rf and _rf != _snippet_dest:
-                            _snippet_dest = _rf
-                        else:
-                            await page.goto(_snippet_dest, wait_until="domcontentloaded", timeout=20000)
-                            await asyncio.sleep(1.5)
-                            _cur2 = page.url or ""
-                            if _is_destination_url(_cur2) and not _is_ad_url(_cur2):
-                                _snippet_dest = _cur2
-                            else:
-                                _d2 = await _wait_for_hubcloud_deep_link(page, max_wait=10.0, ctx=ctx) or await _extract_destination(page, ctx)
-                                if _d2 and _is_destination_url(_d2):
-                                    _snippet_dest = _d2
-                    except Exception:
-                        pass
-                return _snippet_dest
-            else:
-                print(f"[link_exec] snippet widget complete missed (dest={str(_snippet_dest)[:80] if _snippet_dest else 'None'}), falling back to nudge")
-        except Exception as _e:
-            print(f"[link_exec] snippet widget complete error (falling back): {_e!r}")
 
         # Inner Turnstile (the f/av0 widget that unhides after Continue).
         # On a residential IP it auto-verifies and Go enables by itself.
