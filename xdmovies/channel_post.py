@@ -90,8 +90,9 @@ def parse_channel_title(text: str) -> Optional[str]:
         for rx in _NON_TITLE_RES:
             if rx.search(title):
                 return None
-        # Must contain at least one letter (reject pure emoji/numbers).
-        if not re.search(r"[A-Za-z\u00C0-\u024F]", title):
+        # Must contain at least one letter or digit (reject pure emoji).
+        # Numeric-only titles like 1917 / 300 / 2012 are valid.
+        if not re.search(r"[A-Za-z0-9\u00C0-\u024F]", title):
             return None
         return title[:120]
     except Exception:
