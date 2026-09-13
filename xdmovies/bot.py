@@ -146,11 +146,15 @@ except ImportError:  # pragma: no cover
     ParseMode = None  # type: ignore
 
 
-# Movie/series pages AND direct gate links. A pasted latestnews URL runs
-# as a single-card gate job: no movie-page fetch, no follow hop, straight
-# to the gate drive (saves a full browser + page load per link).
+# Movie/series pages, intermediate download links, AND direct gate links.
+# A pasted latestnews URL runs as a single-card gate job: no movie-page
+# fetch, no follow hop, straight to the gate drive (saves a full browser +
+# page load per link). A pasted link.xdmovies.wtf/download/<token> URL runs
+# as a single-card follow+gate job: it redirects to latestnews, so we keep
+# the follow hop then drive the gate (same path as a movie-page card).
 URL_RE = re.compile(
     r"https?://(?:top\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
+    r"|https?://link\.xdmovies\.wtf/download/[A-Za-z0-9_\-]+"
     r"|https?://latestnewsonline\.sbs/r/[A-Za-z0-9_-]+",
     re.IGNORECASE,
 )
@@ -424,6 +428,25 @@ def _is_gate_url(url: str) -> bool:
         from urllib.parse import urlparse
         h = (urlparse(url or "").hostname or "").lower()
         return bool(h) and (h == _gh or h.endswith("." + _gh))
+    except Exception:
+        return False
+
+
+def _is_download_url(url: str) -> bool:
+    """True for intermediate link.xdmovies.wtf/download/<token> links.
+
+    These redirect to the latestnews gate, so a pasted one runs as a
+    single-card follow+gate job (NOT gate-direct: the follow hop is
+    required). Host + path based, so ad lookalikes can never match.
+    """
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url or "")
+        h = (u.hostname or "").lower()
+        if not h or (h != "link.xdmovies.wtf" and not h.endswith(".link.xdmovies.wtf")):
+            return False
+        path = (u.path or "").lower()
+        return path.startswith("/download/") and len(path) > len("/download/")
     except Exception:
         return False
 
@@ -1066,6 +1089,14 @@ class Bot:
                 # straight to the drive.
                 cards = [Card(title="", file_name="", url=job.url)]
                 result = types.SimpleNamespace(page_title="Gate link", html_len=0, cards=cards)
+            elif _is_download_url(job.url):
+                # Intermediate download link pasted in chat: single-card
+                # job with NO movie page fetch, but KEEP the follow hop
+                # (it redirects to the latestnews gate). The per-card
+                # loop below follows it then drives the gate -- same as
+                # a movie-page card.
+                cards = [Card(title="Download link", file_name="", url=job.url)]
+                result = types.SimpleNamespace(page_title="Download link", html_len=0, cards=cards)
             else:
                 result = await _extract_with_diagnostics(  # type: ignore[misc]
                 job.url, session_id=session_id, headless=self.headless
@@ -1461,8 +1492,9 @@ class Bot:
         job.finished_at = time.time()
         self.last_solve_ago = 0.0
         # remember movie posts for keep-alive refresh (CF is on posts, not
-        # home). Gate-direct jobs have no post page -- nothing to remember.
-        if not _is_gate_url(job.url):
+        # home). Gate-direct and download-direct jobs have no post page --
+        # nothing to remember.
+        if not _is_gate_url(job.url) and not _is_download_url(job.url):
             try:
                 from xdmovies.keep_alive import remember_movie_url
                 remember_movie_url(job.url)
@@ -3798,6 +3830,7 @@ class Bot:
         await _send_safe(
             context.bot, update.effective_chat.id,
             "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
+            "or a download link like `https://link.xdmovies.wtf/download/<token>` "
             "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
             parse_mode=ParseMode.HTML,
         )
