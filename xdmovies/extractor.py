@@ -433,3 +433,84 @@ def group_cards_by_quality(cards: List[Card]) -> List[QualityGroup]:
         )
 
     return [buckets[k] for k in sorted(order, key=_rank)]
+
+
+# ---------------------------------------------------------------------------
+# Section grouping for /dmode (download mode) picker.
+# Cards are bucketed by (season, section) where section is "packs" or
+# "episodes" — mirroring the site's own "Season N Packs/Zips" /
+# "Season N Episodes" toggle sections (e.g. Reacher: S1..S4 x packs/ep).
+# Season is reused from _parse_quality_key (S01 / S01E05 markers);
+# section comes from Card.kind (pack-title -> pack, episode-title ->
+# episode). Pure function, no I/O. Page order preserved inside buckets.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SectionGroup:
+    """One toggle row in the dmode picker: all pack OR episode cards of
+    one season. `cards` keeps page order."""
+    season: int = 0  # 0 = unknown -> rendered under "Other"
+    section: str = ""  # "packs" | "episodes"
+    cards: List[Card] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.cards is None:
+            self.cards = []
+
+    @property
+    def label(self) -> str:
+        sec = "Packs" if self.section == "packs" else "Episodes"
+        if self.season <= 0:
+            return f"Other {sec} ({len(self.cards)})"
+        return f"S{self.season} {sec} ({len(self.cards)})"
+
+    @property
+    def section_header(self) -> str:
+        return f"Season {self.season}" if self.season > 0 else "Other"
+
+
+_SECTION_RANK = {"packs": 0, "episodes": 1}
+
+
+def _parse_section_key(title: str, kind: str) -> Tuple[int, str]:
+    """(season, section) for one card. Unknown kind lands in BOTH sections
+    via the caller (see group_cards_by_section) so movies/untagged markup
+    are never filtered to zero."""
+    season, _quality, _codec = _parse_quality_key(title)
+    k = (kind or "").lower()
+    if k == "pack":
+        return season, "packs"
+    if k == "episode":
+        return season, "episodes"
+    return season, ""
+
+
+def group_cards_by_section(cards: List[Card]) -> List[SectionGroup]:
+    """Bucket cards into ordered SectionGroups for the /dmode picker.
+
+    Buckets sort by season asc (unknown last), packs before episodes
+    within a season. Cards with no kind info (custom/movie markup) are
+    kept under BOTH sections so section filtering can never wipe a job
+    to zero — same rule as filter_cards_by_content.
+    """
+    buckets: dict = {}
+    order: List[Tuple[int, str]] = []
+    for c in cards or []:
+        season, section = _parse_section_key(c.title, c.kind)
+        keys = [(season, section)] if section else [(season, "packs"), (season, "episodes")]
+        for key in keys:
+            if key not in buckets:
+                buckets[key] = SectionGroup(season=key[0], section=key[1])
+                order.append(key)
+            buckets[key].cards.append(c)
+
+    def _rank(key: Tuple[int, str]):
+        season, section = key
+        season_rank = season if season > 0 else 10**6
+        return (
+            season_rank,
+            _SECTION_RANK.get(section, 2),
+            order.index(key),
+        )
+
+    return [buckets[k] for k in sorted(order, key=_rank)]

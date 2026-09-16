@@ -666,6 +666,15 @@ QPICK_TIMEOUT = 120.0
 # on choosing and resolve everything rather than paginating a picker.
 QPICK_MAX_GROUPS = 40
 
+# /dmode series section picker: pid -> {uid, chat_id, msg_id,
+# groups (List[SectionGroup]), selected (set[int]), event, verdict}.
+# Fully separate from _QPICK (different dict, different callback prefix
+# `dp:`) so the two pickers can never collide, even when both run in
+# sequence for one job. Same 2m window / transient semantics as qmode.
+_DPICK: Dict[str, dict] = {}
+DPICK_TIMEOUT = 120.0
+DPICK_MAX_GROUPS = 40
+
 
 def _fit_button(s: str, limit: int = 60) -> str:
     """Truncate to a byte budget (Bot API button text is 1-64 bytes;
@@ -743,6 +752,45 @@ def _qpick_text(page_title: str, groups) -> str:
         if g.section != last_section:
             lines.append(f"<b>{_html_escape(g.section)}:</b>")
             last_section = g.section
+    lines.append("Tap to select (✅) or Select All. Done = resolve picked (empty = all). 2m no choice = cancel.")
+    return "\n".join(lines)
+
+
+def _dpick_keyboard(pid: str, groups, selected) -> "InlineKeyboardMarkup":
+    """Toggle grid for the /dmode section picker. Separate `dp:` callback
+    namespace from the qmode `qp:` one so taps can never cross-talk.
+    Callback payloads stay far under the 64-byte Telegram limit
+    (`dp:<8hex>:t:<gi>`)."""
+    rows = []
+    row = []
+    for gi, g in enumerate(groups):
+        label = _fit_button(f"{'✅ ' if gi in selected else ''}{g.label}")
+        row.append(InlineKeyboardButton(label, callback_data=f"dp:{pid}:t:{gi}"))  # type: ignore[misc]
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("☑️ Select All", callback_data=f"dp:{pid}:all"),  # type: ignore[misc]
+    ])
+    rows.append([
+        InlineKeyboardButton("✅ Done", callback_data=f"dp:{pid}:done"),  # type: ignore[misc]
+        InlineKeyboardButton("❌ Cancel", callback_data=f"dp:{pid}:cancel"),  # type: ignore[misc]
+    ])
+    return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+
+def _dpick_text(page_title: str, groups) -> str:
+    """Picker body (HTML) for /dmode: season headers + usage line."""
+    lines = ["What sections you want? (Packs vs Episodes per season)"]
+    if page_title:
+        lines.append(f"<b>{_html_escape(page_title.strip()[:80])}</b>")
+    last_section = None
+    for g in groups:
+        if g.section_header != last_section:
+            lines.append(f"<b>{_html_escape(g.section_header)}:</b>")
+            last_section = g.section_header
     lines.append("Tap to select (✅) or Select All. Done = resolve picked (empty = all). 2m no choice = cancel.")
     return "\n".join(lines)
 
@@ -1287,6 +1335,32 @@ class Bot:
                 _LOG.debug(f"keep_alive touch failed: {_e!r}")
             return
 
+        # /dmode section picker (series only, dmode ON, 2+ groups):
+        # narrow the card list before the resolve loop. None = the user
+        # cancelled at the picker (or /cancel fired mid-pick).
+        # Runs FIRST so /qmode (when also ON) only offers qualities
+        # present in the chosen sections.
+        try:
+            _dpicked = await self._ask_download(
+                job, cards, page_title=(result.page_title or ""))
+        except Exception:
+            _LOG.exception("section picker failed (non-fatal) -- resolving all")
+            _dpicked = list(cards)
+        if _dpicked is None:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            return
+        if [c.url for c in _dpicked] != [c.url for c in cards]:
+            _LOG.info(
+                "section picker: %d/%d cards kept for %s",
+                len(_dpicked), len(cards), job.url,
+            )
+            cards = _dpicked
+            try:
+                result.cards = _dpicked
+            except Exception:
+                pass
+
         # /qmode quality picker (series only, qmode ON, 2+ groups):
         # narrow the card list before the resolve loop. None = the user
         # cancelled at the picker (or /cancel fired mid-pick).
@@ -1300,6 +1374,23 @@ class Bot:
             job.status = "cancelled"
             job.finished_at = time.time()
             return
+        if not _picked and cards:
+            # Empty intersection: qmode matched nothing inside the dmode
+            # set. Keep the dmode selection rather than resolving zero.
+            _LOG.info(
+                "quality picker matched 0/%d section-picked cards for %s -- keeping section set",
+                len(cards), job.url,
+            )
+            try:
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"⚠️ quality matched nothing in your sections -- resolving the "
+                    f"<b>{len(cards)}</b> section links instead.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            _picked = list(cards)
         if [c.url for c in _picked] != [c.url for c in cards]:
             _LOG.info(
                 "quality picker: %d/%d cards kept for %s",
@@ -2810,6 +2901,253 @@ class Bot:
             return None
         return list(cards)
 
+    async def _cmd_dmode(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        if not bot_config.is_allowed(update.effective_user.id, self.cfg):
+            return  # silent (bot convention)
+        from xdmovies import dmode_store
+        on = dmode_store.is_dmode_on(update.effective_user.id)
+        keyboard = InlineKeyboardMarkup([  # type: ignore[misc]
+            [InlineKeyboardButton("✅ Yes", callback_data="dmode:set:yes")],  # type: ignore[misc]
+            [InlineKeyboardButton("❌ No", callback_data="dmode:set:no")],  # type: ignore[misc]
+        ])
+        text = (
+            "Do you want to enable download mode?\n"
+            f"Currently: <b>{'ON' if on else 'OFF'}</b>\n"
+            "ON = series links show a section picker (Season N Packs vs "
+            "Season N Episodes) before resolving. "
+            "OFF = resolve everything as today."
+        )
+        try:
+            await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        except _TelegramError.BadRequest:
+            try:
+                await update.message.reply_text(
+                    text.replace("<b>", "").replace("</b>", ""),
+                    reply_markup=keyboard)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _on_dmode_choice(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        data = query.data or ""
+        if data not in ("dmode:set:yes", "dmode:set:no"):
+            return
+        from xdmovies import dmode_store
+        on = dmode_store.set_dmode(query.from_user.id, data == "dmode:set:yes")
+        text = (
+            f"Download mode: <b>{'ON' if on else 'OFF'}</b>\n"
+            + ("Series links will now ask which sections (Packs/Episodes) to resolve."
+               if on else "Series links resolve everything as before.")
+        )
+        if query.message is not None:
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(text.replace("<b>", "").replace("</b>", ""))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def _on_dpick(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        parts = (query.data or "").split(":")
+        if len(parts) < 3 or parts[0] != "dp":
+            return
+        pid = parts[1]
+        st = _DPICK.get(pid)
+        if st is None:
+            if query.message is not None:
+                try:
+                    await query.edit_message_text("⌛ picker expired -- resend the link.")
+                except Exception:
+                    pass
+            return
+        if query.from_user.id != st.get("uid"):
+            return  # only the requester's taps count
+        action = parts[2]
+        if action == "done" and len(parts) == 3:
+            st["verdict"] = "done"
+            st["event"].set()
+        elif action == "cancel" and len(parts) == 3:
+            st["verdict"] = "cancel"
+            st["event"].set()
+        elif action == "all" and len(parts) == 3:
+            try:
+                groups = st.get("groups") or []
+                sel = st.get("selected")
+                if sel is None:
+                    sel = st["selected"] = set()
+                for gi in range(len(groups)):
+                    sel.add(gi)
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=_dpick_keyboard(pid, groups, sel))
+                except _TelegramError.BadRequest:
+                    pass  # MessageNotModified on rapid double-tap
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        elif action == "t" and len(parts) == 4 and parts[3].isdigit():
+            gi = int(parts[3])
+            groups = st.get("groups") or []
+            if 0 <= gi < len(groups):
+                sel = st.get("selected")
+                if sel is None:
+                    sel = st["selected"] = set()
+                if gi in sel:
+                    sel.discard(gi)
+                else:
+                    sel.add(gi)
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=_dpick_keyboard(pid, groups, sel))
+                except _TelegramError.BadRequest:
+                    pass  # MessageNotModified on rapid double-tap
+                except Exception:
+                    pass
+        # anything else: malformed payload, ignore
+
+    async def _ask_download(self, job: "Job", cards, page_title: str = "") -> Optional[list]:
+        """Series section picker (/dmode). Returns the cards to resolve, or
+        None when the user cancelled at the picker.
+
+        Skipped (all cards returned) when: job is silent/channel-routed
+        (scrape-all children must never stall), URL is not /series/,
+        dmode is OFF for this user, or fewer than 2 section groups.
+        Runs BEFORE _ask_quality when both modes are ON.
+        """
+        from xdmovies.extractor import group_cards_by_section
+        from xdmovies import dmode_store
+        try:
+            if job.silent or job.post_to_channel:
+                return list(cards)
+            if "/series/" not in (job.url or "").lower():
+                return list(cards)
+            if not dmode_store.is_dmode_on(job.user_id):
+                return list(cards)
+        except Exception:
+            return list(cards)
+        # Auto-channel mode: a preset channel is set, so every paste-link
+        # job mirrors there with zero questions -- skip the picker and
+        # resolve everything (user chose: no modes, post all).
+        try:
+            from xdmovies.scrape_all import load_channel as _load_chan
+            _ch = _load_chan()
+            if _ch is not None and getattr(_ch, "channel_id", 0):
+                return list(cards)
+        except Exception:
+            pass
+        try:
+            groups = group_cards_by_section(cards)
+        except Exception:
+            _LOG.exception("section grouping failed (non-fatal) -- resolving all")
+            return list(cards)
+        if len(groups) <= 1:
+            return list(cards)
+        if len(groups) > DPICK_MAX_GROUPS:
+            await _send_safe(
+                self._bot, job.chat_id,
+                f"Too many section groups ({len(groups)}) to pick from -- resolving all {len(cards)} links.",
+                parse_mode=ParseMode.HTML,
+            )
+            return list(cards)
+        pid = uuid.uuid4().hex[:8]
+        while pid in _DPICK:  # 32-bit id; re-roll on the freak collision
+            pid = uuid.uuid4().hex[:8]
+        ev = asyncio.Event()
+        _DPICK[pid] = {
+            "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
+            "groups": groups, "selected": set(), "event": ev, "verdict": None,
+        }
+        try:
+            msg_id = await _send_markup_safe(
+                self._bot, job.chat_id,
+                _dpick_text(_best_picker_title(page_title, job.url), groups),
+                _dpick_keyboard(pid, groups, set()),
+            )
+        except Exception:
+            msg_id = None
+        if msg_id is None:
+            _DPICK.pop(pid, None)
+            return list(cards)
+        _DPICK[pid]["msg_id"] = msg_id
+        verdict = None
+        selected: set = set()
+        try:
+            deadline = time.time() + DPICK_TIMEOUT
+            while time.time() < deadline:
+                if job.cancel_event.is_set():
+                    _DPICK.get(pid, {})["verdict"] = "cancel"
+                    break
+                try:
+                    await asyncio.wait_for(ev.wait(), 1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            st = _DPICK.pop(pid, None) or {}
+            verdict = st.get("verdict")
+            selected = set(st.get("selected") or set())
+        finally:
+            # Cleanup runs even on task-cancel/shutdown so the picker
+            # entry never leaks and the message is never orphaned.
+            _DPICK.pop(pid, None)
+            await _drop_msg(self._bot, job.chat_id, msg_id)
+        if verdict == "cancel" or job.cancel_event.is_set():
+            await _send_safe(self._bot, job.chat_id, "🛑 section pick cancelled -- job stopped.")
+            return None
+        if verdict == "done" and selected:
+            picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
+            # De-dupe: untagged cards appear under both sections.
+            seen = set()
+            uniq = []
+            for c in picked:
+                try:
+                    key = c.url
+                except Exception:
+                    key = id(c)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(c)
+            picked = uniq
+            if not picked:
+                return list(cards)
+            await _send_safe(
+                self._bot, job.chat_id,
+                f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
+                parse_mode=ParseMode.HTML,
+            )
+            return picked
+        if verdict != "done":
+            await _send_safe(
+                self._bot, job.chat_id,
+                "⏳ no choice in 2m -- job cancelled.",
+                parse_mode=ParseMode.HTML,
+            )
+            return None
+        return list(cards)
+
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
             return
@@ -3719,14 +4057,17 @@ class Bot:
 
     async def _resolve_channel_title(self, uid: int, chat_id: int, raw_title: str,
                                      user_name: str = "", username: str = "") -> bool:
-        """Search + auto best-match enqueue for a channel-post title.
+        """Search + exact-match enqueue for a channel-post title.
 
-        Returns True when a job was enqueued (normal or urgent), False
-        when search found nothing / unavailable (caller already replied).
-        Never raises — all failures reply inline.
+        Exact normalized-title match auto-enqueues (normal or urgent).
+        When nothing matches exactly, shows the search picker instead of
+        blindly taking the top fuzzy hit (which scraped the wrong movie,
+        e.g. "Dark" -> "Darkness Falls"). Returns True when handled
+        (enqueued or picker shown), False on search failure/empty
+        (caller already replied). Never raises — all failures reply inline.
         """
         try:
-            from xdmovies.channel_post import pick_best_match
+            from xdmovies.channel_post import find_exact_match
             from xdmovies.search import SearchUnavailable, search_titles
         except Exception as exc:
             _LOG.warning("channel title search import failed: %r", exc)
@@ -3737,7 +4078,7 @@ class Bot:
             )
             return False
         try:
-            results = await search_titles(raw_title, limit=5)
+            results = await search_titles(raw_title, limit=_SEARCH_FETCH_LIMIT)
         except Exception as exc:
             _LOG.warning("channel title search failed for %r: %r", raw_title, exc)
             await _send_safe(
@@ -3754,16 +4095,29 @@ class Bot:
             )
             return False
         try:
-            picked = pick_best_match(raw_title, results)
+            picked = find_exact_match(raw_title, results)
         except Exception:
-            picked = results[0] if results else None
+            picked = None
         if picked is None:
-            await _send_safe(
-                self._bot, chat_id,
-                f"Not found: <code>{_html_escape(raw_title)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return False
+            # No exact match — let the user pick instead of scraping the
+            # wrong title. Reuses the /search picker flow (cache + buttons).
+            try:
+                _SEARCH_CACHE[uid] = (time.time(), raw_title, results)
+                page, total_pages, keyboard = _search_page_keyboard(results, 1)
+                text = (
+                    f"⚠️ No exact match for <code>{_html_escape(raw_title)}</code> — "
+                    f"tap the right one below (wrong auto-pick disabled).\n"
+                    + _search_page_text(raw_title, results, page, total_pages)
+                )
+                await _send_markup_safe(self._bot, chat_id, text, keyboard)
+            except Exception:
+                _LOG.exception("channel title picker failed")
+                await _send_safe(
+                    self._bot, chat_id,
+                    f"Not found: <code>{_html_escape(raw_title)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return True
         try:
             url = getattr(picked, "url", "")
             title = getattr(picked, "title", "") or raw_title
@@ -4088,6 +4442,15 @@ class Bot:
             pattern=r"^qp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
         ))
         app.add_handler(CommandHandler("qmode", self._cmd_qmode))
+        app.add_handler(CallbackQueryHandler(
+            self._on_dmode_choice,
+            pattern=r"^dmode:set:(yes|no)$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_dpick,
+            pattern=r"^dp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
+        ))
+        app.add_handler(CommandHandler("dmode", self._cmd_dmode))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         # TEXT covers plain DMs, CAPTION covers forwarded channel
         # photo+caption posts (filters are disjoint in PTB v21).

@@ -108,24 +108,57 @@ def _normalize(s: str) -> str:
         return ""
 
 
-def pick_best_match(title: str, results) -> Optional[object]:
-    """Best-match pick from search results (operator: auto, year ignored).
+def _strip_trailing_year(norm: str) -> str:
+    """Remove a trailing release year from an already-normalized title.
 
-    Exact normalized-title match wins, else the top result (search API
-    already ranks by relevance). Returns None on empty input. Never raises.
+    The search API sometimes folds the year into the title ("Sweetpea
+    (2024)" -> "sweetpea 2024") while channel posts carry it separately
+    (stripped by parse_channel_title). Comparing both forms keeps the
+    exact-match path working either way.
     """
+    try:
+        return re.sub(r"\s+(19\d{2}|20\d{2})\s*$", "", norm or "").strip()
+    except Exception:
+        return norm
+
+
+def find_exact_match(title: str, results) -> Optional[object]:
+    """Exact normalized-title match, or None. Never raises."""
     try:
         seq = list(results or [])
         if not seq or not title:
             return None
         want = _normalize(title)
-        if want:
-            for r in seq:
-                try:
-                    if _normalize(getattr(r, "title", "")) == want:
-                        return r
-                except Exception:
-                    continue
-        return seq[0]
+        if not want:
+            return None
+        for r in seq:
+            try:
+                cand = _normalize(getattr(r, "title", ""))
+                if cand == want or _strip_trailing_year(cand) == want:
+                    return r
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def pick_best_match(title: str, results) -> Optional[object]:
+    """Best-match pick from search results (operator: auto, year ignored).
+
+    Exact normalized-title match wins, else the top result (search API
+    already ranks by relevance). Returns None on empty input. Never raises.
+
+    NOTE: channel forwards no longer use the top-result fallback — see
+    Bot._resolve_channel_title, which shows a picker when there is no
+    exact match (blindly taking seq[0] scraped the wrong movie, e.g.
+    "Dark" -> "Darkness Falls"). Kept for back-compat only.
+    """
+    try:
+        exact = find_exact_match(title, results)
+        if exact is not None:
+            return exact
+        seq = list(results or [])
+        return seq[0] if seq else None
     except Exception:
         return None
