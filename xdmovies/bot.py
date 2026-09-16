@@ -4338,6 +4338,7 @@ class Bot:
                 BotCommand("scrapeall", "scrape all movies or series"),
                 BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
                 BotCommand("qmode", "toggle quality picker for series"),
+                BotCommand("dmode", "toggle section picker for series"),
             ])
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
