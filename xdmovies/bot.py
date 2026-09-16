@@ -2321,6 +2321,8 @@ class Bot:
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
             "/scrapeallchannel -- scrape to your channel (owner only)\n"
             "/cancel -- stop your running/queued job\n"
+            "/qmode -- toggle quality picker for series\n"
+            "/dmode -- toggle section (Packs/Episodes) picker for series\n"
             "/restart -- restart the whole bot (owner only)\n"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -2392,12 +2394,37 @@ class Bot:
                 desktop_line = "\n<b>desktop:</b> [FAIL] xdmovies-vnc not active (set XDMOVIES_ENABLE_VNC=1 in deploy env)\n"
         except Exception:
             desktop_line = ""
+        # Picker modes for the requesting user + preset channel. A preset
+        # channel suppresses the /qmode + /dmode pickers by design, so it
+        # is shown here to explain "why didn't it ask me".
+        try:
+            from xdmovies import qmode_store as _qm, dmode_store as _dm
+            _modes_line = (
+                f"\n<b>modes (you):</b> qmode="
+                f"{'ON' if _qm.is_qmode_on(update.effective_user.id) else 'OFF'} "
+                f"dmode={'ON' if _dm.is_dmode_on(update.effective_user.id) else 'OFF'}\n"
+            )
+        except Exception:
+            _modes_line = ""
+        try:
+            from xdmovies.scrape_all import load_channel as _lc
+            _ch = _lc()
+            if _ch is not None and getattr(_ch, "channel_id", 0):
+                _chan_line = (
+                    f"\n<b>channel:</b> preset to "
+                    f"{_html_escape(str(getattr(_ch, 'title', '') or _ch.channel_id))} "
+                    f"-- pickers (qmode/dmode) are skipped while set\n"
+                )
+            else:
+                _chan_line = "\n<b>channel:</b> none preset -- pickers ask normally\n"
+        except Exception:
+            _chan_line = ""
         text = (
             "🟢 <b>alive</b> (VPS token solve-server + CloakBrowser, no VPN layer)\n"
             f"queue: <b>{depth}</b>\n"
             f"current: {cur}\n"
             f"last solve: {last}\n"
-            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}\n"
+            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}\n"
             f"<b>cookies:</b>\n{cst}"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -2807,10 +2834,13 @@ class Bot:
         from xdmovies import qmode_store
         try:
             if job.silent or job.post_to_channel:
+                _LOG.info("qmode picker skipped (silent/channel-routed job) for %s", job.url)
                 return list(cards)
             if "/series/" not in (job.url or "").lower():
+                _LOG.info("qmode picker skipped (not a series URL) for %s", job.url)
                 return list(cards)
             if not qmode_store.is_qmode_on(job.user_id):
+                _LOG.info("qmode picker skipped (qmode OFF for user %d) for %s", job.user_id, job.url)
                 return list(cards)
         except Exception:
             return list(cards)
@@ -2821,6 +2851,8 @@ class Bot:
             from xdmovies.scrape_all import load_channel as _load_chan
             _ch = _load_chan()
             if _ch is not None and getattr(_ch, "channel_id", 0):
+                _LOG.info("qmode picker skipped (preset channel %s set) for %s",
+                          getattr(_ch, "channel_id", "?"), job.url)
                 return list(cards)
         except Exception:
             pass
@@ -2830,6 +2862,7 @@ class Bot:
             _LOG.exception("quality grouping failed (non-fatal) -- resolving all")
             return list(cards)
         if len(groups) <= 1:
+            _LOG.info("qmode picker skipped (%d quality group) for %s", len(groups), job.url)
             return list(cards)
         if len(groups) > QPICK_MAX_GROUPS:
             await _send_safe(
@@ -3041,10 +3074,13 @@ class Bot:
         from xdmovies import dmode_store
         try:
             if job.silent or job.post_to_channel:
+                _LOG.info("dmode picker skipped (silent/channel-routed job) for %s", job.url)
                 return list(cards)
             if "/series/" not in (job.url or "").lower():
+                _LOG.info("dmode picker skipped (not a series URL) for %s", job.url)
                 return list(cards)
             if not dmode_store.is_dmode_on(job.user_id):
+                _LOG.info("dmode picker skipped (dmode OFF for user %d) for %s", job.user_id, job.url)
                 return list(cards)
         except Exception:
             return list(cards)
@@ -3055,6 +3091,8 @@ class Bot:
             from xdmovies.scrape_all import load_channel as _load_chan
             _ch = _load_chan()
             if _ch is not None and getattr(_ch, "channel_id", 0):
+                _LOG.info("dmode picker skipped (preset channel %s set) for %s",
+                          getattr(_ch, "channel_id", "?"), job.url)
                 return list(cards)
         except Exception:
             pass
@@ -3064,6 +3102,7 @@ class Bot:
             _LOG.exception("section grouping failed (non-fatal) -- resolving all")
             return list(cards)
         if len(groups) <= 1:
+            _LOG.info("dmode picker skipped (%d section group) for %s", len(groups), job.url)
             return list(cards)
         if len(groups) > DPICK_MAX_GROUPS:
             await _send_safe(
