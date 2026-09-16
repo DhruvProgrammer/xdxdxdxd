@@ -46,6 +46,14 @@ _LOCK = None  # set in main()
 def _acquire_single_instance_lock() -> "fcntl.flock|None":
     """Best-effort advisory lock. On Windows (no fcntl) we fall back to a
     stale-lock check on the lockfile's mtime.
+
+    Returns the fd on POSIX when the lock is OURS, else None. IMPORTANT:
+    on POSIX, None means ANOTHER LIVE instance holds the flock (kernel
+    releases it on process death, so it can never be stale) -- main()
+    must refuse to start a second poller in that case. Two pollers split
+    Telegram updates between them, so one instance can run a job with
+    stale code while the other answers commands: silent wrong behavior
+    with zero errors in either log.
     """
     try:
         import fcntl  # type: ignore[import-not-found]
@@ -53,6 +61,10 @@ def _acquire_single_instance_lock() -> "fcntl.flock|None":
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
             return None
         os.write(fd, str(os.getpid()).encode("ascii"))
         return fd
@@ -2833,6 +2845,14 @@ class Bot:
         from xdmovies.extractor import group_cards_by_quality
         from xdmovies import qmode_store
         try:
+            _LOG.info(
+                "qmode picker check: pid=%d user=%d url=%s cards=%d qmode=%s",
+                os.getpid(), job.user_id, job.url, len(cards or []),
+                "ON" if qmode_store.is_qmode_on(job.user_id) else "OFF",
+            )
+        except Exception:
+            pass
+        try:
             if job.silent or job.post_to_channel:
                 _LOG.info("qmode picker skipped (silent/channel-routed job) for %s", job.url)
                 return list(cards)
@@ -2871,68 +2891,99 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return list(cards)
-        pid = uuid.uuid4().hex[:8]
-        while pid in _QPICK:  # 32-bit id; re-roll on the freak collision
+        # Exact-error trap (same contract as the dmode picker): unexpected
+        # crashes surface the exception (log + user message) instead of
+        # silently resolving everything.
+        try:
+            _LOG.info(
+                "qmode picker showing: pid=%d groups=%d cards=%d for %s",
+                os.getpid(), len(groups), len(cards), job.url,
+            )
             pid = uuid.uuid4().hex[:8]
-        ev = asyncio.Event()
-        _QPICK[pid] = {
-            "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
-            "groups": groups, "selected": set(), "event": ev, "verdict": None,
-        }
-        try:
-            msg_id = await _send_markup_safe(
-                self._bot, job.chat_id,
-                _qpick_text(_best_picker_title(page_title, job.url), groups),
-                _qpick_keyboard(pid, groups, set()),
-            )
-        except Exception:
-            msg_id = None
-        if msg_id is None:
-            _QPICK.pop(pid, None)
+            while pid in _QPICK:  # 32-bit id; re-roll on the freak collision
+                pid = uuid.uuid4().hex[:8]
+            ev = asyncio.Event()
+            _QPICK[pid] = {
+                "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
+                "groups": groups, "selected": set(), "event": ev, "verdict": None,
+            }
+            try:
+                msg_id = await _send_markup_safe(
+                    self._bot, job.chat_id,
+                    _qpick_text(_best_picker_title(page_title, job.url), groups),
+                    _qpick_keyboard(pid, groups, set()),
+                )
+            except Exception as send_exc:
+                msg_id = None
+                _QPICK.pop(pid, None)
+                raise RuntimeError(f"picker send raised: {send_exc!r}") from send_exc
+            if msg_id is None:
+                _QPICK.pop(pid, None)
+                raise RuntimeError("picker send returned None (see 'picker send failed' traceback just above in log)")
+            _QPICK[pid]["msg_id"] = msg_id
+            verdict = None
+            selected: set = set()
+            try:
+                deadline = time.time() + QPICK_TIMEOUT
+                while time.time() < deadline:
+                    if job.cancel_event.is_set():
+                        _QPICK.get(pid, {})["verdict"] = "cancel"
+                        break
+                    try:
+                        await asyncio.wait_for(ev.wait(), 1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+                st = _QPICK.pop(pid, None) or {}
+                verdict = st.get("verdict")
+                selected = set(st.get("selected") or set())
+            finally:
+                # Cleanup runs even on task-cancel/shutdown so the picker
+                # entry never leaks and the message is never orphaned.
+                _QPICK.pop(pid, None)
+                await _drop_msg(self._bot, job.chat_id, msg_id)
+            if verdict == "cancel" or job.cancel_event.is_set():
+                await _send_safe(self._bot, job.chat_id, "🛑 quality pick cancelled -- job stopped.")
+                return None
+            if verdict == "done" and selected:
+                picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
+                if not picked:
+                    return list(cards)
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return picked
+            if verdict != "done":
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    "⏳ no choice in 2m -- job cancelled.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return None
             return list(cards)
-        _QPICK[pid]["msg_id"] = msg_id
-        verdict = None
-        selected: set = set()
-        try:
-            deadline = time.time() + QPICK_TIMEOUT
-            while time.time() < deadline:
-                if job.cancel_event.is_set():
-                    _QPICK.get(pid, {})["verdict"] = "cancel"
-                    break
-                try:
-                    await asyncio.wait_for(ev.wait(), 1.0)
-                    break
-                except asyncio.TimeoutError:
-                    continue
-            st = _QPICK.pop(pid, None) or {}
-            verdict = st.get("verdict")
-            selected = set(st.get("selected") or set())
-        finally:
-            # Cleanup runs even on task-cancel/shutdown so the picker
-            # entry never leaks and the message is never orphaned.
-            _QPICK.pop(pid, None)
-            await _drop_msg(self._bot, job.chat_id, msg_id)
-        if verdict == "cancel" or job.cancel_event.is_set():
-            await _send_safe(self._bot, job.chat_id, "🛑 quality pick cancelled -- job stopped.")
-            return None
-        if verdict == "done" and selected:
-            picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
-            if not picked:
-                return list(cards)
-            await _send_safe(
-                self._bot, job.chat_id,
-                f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
-                parse_mode=ParseMode.HTML,
+        except Exception as exc:
+            _LOG.exception(
+                "qmode picker CRASHED (pid=%d user=%d url=%s cards=%d): %r",
+                os.getpid(), job.user_id, job.url, len(cards or []), exc,
             )
-            return picked
-        if verdict != "done":
-            await _send_safe(
-                self._bot, job.chat_id,
-                "⏳ no choice in 2m -- job cancelled.",
-                parse_mode=ParseMode.HTML,
-            )
-            return None
-        return list(cards)
+            try:
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"⚠️ quality picker crashed: "
+                    f"<code>{_html_escape(exc.__class__.__name__ + ': ' + str(exc)[:200])}</code> "
+                    f"-- resolving all <b>{len(cards)}</b> links. "
+                    f"Forward this + /status to the owner.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            try:
+                _QPICK.pop(pid, None)  # type: ignore[possibly-unbound]
+            except Exception:
+                pass
+            return list(cards)
 
     async def _cmd_dmode(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -3073,6 +3124,14 @@ class Bot:
         from xdmovies.extractor import group_cards_by_section
         from xdmovies import dmode_store
         try:
+            _LOG.info(
+                "dmode picker check: pid=%d user=%d url=%s cards=%d dmode=%s",
+                os.getpid(), job.user_id, job.url, len(cards or []),
+                "ON" if dmode_store.is_dmode_on(job.user_id) else "OFF",
+            )
+        except Exception:
+            pass
+        try:
             if job.silent or job.post_to_channel:
                 _LOG.info("dmode picker skipped (silent/channel-routed job) for %s", job.url)
                 return list(cards)
@@ -3111,81 +3170,113 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return list(cards)
-        pid = uuid.uuid4().hex[:8]
-        while pid in _DPICK:  # 32-bit id; re-roll on the freak collision
+        # Exact-error trap: ANY unexpected crash below must surface the
+        # exception (log + user message) instead of silently resolving
+        # everything. Normal paths (cancel / timeout / done / empty=all)
+        # return from inside the try untouched.
+        try:
+            _LOG.info(
+                "dmode picker showing: pid=%d groups=%d cards=%d for %s",
+                os.getpid(), len(groups), len(cards), job.url,
+            )
             pid = uuid.uuid4().hex[:8]
-        ev = asyncio.Event()
-        _DPICK[pid] = {
-            "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
-            "groups": groups, "selected": set(), "event": ev, "verdict": None,
-        }
-        try:
-            msg_id = await _send_markup_safe(
-                self._bot, job.chat_id,
-                _dpick_text(_best_picker_title(page_title, job.url), groups),
-                _dpick_keyboard(pid, groups, set()),
-            )
-        except Exception:
-            msg_id = None
-        if msg_id is None:
-            _DPICK.pop(pid, None)
+            while pid in _DPICK:  # 32-bit id; re-roll on the freak collision
+                pid = uuid.uuid4().hex[:8]
+            ev = asyncio.Event()
+            _DPICK[pid] = {
+                "uid": job.user_id, "chat_id": job.chat_id, "msg_id": None,
+                "groups": groups, "selected": set(), "event": ev, "verdict": None,
+            }
+            try:
+                msg_id = await _send_markup_safe(
+                    self._bot, job.chat_id,
+                    _dpick_text(_best_picker_title(page_title, job.url), groups),
+                    _dpick_keyboard(pid, groups, set()),
+                )
+            except Exception as send_exc:
+                msg_id = None
+                _DPICK.pop(pid, None)
+                raise RuntimeError(f"picker send raised: {send_exc!r}") from send_exc
+            if msg_id is None:
+                _DPICK.pop(pid, None)
+                raise RuntimeError("picker send returned None (see 'picker send failed' traceback just above in log)")
+            _DPICK[pid]["msg_id"] = msg_id
+            verdict = None
+            selected: set = set()
+            try:
+                deadline = time.time() + DPICK_TIMEOUT
+                while time.time() < deadline:
+                    if job.cancel_event.is_set():
+                        _DPICK.get(pid, {})["verdict"] = "cancel"
+                        break
+                    try:
+                        await asyncio.wait_for(ev.wait(), 1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+                st = _DPICK.pop(pid, None) or {}
+                verdict = st.get("verdict")
+                selected = set(st.get("selected") or set())
+            finally:
+                # Cleanup runs even on task-cancel/shutdown so the picker
+                # entry never leaks and the message is never orphaned.
+                _DPICK.pop(pid, None)
+                await _drop_msg(self._bot, job.chat_id, msg_id)
+            if verdict == "cancel" or job.cancel_event.is_set():
+                await _send_safe(self._bot, job.chat_id, "🛑 section pick cancelled -- job stopped.")
+                return None
+            if verdict == "done" and selected:
+                picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
+                # De-dupe: untagged cards appear under both sections.
+                seen = set()
+                uniq = []
+                for c in picked:
+                    try:
+                        key = c.url
+                    except Exception:
+                        key = id(c)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    uniq.append(c)
+                picked = uniq
+                if not picked:
+                    return list(cards)
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return picked
+            if verdict != "done":
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    "⏳ no choice in 2m -- job cancelled.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return None
             return list(cards)
-        _DPICK[pid]["msg_id"] = msg_id
-        verdict = None
-        selected: set = set()
-        try:
-            deadline = time.time() + DPICK_TIMEOUT
-            while time.time() < deadline:
-                if job.cancel_event.is_set():
-                    _DPICK.get(pid, {})["verdict"] = "cancel"
-                    break
-                try:
-                    await asyncio.wait_for(ev.wait(), 1.0)
-                    break
-                except asyncio.TimeoutError:
-                    continue
-            st = _DPICK.pop(pid, None) or {}
-            verdict = st.get("verdict")
-            selected = set(st.get("selected") or set())
-        finally:
-            # Cleanup runs even on task-cancel/shutdown so the picker
-            # entry never leaks and the message is never orphaned.
-            _DPICK.pop(pid, None)
-            await _drop_msg(self._bot, job.chat_id, msg_id)
-        if verdict == "cancel" or job.cancel_event.is_set():
-            await _send_safe(self._bot, job.chat_id, "🛑 section pick cancelled -- job stopped.")
-            return None
-        if verdict == "done" and selected:
-            picked = [c for gi, g in enumerate(groups) if gi in selected for c in g.cards]
-            # De-dupe: untagged cards appear under both sections.
-            seen = set()
-            uniq = []
-            for c in picked:
-                try:
-                    key = c.url
-                except Exception:
-                    key = id(c)
-                if key in seen:
-                    continue
-                seen.add(key)
-                uniq.append(c)
-            picked = uniq
-            if not picked:
-                return list(cards)
-            await _send_safe(
-                self._bot, job.chat_id,
-                f"✅ picked <b>{len(picked)}/{len(cards)}</b> links -- resolving those.",
-                parse_mode=ParseMode.HTML,
+        except Exception as exc:
+            _LOG.exception(
+                "dmode picker CRASHED (pid=%d user=%d url=%s cards=%d): %r",
+                os.getpid(), job.user_id, job.url, len(cards or []), exc,
             )
-            return picked
-        if verdict != "done":
-            await _send_safe(
-                self._bot, job.chat_id,
-                "⏳ no choice in 2m -- job cancelled.",
-                parse_mode=ParseMode.HTML,
-            )
-            return None
-        return list(cards)
+            try:
+                await _send_safe(
+                    self._bot, job.chat_id,
+                    f"⚠️ section picker crashed: "
+                    f"<code>{_html_escape(exc.__class__.__name__ + ': ' + str(exc)[:200])}</code> "
+                    f"-- resolving all <b>{len(cards)}</b> links. "
+                    f"Forward this + /status to the owner.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            try:
+                _DPICK.pop(pid, None)  # type: ignore[possibly-unbound]
+            except Exception:
+                pass
+            return list(cards)
 
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -4533,19 +4624,30 @@ def main() -> None:
     """Sync entry point -- wraps `Bot.run`."""
     global _LOCK, _BOT_MAX_SESSIONS
     _LOCK = _acquire_single_instance_lock()
-    if _LOCK is None and os.path.isfile(_LOCK_PATH):
-        # On Windows _LOCK is None even on success; distinguish by lockfile
-        # existence (we wrote it). On POSIX _LOCK is the fd. Check both.
-        pass
-    # Belt-and-suspenders: on POSIX _LOCK is the fd when held. On Windows
-    # _LOCK is None but we wrote the lockfile. We can't reliably detect a
-    # stolen instance on Windows without psutil; assume success if the
-    # lockfile write succeeded.
+    if _LOCK is None and os.name == "posix":
+        # Another LIVE bot holds the flock (kernel-managed: never stale).
+        # Refuse to start: a second poller would split Telegram updates
+        # with the running instance (commands answered by one, jobs run
+        # by the other, possibly on older code) with zero errors logged.
+        # /restart is safe: os.execv closes our non-inheritable fd first,
+        # so the new image re-acquires cleanly.
+        print(
+            f"another xdmovies-bot instance is already running "
+            f"(lock {_LOCK_PATH} held); refusing to start a second poller. "
+            f"Stop it first (systemctl stop xdmovies-bot) or run "
+            f"bash xdmovies_kill_all.sh",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    # On Windows _LOCK is None even on success (lockfile write is the
+    # signal). We can't reliably detect a stolen instance there without
+    # psutil; assume success if the lockfile write succeeded.
     cfg = bot_config.load_config()
     bot_config.configure_logging(cfg)
     _BOT_MAX_SESSIONS = cfg.max_sessions
     _LOG.info(
-        "config loaded: owner=%d admin_ids=%s max_sessions=%d",
+        "config loaded: pid=%d owner=%d admin_ids=%s max_sessions=%d",
+        os.getpid(),
         cfg.owner_id,
         [a for a in cfg.admin_ids] or "[]",
         cfg.max_sessions,
