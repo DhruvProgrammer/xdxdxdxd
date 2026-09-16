@@ -1389,9 +1389,9 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             return _pop_dest
 
         # First hop: extract destination via the existing helper (handles
-        # new-tab destinations). Then, if we landed on a hub page
-        # (hubcloud / hubdrive / fdrive / gamerxyt), follow the inner
-        # redirect link to the final token-bearing URL.
+        # new-tab destinations). Policy: STOP at the hub page
+        # (hubcloud / hubdrive / fdrive). Do NOT click "Generate Link" /
+        # follow the inner redirect to the gamerxyt token URL.
         dest = await _wait_for_hubcloud_deep_link(page, max_wait=final_wait, ctx=ctx)
         if not dest:
             dest = await _extract_destination(page, ctx)
@@ -1401,52 +1401,18 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             if _is_ad_url(dest) or not any(h in _url_host(dest) for h in hub_hints):
                 return dest
             else:
-                # Fast path first: the hub drive page states its title, size
-                # and final gamerxyt token URL statically -- one cheap HTTPS
-                # GET instead of a full browser navigation.
+                # Metadata-only: cache title/size for card enrichment, but
+                # always return the hub URL itself (never gamerxyt).
                 try:
                     _rf, _rt, _rs = await resolve_hub_details(dest)
-                    if _rf and _rf != dest:
-                        print(f"[link_exec] hub static fast path: {dest[:80]} -> {_rf[:80]}")
-                        return _rf
-                except Exception:
-                    pass
-                try:
-                    await page.goto(dest, wait_until="domcontentloaded", timeout=30000)
-                    # The loaded hub page states its own title/size/final
-                    # URL statically -- parse and share via cache (zero
-                    # extra network; works behind CF where plain HTTPS
-                    # fetches are challenged).
-                    try:
-                        from xdmovies.extractor import extract_hub_details as _ehd
-                        _html = await page.content()
-                        _hd = _ehd(_html or "")
-                        if _hd.title or _hd.final_url:
-                            note_hub_details(dest, _hd.final_url, _hd.title, _hd.size)
-                            if _hd.final_url and _hd.final_url != dest \
-                                    and _is_destination_url(_hd.final_url) \
-                                    and not _is_ad_url(_hd.final_url):
-                                print(f"[link_exec] hub page parse: {dest[:80]} -> {_hd.final_url[:80]}")
-                                return _hd.final_url
-                    except Exception:
-                        pass
-                    for sel in ("a#download", "a.btn-download", "a.btn-primary",
-                                "button.btn-primary", "a[class*='download']"):
+                    if _rt or _rs or _rf:
                         try:
-                            loc = page.locator(sel)
-                            if await loc.count() > 0:
-                                href = await loc.first.get_attribute("href")
-                                if href and ("http" in href or href.startswith("/")):
-                                    if href.startswith("/"):
-                                        from urllib.parse import urljoin
-                                        href = urljoin(dest, href)
-                                    print(f"[link_exec] hub redirect href: {href}")
-                                    dest = href
-                                    break
+                            note_hub_details(dest, _rf, _rt, _rs)
                         except Exception:
                             pass
-                except Exception as exc:
-                    print(f"[link_exec] hub follow failed: {exc}")
+                        print(f"[link_exec] hub kept (gamerxyt upgrade skipped): {dest[:80]}")
+                except Exception:
+                    pass
             return dest
         return await _extract_destination(page, ctx)
     finally:

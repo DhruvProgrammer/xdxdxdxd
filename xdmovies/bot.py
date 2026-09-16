@@ -452,10 +452,13 @@ def _is_download_url(url: str) -> bool:
 
 
 async def _enrich_hub_dest(dest: str, card) -> str:
-    """Best-effort upgrade of a hub /drive/ URL to its final gamerxyt URL
-    with real title/size from the hub page. Prefers the in-browser cache
-    (filled when a flow already loaded that hub page behind CF); falls
-    back to one static HTTPS read. Returns dest unchanged on any failure.
+    """Best-effort metadata enrichment for a hub /drive/ URL.
+
+    Policy (operator choice): STOP at the hub page (hubcloud/hubdrive/...).
+    Do NOT follow the "Generate Link" redirect to the gamerxyt token URL.
+    Only fills real title/size from the hub page via the in-browser cache
+    (filled when a flow already loaded that hub page behind CF) or one
+    static HTTPS read. Returns dest unchanged (never the gamerxyt URL).
     Never raises (callers treat enrichment as optional)."""
     try:
         from xdmovies.link_exec import (
@@ -473,9 +476,10 @@ async def _enrich_hub_dest(dest: str, card) -> str:
                 _rf, _rt, _rs = await _rhd(dest)
             except Exception:
                 return dest
+        # Keep the hub URL as-is; _rf (gamerxyt token URL) is
+        # deliberately ignored — only _rt/_rs below are used.
         if _rf and _rf != dest:
-            _LOG.info("hub dest enriched to final: %s", _rf[:100])
-            dest = _rf
+            _LOG.info("hub dest kept at hub page (gamerxyt upgrade skipped): %s", dest[:100])
         try:
             if _rt and (not card.title or card.title in ("Gate link", "Download link")):
                 card.title = _rt
