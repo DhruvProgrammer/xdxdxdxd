@@ -2425,10 +2425,10 @@ class Bot:
                 _chan_line = (
                     f"\n<b>channel:</b> preset to "
                     f"{_html_escape(str(getattr(_ch, 'title', '') or _ch.channel_id))} "
-                    f"-- pickers (qmode/dmode) are skipped while set\n"
+                    f"-- results mirror there; pickers still ask\n"
                 )
             else:
-                _chan_line = "\n<b>channel:</b> none preset -- pickers ask normally\n"
+                _chan_line = "\n<b>channel:</b> none preset\n"
         except Exception:
             _chan_line = ""
         text = (
@@ -2864,18 +2864,10 @@ class Bot:
                 return list(cards)
         except Exception:
             return list(cards)
-        # Auto-channel mode: a preset channel is set, so every paste-link
-        # job mirrors there with zero questions -- skip the picker and
-        # resolve everything (user chose: no modes, post all).
-        try:
-            from xdmovies.scrape_all import load_channel as _load_chan
-            _ch = _load_chan()
-            if _ch is not None and getattr(_ch, "channel_id", 0):
-                _LOG.info("qmode picker skipped (preset channel %s set) for %s",
-                          getattr(_ch, "channel_id", "?"), job.url)
-                return list(cards)
-        except Exception:
-            pass
+        # NOTE: a preset scrape channel does NOT skip this picker. It only
+        # controls where results land (mirrored after resolve). Silent /
+        # channel-routed jobs (scrape-all children) already returned above
+        # -- an explicit per-user /qmode ON always gets asked.
         try:
             groups = group_cards_by_quality(cards)
         except Exception:
@@ -3143,18 +3135,10 @@ class Bot:
                 return list(cards)
         except Exception:
             return list(cards)
-        # Auto-channel mode: a preset channel is set, so every paste-link
-        # job mirrors there with zero questions -- skip the picker and
-        # resolve everything (user chose: no modes, post all).
-        try:
-            from xdmovies.scrape_all import load_channel as _load_chan
-            _ch = _load_chan()
-            if _ch is not None and getattr(_ch, "channel_id", 0):
-                _LOG.info("dmode picker skipped (preset channel %s set) for %s",
-                          getattr(_ch, "channel_id", "?"), job.url)
-                return list(cards)
-        except Exception:
-            pass
+        # NOTE: a preset scrape channel does NOT skip this picker. It only
+        # controls where results land (mirrored after resolve). Silent /
+        # channel-routed jobs (scrape-all children) already returned above
+        # -- an explicit per-user /dmode ON always gets asked.
         try:
             groups = group_cards_by_section(cards)
         except Exception:
