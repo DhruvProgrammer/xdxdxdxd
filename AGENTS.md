@@ -113,12 +113,12 @@ Keep-alive must hit a deep link, not home. The flow:
   passing `proxy={"server": "socks5://host:port", ...}` to
   `launch_chromium()` at the call sites.
 
-- **Telegram single-instance lock.** `bot.py:43` opens
+- **Telegram single-instance lock.** `bot.py` opens
   `.xdmovies_bot.lock` (in the repo root, one level above `xdmovies/`)
-  with `fcntl.flock` on POSIX. A second `python -m xdmovies` would
-  conflict-poll the bot token and Telegram returns
-  `Conflict: terminated by other getUpdates`. On Windows, the lock
-  falls back to a mtime-based stale check + psutil.
+  with `fcntl.flock` on POSIX. A second `python -m xdmovies` on POSIX
+  exits(2) instead of starting (two pollers would split updates between
+  instances with zero errors). On Windows, the lock falls back to a
+  mtime-based stale check + psutil.
 
 - **Access control is silent.** `bot.py:_on_text` and `_cmd_*` return
   without replying if the user ID is not in `TELEGRAM_OWNER_ID` or
@@ -170,6 +170,18 @@ Keep-alive must hit a deep link, not home. The flow:
   `playwright_stealth.Stealth()` plugin + `is_chromium_family()` helper.
   Used by `link_exec.py` only. Browser launch itself is in
   `cloak_stealth.py`; this is the per-page init script.
+- `xdmovies/qmode_store.py` + `xdmovies/dmode_store.py` +
+  `xdmovies/settings_store.py` — per-user prefs in
+  `xdmovies_state/{qmode,dmode,settings}.json`. `/qmode` (quality
+  picker, `qp:` callbacks, `_QPICK`) and `/dmode` (section picker,
+  `dp:` callbacks, `_DPICK`) are independent ON/OFF toggles; when both
+  are ON the chain is dmode→qmode with fallback to the dmode set on
+  empty intersection. A preset scrape channel never suppresses either
+  picker (only silent/channel-routed jobs skip). `/settings` toggles
+  result-card detail lines (Size/Rating/Genre/First Air/Audios/Sources/
+  TMDB) via `settings:` callbacks; page meta comes from
+  `extractor.extract_page_meta` + `extract_tmdb_code` through
+  `pipeline.ExtractionResult` into `Job.page_meta`/`detail_fields`.
 
 ## 6. Environment / secrets
 

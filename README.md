@@ -107,9 +107,13 @@ User sends https://top.xdmovies.wtf/movies/<slug> (or /series/<slug>)
 | Command | Who | What |
 |---|---|---|
 | `/start` | allowed | welcome + flow help |
-| `/status` | allowed | alive, queue, cookies, keep-alive age, cloak, vpn (always "none"), desktop |
+| `/search` | allowed | find a movie/series, tap a result to scrape (accept-all + .txt batch supported) |
+| `/status` | allowed | alive, queue, cookies, keep-alive age, cloak, vpn (always "none"), desktop, your qmode/dmode, preset channel |
 | `/queue` | allowed | running + queued jobs as clickable names with titles, waits, ETAs |
 | `/cancel` | allowed | stop your running/queued job(s) |
+| `/qmode` | allowed | toggle quality picker for series (per-user, survives restart) |
+| `/dmode` | allowed | toggle section picker — Season N Packs vs Episodes (per-user, runs before qmode) |
+| `/settings` | allowed | toggle which details result cards show: Size/Rating/Genre/First Air/Audios/Sources/TMDB (per-user) |
 | `/restart` | **owner only** | cancel everything, tear down browsers/servers, re-exec the process (same PID, lock survives) |
 | `/scrapeall` | owner + admins | catalog scrape: All / Movies / Series (+ ❌ Cancel), resumable, checkpoints per kind |
 | `/scrapeallchannel` | **owner only** | same as scrapeall but results post to a saved channel; forward a channel message once to set it |

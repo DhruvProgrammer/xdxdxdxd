@@ -27,3 +27,6 @@ live_screens/
 
 # Single-instance lockfile (runtime, per-machine)
 .xdmovies_bot.lock
+
+# Runtime SQLite DB (untracked working data, not referenced by code)
+scraper.db
