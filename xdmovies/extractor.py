@@ -337,6 +337,80 @@ def extract_page_audios(html: str) -> str:
         return ""
 
 
+_META_LABEL_RES = {
+    # <p><strong>Rating:</strong> 6.2 / 10 ⭐</p> — first <strong>-labelled
+    # match wins (SEO footer reuses bare "Genres:" without <strong>).
+    "rating": re.compile(
+        r"<strong>\s*Rating\s*:?\s*</strong>\s*([\d.]+\s*(?:/\s*[\d.]+)?)",
+        re.IGNORECASE),
+    "genres": re.compile(
+        r"<strong>\s*Genres?\s*:?\s*</strong>\s*([^<]{1,120})</p>",
+        re.IGNORECASE),
+    # Series pages say "First Air Date", movie pages "Release Date".
+    "air_date": re.compile(
+        r"<strong>\s*(?:First\s+Air\s+Date|Release\s+Date)\s*:?\s*</strong>\s*([^<]{1,40})</p>",
+        re.IGNORECASE),
+    "sources": re.compile(
+        r'<p\b[^>]*\bid=["\']source-info["\'][^>]*>(.*?)</p>',
+        re.IGNORECASE | re.DOTALL),
+}
+
+_TMDB_ID_RE = re.compile(r"-(\d+)\s*$")
+
+
+def extract_page_meta(html: str) -> dict:
+    """Page-level info-block details: rating/genres/air_date/sources.
+
+    Keys are always present ("" when absent) so renderers can gate on
+    per-user /settings prefs without extra plumbing. Pure, no I/O.
+    """
+    out = {"rating": "", "genres": "", "air_date": "", "sources": ""}
+    if not html:
+        return out
+    try:
+        m = _META_LABEL_RES["rating"].search(html)
+        if m:
+            out["rating"] = re.sub(r"\s+", " ", m.group(1)).strip(" ,;")[:40]
+    except Exception:
+        pass
+    try:
+        m = _META_LABEL_RES["genres"].search(html)
+        if m:
+            # Strip trailing "#tag #tag" tail the SEO paragraph appends.
+            t = re.sub(r"\s+", " ", m.group(1)).strip(" ,;")
+            t = re.split(r"\s+#", t, maxsplit=1)[0].strip(" ,;")
+            out["genres"] = t[:120]
+    except Exception:
+        pass
+    try:
+        m = _META_LABEL_RES["air_date"].search(html)
+        if m:
+            out["air_date"] = re.sub(r"\s+", " ", m.group(1)).strip(" ,;")[:40]
+    except Exception:
+        pass
+    try:
+        m = _META_LABEL_RES["sources"].search(html)
+        if m:
+            t = _strip_tags(m.group(1))
+            t = re.sub(r"^.*?\bsources?\s*[:\-]\s*", "", t, flags=re.IGNORECASE)
+            out["sources"] = re.sub(r"\s+", " ", t).strip(" ,;")[:120]
+    except Exception:
+        pass
+    return out
+
+
+def extract_tmdb_code(url: str) -> str:
+    """Numeric id trailing the page slug, e.g. `...-download-273207`
+    -> "273207". Used for the optional TMDB detail line. Pure, no I/O."""
+    try:
+        from urllib.parse import urlsplit
+        path = (urlsplit(url or "").path or "").rstrip("/")
+        m = _TMDB_ID_RE.search(path)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
 def extract_cards_from_html(html: str) -> List[Card]:
     """Public alias — matches the wording in telegram.md."""
     return extract_cards(html)

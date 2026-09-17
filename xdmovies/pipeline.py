@@ -380,6 +380,10 @@ class ExtractionResult:
     elapsed_time_seconds: float
     page_title: str = ""
     audios: str = ""
+    rating: str = ""
+    genres: str = ""
+    air_date: str = ""
+    sources: str = ""
 
 
 async def extract_with_diagnostics(movie_url: str, session_id: str = "xdmovies_video_session", headless: bool = False) -> ExtractionResult:
@@ -403,11 +407,14 @@ async def extract_with_diagnostics(movie_url: str, session_id: str = "xdmovies_v
             pass
     page_title = _extract_page_title(html or "", url=movie_url)
     try:
-        from xdmovies.extractor import extract_page_audios
+        from xdmovies.extractor import extract_page_audios, extract_page_meta
         audios = extract_page_audios(html or "")
+        meta = extract_page_meta(html or "")
     except Exception:
-        audios = ""
-    return ExtractionResult(cards=cards, html_len=len(html or ""), bypass_status=bypass_status, challenge_mode=challenge_mode, elapsed_time_seconds=elapsed, page_title=page_title, audios=audios)
+        audios, meta = "", {}
+    return ExtractionResult(cards=cards, html_len=len(html or ""), bypass_status=bypass_status, challenge_mode=challenge_mode, elapsed_time_seconds=elapsed, page_title=page_title, audios=audios,
+                            rating=(meta or {}).get("rating", ""), genres=(meta or {}).get("genres", ""),
+                            air_date=(meta or {}).get("air_date", ""), sources=(meta or {}).get("sources", ""))
 
 
 # ---------------------------------------------------------------------------

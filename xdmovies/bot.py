@@ -183,7 +183,52 @@ _BATCH_CHUNK_BUDGET = MSG_LIMIT - 400
 _BATCH_SEP = "─" * 25
 
 
-def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optional[str], audios: str = "") -> str:
+_DETAIL_KEYS = ("rating", "genres", "air_date", "sources", "tmdb")
+
+
+def _card_detail_lines(job, card) -> Tuple[str, List[Tuple[str, str]], bool]:
+    """(audios, details, show_size) for one result card.
+
+    Reads the job snapshot (`detail_fields` from /settings +
+    `page_meta` scraped once per page). `details` is an ordered list of
+    (label, value) for the free-form /settings fields. Falls back to the
+    legacy output (Audio + Size) when no snapshot exists.
+    """
+    try:
+        fields = set(getattr(job, "detail_fields", None) or ())
+    except Exception:
+        fields = set()
+    try:
+        meta = dict(getattr(job, "page_meta", {}) or {})
+    except Exception:
+        meta = {}
+    if not meta:
+        try:
+            pa = getattr(job, "page_audios", "") or ""
+        except Exception:
+            pa = ""
+        if pa:
+            meta = {"audios": pa}
+    if not fields:
+        return meta.get("audios", ""), [], True
+    audios = meta.get("audios", "") if "audios" in fields else ""
+    details: List[Tuple[str, str]] = []
+    for key in _DETAIL_KEYS:
+        if key in fields and meta.get(key):
+            try:
+                from xdmovies import settings_store as _ss
+                label = _ss.field_label(key)
+            except Exception:
+                label = key
+            details.append((label, meta[key]))
+    try:
+        show_size = "size" in fields
+    except Exception:
+        show_size = True
+    return audios, details, show_size
+
+
+def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optional[str], audios: str = "", details=None, show_size: bool = True) -> str:
     """Render one numbered result block.
 
     Byte-identical to the per-card section of Bot._format_batch_text, so
@@ -193,13 +238,18 @@ def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optiona
 
     `audios` is the page-level audio list (same for every card on the
     page); rendered as the `Audio:` line right after the title.
+    `details` is an ordered list of (label, value) free-form lines from
+    /settings (Rating/Genre/First Air/Source/TMDB); rendered after Size.
     """
     title_text = _html_escape(card.title or "(untitled)")
     block = [f"<b>{idx}) {title_text}</b>"]
     if audios:
         block.append(f"Audio: {_html_escape(audios)}")
-    if card.size:
+    if show_size and card.size:
         block.append(f"Size: {_html_escape(card.size)}")
+    for label, value in details or []:
+        if value:
+            block.append(f"{_html_escape(label)}: {_html_escape(value)}")
     if card.language:
         block.append(f"Language: {_html_escape(card.language)}")
     if card.file_name and card.file_name != card.title:
@@ -812,6 +862,40 @@ def _dpick_text(page_title: str, groups) -> str:
     return "\n".join(lines)
 
 
+def _settings_keyboard(prefs) -> "InlineKeyboardMarkup":
+    """Toggle grid for /settings. Instant-apply: every tap flips one
+    field and the message markup re-renders. Callback payloads
+    (`settings:toggle:<key>`) stay far under the 64-byte limit."""
+    try:
+        from xdmovies import settings_store as _ss
+        fields = list(_ss.ALL_FIELDS)
+    except Exception:
+        return InlineKeyboardMarkup([])  # type: ignore[misc]
+    rows = []
+    row = []
+    for key, label, emoji in fields:
+        on = bool((prefs or {}).get(key, False))
+        row.append(InlineKeyboardButton(
+            f"{'✅ ' if on else ''}{emoji} {label}",
+            callback_data=f"settings:toggle:{key}"))  # type: ignore[misc]
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("☑️ Select All", callback_data="settings:all"),  # type: ignore[misc]
+    ])
+    rows.append([
+        InlineKeyboardButton("❌ Close", callback_data="settings:close"),  # type: ignore[misc]
+    ])
+    return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+
+def _settings_text() -> str:
+    return "What details you want in result cards?"
+
+
 async def _send_markup_safe(bot, chat_id: int, text: str, reply_markup) -> Optional[int]:
     """_send_safe equivalent for messages carrying an inline keyboard:
     HTML first, plain-text retry (markup kept) on BadRequest. Returns
@@ -948,6 +1032,11 @@ class Job:
     # from the movie/series info block; rendered as the `Audio:` line in
     # every result card. Empty for gate/download-direct jobs (no page).
     page_audios: str = ""
+    # Free-form detail snapshot for /settings: page-level meta
+    # {audios, rating, genres, air_date, sources, tmdb} + the user's
+    # enabled field keys at job start. Rendered by _card_detail_lines.
+    page_meta: dict = field(default_factory=dict)
+    detail_fields: List[str] = field(default_factory=list)
     # Urgent lane: 0 = normal FIFO, 1 = urgent (user link sent while a
     # channel scrape runs). Urgent jobs are stored in Bot._urgent and
     # drained at movie boundaries inside _run_scrape_all, then the
@@ -1213,6 +1302,20 @@ class Bot:
                 job.page_audios = getattr(result, "audios", "") or ""
             except Exception:
                 pass
+            try:
+                from xdmovies import settings_store as _ss
+                from xdmovies.extractor import extract_tmdb_code
+                job.detail_fields = _ss.enabled_fields(job.user_id)
+                job.page_meta = {
+                    "audios": getattr(result, "audios", "") or "",
+                    "rating": getattr(result, "rating", "") or "",
+                    "genres": getattr(result, "genres", "") or "",
+                    "air_date": getattr(result, "air_date", "") or "",
+                    "sources": getattr(result, "sources", "") or "",
+                    "tmdb": extract_tmdb_code(job.url or ""),
+                }
+            except Exception:
+                pass
         except CFChallengeError as cf_exc:
             host = getattr(cf_exc, "host", "") or "xdmovies.wtf"
             blocked_url = cf_exc.url or job.url
@@ -1241,10 +1344,24 @@ class Bot:
                     # unhandled exception as an "unhandled error" from the
                     # dispatcher with no _fail() bookkeeping.
                     try:
-                        result = await _extract_with_diagnostics(job.url, session_id=session_id, headless=self.headless)  # type: ignore[misc]
+                        result = await _extract_with_diagnostics(job.url, session_id=session_id, headless=False)  # type: ignore[misc]
                         cards = result.cards
                         try:
                             job.page_audios = getattr(result, "audios", "") or ""
+                        except Exception:
+                            pass
+                        try:
+                            from xdmovies import settings_store as _ss2
+                            from xdmovies.extractor import extract_tmdb_code as _tmdb2
+                            job.detail_fields = _ss2.enabled_fields(job.user_id)
+                            job.page_meta = {
+                                "audios": getattr(result, "audios", "") or "",
+                                "rating": getattr(result, "rating", "") or "",
+                                "genres": getattr(result, "genres", "") or "",
+                                "air_date": getattr(result, "air_date", "") or "",
+                                "sources": getattr(result, "sources", "") or "",
+                                "tmdb": _tmdb2(job.url or ""),
+                            }
                         except Exception:
                             pass
                     except CFChallengeError as cf2:
@@ -1863,13 +1980,14 @@ class Bot:
         page_title: str,
         cards: List[Tuple["Card", Optional[str], Optional[str]]],
         audios: str = "",
+        details=None,
     ) -> str:
         """Render the entire batched results message in one HTML string.
 
         Layout (matches the user's expected format):
           {movie/series name}:
           <blank>
-          1) <title> [audio] [size] [lang]
+          1) <title> [audio] [size] [details...] [lang]
           ─────────────────────────
           → <hubcloud url>
           ─────────────────────────
@@ -1879,7 +1997,7 @@ class Bot:
         title_esc = _html_escape(page_title or "(untitled)")
         out: List[str] = [f"<b>{title_esc}:</b>"]
         for i, (card, dest, err) in enumerate(cards, 1):
-            out.append(_format_card_block(i, card, dest, err, audios))
+            out.append(_format_card_block(i, card, dest, err, audios, details))
             out.append(sep)
         # remove trailing separator for clean look
         if out and out[-1] == sep:
@@ -2024,14 +2142,15 @@ class Bot:
             first_ever = not job.batch_msg_ids
             title_esc = _html_escape(page_title or "(untitled)")
             title_header = f"<b>{title_esc}:</b>"
-            try:
-                _audios = getattr(job, "page_audios", "") or ""
-            except Exception:
-                _audios = ""
-            blocks = [
-                _format_card_block(sealed + k + 1, card, dest, err, _audios)
-                for k, (card, dest, err) in enumerate(tail)
-            ]
+            blocks = []
+            for k, (card, dest, err) in enumerate(tail):
+                try:
+                    _audios, _details, _show_size = _card_detail_lines(job, card)
+                except Exception:
+                    _audios, _details, _show_size = "", [], True
+                blocks.append(
+                    _format_card_block(sealed + k + 1, card, dest, err, _audios, _details, _show_size)
+                )
             # Greedy block-granular chunking of the tail. Deterministic from
             # the same sealed start, so the previous open message is always a
             # prefix of chunk 0 -- it can be edited, never re-sent.
@@ -2187,6 +2306,8 @@ class Bot:
             try:
                 mjob = Job(user_id=job.user_id, chat_id=cid, url=job.url)
                 mjob.page_audios = getattr(job, "page_audios", "") or ""
+                mjob.page_meta = dict(getattr(job, "page_meta", {}) or {})
+                mjob.detail_fields = list(getattr(job, "detail_fields", []) or [])
             except Exception:
                 return
             try:
@@ -2358,6 +2479,7 @@ class Bot:
             "/cancel -- stop your running/queued job\n"
             "/qmode -- toggle quality picker for series\n"
             "/dmode -- toggle section (Packs/Episodes) picker for series\n"
+            "/settings -- choose which details result cards show\n"
             "/restart -- restart the whole bot (owner only)\n"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -3284,6 +3406,64 @@ class Bot:
             except Exception:
                 pass
             return list(cards)
+
+    async def _cmd_settings(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        if not bot_config.is_allowed(update.effective_user.id, self.cfg):
+            return  # silent (bot convention)
+        from xdmovies import settings_store
+        prefs = settings_store.get_settings(update.effective_user.id)
+        try:
+            await update.message.reply_text(
+                _settings_text(),
+                reply_markup=_settings_keyboard(prefs),
+                parse_mode=ParseMode.HTML)
+        except _TelegramError.BadRequest:
+            try:
+                await update.message.reply_text(
+                    _settings_text(),
+                    reply_markup=_settings_keyboard(prefs))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _on_settings(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None:
+            return
+        if not bot_config.is_allowed(query.from_user.id, self.cfg):
+            return  # silent ignore
+        from xdmovies import settings_store
+        data = query.data or ""
+        if data == "settings:close":
+            if query.message is not None:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+            return
+        if data == "settings:all":
+            prefs = settings_store.get_settings(query.from_user.id)
+            for key, _label, _emoji in settings_store.ALL_FIELDS:
+                prefs = settings_store.set_field(query.from_user.id, key, True)
+        elif data.startswith("settings:toggle:"):
+            key = data.split(":", 2)[-1]
+            prefs = settings_store.toggle_field(query.from_user.id, key)
+        else:
+            return
+        if query.message is not None:
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_settings_keyboard(prefs))
+            except _TelegramError.BadRequest:
+                pass  # MessageNotModified on rapid double-tap
+            except Exception:
+                pass
 
     async def _cmd_scrapeall(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         if update.effective_user is None or update.effective_chat is None or update.message is None:
@@ -4476,6 +4656,7 @@ class Bot:
                 BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
                 BotCommand("qmode", "toggle quality picker for series"),
                 BotCommand("dmode", "toggle section picker for series"),
+                BotCommand("settings", "choose result card details"),
             ])
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
@@ -4589,6 +4770,11 @@ class Bot:
             pattern=r"^dp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
         ))
         app.add_handler(CommandHandler("dmode", self._cmd_dmode))
+        app.add_handler(CommandHandler("settings", self._cmd_settings))
+        app.add_handler(CallbackQueryHandler(
+            self._on_settings,
+            pattern=r"^settings:(toggle:[a-z_]+|all|close)$",
+        ))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         # TEXT covers plain DMs, CAPTION covers forwarded channel
         # photo+caption posts (filters are disjoint in PTB v21).
