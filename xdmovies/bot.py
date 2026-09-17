@@ -3902,25 +3902,8 @@ class Bot:
                 await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
             except Exception:
                 pass
-            # Re-check busy: the user may have started something meanwhile.
-            try:
-                _snap = await self._snapshot_queue()
-                _q = sum(1 for j in _snap if j.user_id == uid)
-                try:
-                    _uq = await self._snapshot_urgent()
-                    _q += sum(1 for j in _uq if j.user_id == uid)
-                except Exception:
-                    pass
-                _r = self.current is not None and self.current.user_id == uid
-            except Exception:
-                _q, _r = 0, False
-            if _r or _q > 0:
-                try:
-                    await _send_safe(self._bot, chat_id,
-                                     "⏳ timed out with no answer and you're busy -- tap ✅ Accept all again when free.")
-                except Exception:
-                    pass
-                return
+            # Timeout default is NO (scrape here in DM) -- queued, never
+            # rejected: every link queues.
             await self._acceptall_enqueue(uid, chat_id, results, user_name, username,
                                           to_channel=0, card_filter=_filter_to)
         except Exception:
@@ -3963,22 +3946,6 @@ class Bot:
                         pass
                 return
             _ts_all, _label_all, _results_all = entry_all
-            _q_snapshot = await self._snapshot_queue()
-            _queued = sum(1 for j in _q_snapshot if j.user_id == uid)
-            try:
-                _uq_all = await self._snapshot_urgent()
-                _queued += sum(1 for j in _uq_all if j.user_id == uid)
-            except Exception:
-                pass
-            _running = self.current is not None and self.current.user_id == uid
-            if _running or _queued > 0:
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text(
-                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
-                    except Exception:
-                        pass
-                return
             _kb_content = InlineKeyboardMarkup([  # type: ignore[misc]
                 [InlineKeyboardButton("✅ All (EP+Pack)", callback_data="search:content:all")],  # type: ignore[misc]
                 [InlineKeyboardButton("🎞️ Episodes only", callback_data="search:content:ep")],  # type: ignore[misc]
@@ -4010,25 +3977,6 @@ class Bot:
                         pass
                 return
             _ts_ct, _label_ct, _results_ct = entry_ct
-            try:
-                _snap_ct = await self._snapshot_queue()
-                _q_ct = sum(1 for j in _snap_ct if j.user_id == uid)
-                try:
-                    _uq_ct = await self._snapshot_urgent()
-                    _q_ct += sum(1 for j in _uq_ct if j.user_id == uid)
-                except Exception:
-                    pass
-                _r_ct = self.current is not None and self.current.user_id == uid
-            except Exception:
-                _q_ct, _r_ct = 0, False
-            if _r_ct or _q_ct > 0:
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text(
-                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
-                    except Exception:
-                        pass
-                return
             _filter = _CONTENT_CALLBACK[parts[2]]
             _tok = object()
             _nm0, _un0 = _display_name(update.effective_user)
@@ -4078,25 +4026,6 @@ class Bot:
                         pass
                 return
             _ts_yn, _label_yn, _results_yn = entry_yn
-            try:
-                _snap_yn = await self._snapshot_queue()
-                _q_yn = sum(1 for j in _snap_yn if j.user_id == uid)
-                try:
-                    _uq_yn = await self._snapshot_urgent()
-                    _q_yn += sum(1 for j in _uq_yn if j.user_id == uid)
-                except Exception:
-                    pass
-                _r_yn = self.current is not None and self.current.user_id == uid
-            except Exception:
-                _q_yn, _r_yn = 0, False
-            if _r_yn or _q_yn > 0:
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text(
-                            "⏳ busy on your previous job -- wait for the result, then accept again (or /search again).")
-                    except Exception:
-                        pass
-                return
             _to_channel = 0
             _chan_note = ""
             if parts[2] == "yes":
@@ -4173,8 +4102,7 @@ class Bot:
             return
         picked = results[idx]
         # Urgent lane: search pick while a channel scrape runs jumps
-        # ahead (movie-boundary preempt). Otherwise same busy rule as
-        # pasted URLs: one job per user at a time.
+        # ahead (movie-boundary preempt). Otherwise the pick just queues.
         if self._is_scrape_running():
             _nm, _un = _display_name(update.effective_user)
             job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
@@ -4200,23 +4128,7 @@ class Bot:
             except Exception:
                 pass
             return
-        # Same busy rule as pasted URLs: one job per user at a time.
-        _q_snapshot = await self._snapshot_queue()
-        queued = sum(1 for j in _q_snapshot if j.user_id == uid)
-        try:
-            _uq_snapshot = await self._snapshot_urgent()
-            queued += sum(1 for j in _uq_snapshot if j.user_id == uid)
-        except Exception:
-            pass
-        running = self.current is not None and self.current.user_id == uid
-        if running or queued > 0:
-            if query.message is not None:
-                try:
-                    await query.edit_message_text(
-                        "⏳ busy on your previous job -- wait for the result, then tap again (or /search again).")
-                except Exception:
-                    pass
-            return
+        # Every pick queues -- no per-user busy rejection.
         _nm, _un = _display_name(update.effective_user)
         job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
                   user_name=_nm, username=_un)
@@ -4504,7 +4416,7 @@ class Bot:
         _nm, _un = _display_name(update.effective_user)
         # Urgent lane: any allowed user sending a resolve link while a
         # channel scrape runs jumps ahead (movie-boundary preempt inside
-        # _run_scrape_all). Bypasses the per-user busy guard on purpose.
+        # _run_scrape_all).
         if urls and self._is_scrape_running():
             try:
                 jobs = await self._enqueue_urgent_links(
@@ -4531,28 +4443,9 @@ class Bot:
                              parse_mode=ParseMode.HTML)
             return
         if urls:
-            # Audit finding M3: count jobs the user already has queued
-            # (not just the one running) so the busy check covers the whole
-            # queue. The `behind` math previously read "pos - 1" which gave
-            # 0 even with a job running + this one queued, so the user saw
-            # "queued behind 0 job(s)" while still waiting.
-            _q_snapshot = await self._snapshot_queue()
-            queued = sum(1 for j in _q_snapshot if j.user_id == uid)
-            try:
-                _uq_snapshot = await self._snapshot_urgent()
-                queued += sum(1 for j in _uq_snapshot if j.user_id == uid)
-            except Exception:
-                pass
-
-            running = self.current is not None and self.current.user_id == uid
-            if running or queued > 0:
-                await _send_safe(
-                    context.bot, update.effective_chat.id,
-                    "⏳ busy on your previous job -- wait for the result",
-                )
-                return
-
-            depth = self._queue_depth()
+            # Every link queues -- no per-user busy rejection. The single
+            # dispatcher resolves jobs FIFO; _confirm_enqueued tells the
+            # user "Starting now" vs "Queued position #N".
             if len(urls) == 1:
                 job = Job(user_id=uid, chat_id=update.effective_chat.id, url=urls[0],
                           user_name=_nm, username=_un)
@@ -4583,26 +4476,8 @@ class Bot:
         except Exception:
             _chan_title = None
         if _chan_title:
-            # Same busy rule as pasted URLs, except the scrape-running
-            # case goes urgent (handled inside _resolve_channel_title).
-            if not self._is_scrape_running():
-                try:
-                    _q2 = await self._snapshot_queue()
-                    _queued2 = sum(1 for j in _q2 if j.user_id == uid)
-                    try:
-                        _uq2 = await self._snapshot_urgent()
-                        _queued2 += sum(1 for j in _uq2 if j.user_id == uid)
-                    except Exception:
-                        pass
-                    _running2 = self.current is not None and self.current.user_id == uid
-                    if _running2 or _queued2 > 0:
-                        await _send_safe(
-                            context.bot, update.effective_chat.id,
-                            "⏳ busy on your previous job -- wait for the result",
-                        )
-                        return
-                except Exception:
-                    pass
+            # Queues like pasted URLs (urgent when a scrape runs -- handled
+            # inside _resolve_channel_title). No busy rejection.
             try:
                 await self._resolve_channel_title(
                     uid, update.effective_chat.id, _chan_title, _nm, _un)

@@ -128,7 +128,8 @@ tokens can't break parsing. HTML parse failures fall back to plain text.
 
 ## Queue, dispatcher, and scrape model
 
-- One dispatcher, one running job; per-user busy guard; atomic queue
+- One dispatcher, one running job; every link queues (no per-user busy
+  rejection — FIFO, position shown at enqueue); atomic queue
   snapshot (no drain/reput race); `/cancel` marks `cancel_event`,
   observed at per-card boundaries.
 - Catalog scrapes (`scrape_all.py`) checkpoint every item and page to
