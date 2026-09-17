@@ -310,6 +310,33 @@ def extract_cards(html: str) -> List[Card]:
     return out
 
 
+_AUDIO_INFO_RE = re.compile(
+    r'<p\b[^>]*\bid=["\']audio-info["\'][^>]*>(.*?)</p>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_page_audios(html: str) -> str:
+    """Page-level audio languages, e.g. "Hindi, English, Tamil".
+
+    Parsed from `<p id="audio-info">... Audios: <span>Hindi, English,
+    ...</span></p>` in the movie/series info block (same for every card
+    on the page). Pure function, no I/O. Returns "" when absent.
+    """
+    if not html:
+        return ""
+    try:
+        m = _AUDIO_INFO_RE.search(html)
+        if not m:
+            return ""
+        text = _strip_tags(m.group(1))
+        text = re.sub(r"^.*?\baud(?:io)?s?\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" ,;")
+        return text[:200]
+    except Exception:
+        return ""
+
+
 def extract_cards_from_html(html: str) -> List[Card]:
     """Public alias — matches the wording in telegram.md."""
     return extract_cards(html)

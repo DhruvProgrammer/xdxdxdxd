@@ -183,16 +183,21 @@ _BATCH_CHUNK_BUDGET = MSG_LIMIT - 400
 _BATCH_SEP = "─" * 25
 
 
-def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optional[str]) -> str:
+def _format_card_block(idx: int, card: "Card", dest: Optional[str], err: Optional[str], audios: str = "") -> str:
     """Render one numbered result block.
 
     Byte-identical to the per-card section of Bot._format_batch_text, so
     global numbering (1..N) is preserved when messages are appended
     incrementally across many Telegram messages. No caps: every card is
     rendered; large series simply span more messages.
+
+    `audios` is the page-level audio list (same for every card on the
+    page); rendered as the `Audio:` line right after the title.
     """
     title_text = _html_escape(card.title or "(untitled)")
     block = [f"<b>{idx}) {title_text}</b>"]
+    if audios:
+        block.append(f"Audio: {_html_escape(audios)}")
     if card.size:
         block.append(f"Size: {_html_escape(card.size)}")
     if card.language:
@@ -939,6 +944,10 @@ class Job:
     # cards). Default "all" preserves previous behavior everywhere
     # (single picks, pasted URLs, scrape-all children).
     card_filter: str = "all"
+    # Page-level audio list (e.g. "Hindi, English, Tamil") scraped once
+    # from the movie/series info block; rendered as the `Audio:` line in
+    # every result card. Empty for gate/download-direct jobs (no page).
+    page_audios: str = ""
     # Urgent lane: 0 = normal FIFO, 1 = urgent (user link sent while a
     # channel scrape runs). Urgent jobs are stored in Bot._urgent and
     # drained at movie boundaries inside _run_scrape_all, then the
@@ -1200,6 +1209,10 @@ class Bot:
                 job.url, session_id=session_id, headless=self.headless
             )
             cards = result.cards
+            try:
+                job.page_audios = getattr(result, "audios", "") or ""
+            except Exception:
+                pass
         except CFChallengeError as cf_exc:
             host = getattr(cf_exc, "host", "") or "xdmovies.wtf"
             blocked_url = cf_exc.url or job.url
@@ -1230,6 +1243,10 @@ class Bot:
                     try:
                         result = await _extract_with_diagnostics(job.url, session_id=session_id, headless=self.headless)  # type: ignore[misc]
                         cards = result.cards
+                        try:
+                            job.page_audios = getattr(result, "audios", "") or ""
+                        except Exception:
+                            pass
                     except CFChallengeError as cf2:
                         # still blocked after solve
                         host2 = getattr(cf2, "host", "") or host
@@ -1845,13 +1862,14 @@ class Bot:
         self,
         page_title: str,
         cards: List[Tuple["Card", Optional[str], Optional[str]]],
+        audios: str = "",
     ) -> str:
         """Render the entire batched results message in one HTML string.
 
         Layout (matches the user's expected format):
           {movie/series name}:
           <blank>
-          1) <title> [size] [lang]
+          1) <title> [audio] [size] [lang]
           ─────────────────────────
           → <hubcloud url>
           ─────────────────────────
@@ -1861,7 +1879,7 @@ class Bot:
         title_esc = _html_escape(page_title or "(untitled)")
         out: List[str] = [f"<b>{title_esc}:</b>"]
         for i, (card, dest, err) in enumerate(cards, 1):
-            out.append(_format_card_block(i, card, dest, err))
+            out.append(_format_card_block(i, card, dest, err, audios))
             out.append(sep)
         # remove trailing separator for clean look
         if out and out[-1] == sep:
@@ -2006,8 +2024,12 @@ class Bot:
             first_ever = not job.batch_msg_ids
             title_esc = _html_escape(page_title or "(untitled)")
             title_header = f"<b>{title_esc}:</b>"
+            try:
+                _audios = getattr(job, "page_audios", "") or ""
+            except Exception:
+                _audios = ""
             blocks = [
-                _format_card_block(sealed + k + 1, card, dest, err)
+                _format_card_block(sealed + k + 1, card, dest, err, _audios)
                 for k, (card, dest, err) in enumerate(tail)
             ]
             # Greedy block-granular chunking of the tail. Deterministic from
@@ -2164,6 +2186,7 @@ class Bot:
                 return
             try:
                 mjob = Job(user_id=job.user_id, chat_id=cid, url=job.url)
+                mjob.page_audios = getattr(job, "page_audios", "") or ""
             except Exception:
                 return
             try:
