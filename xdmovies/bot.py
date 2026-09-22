@@ -3507,6 +3507,8 @@ class Bot:
             rows.append([InlineKeyboardButton("🟢 Turn ON", callback_data="autodetect:set:yes")])  # type: ignore[misc]
         else:
             rows.append([InlineKeyboardButton("🔴 Turn OFF", callback_data="autodetect:set:no")])  # type: ignore[misc]
+        if cur == "series":
+            rows.append([InlineKeyboardButton("🎞️ Content filter", callback_data="autodetect:content:show")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("⬅️ Change feed", callback_data="autodetect:back")])  # type: ignore[misc]
         return InlineKeyboardMarkup(rows)  # type: ignore[misc]
 
@@ -3522,16 +3524,48 @@ class Bot:
             if cid else "<b>none (run /scrapeallchannel first)</b>"
         )
         interval = "30m"
+        content_line = ""
+        if cur == "series":
+            cf = _ad.get_card_filter()
+            content_line = f"\nContent: <b>{_html_escape(_CONTENT_LABEL.get(cf, cf))}</b>"
         return (
             f"Auto detect: <b>{'ON' if on else 'OFF'}</b>\n"
             f"Feed: <b>{self._AD_FEED_LABELS[cur]}</b>\n"
-            f"Interval: <b>{interval}</b>\n"
+            f"Interval: <b>{interval}</b>{content_line}\n"
             f"Channel: {ch_txt}\n"
             + (
                 "New posts will be resolved and posted to the channel."
                 if on
                 else "Tap Turn ON to start watching."
             )
+        )
+
+    def _autodetect_content_keyboard(self):
+        from xdmovies import autodetect_store as _ad
+        cur = _ad.get_card_filter()
+        # Same three choices as the search accept-all content picker.
+        rows = []
+        for key, cb, emoji in (
+            ("all", "all", "✅"),
+            ("episodes", "ep", "🎞️"),
+            ("packs", "pack", "🗜️"),
+        ):
+            label = f"{emoji} {_CONTENT_LABEL[key]}"
+            if key == cur:
+                label = f"✅ {label}" if key != "all" else label
+            rows.append([InlineKeyboardButton(label, callback_data=f"autodetect:content:{cb}")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="autodetect:back")])  # type: ignore[misc]
+        return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+    def _autodetect_content_text(self) -> str:
+        from xdmovies import autodetect_store as _ad
+        cf = _ad.get_card_filter()
+        return (
+            "Series detected -- what should auto-detect resolve?\n\n"
+            f"Current: <b>{_html_escape(_CONTENT_LABEL.get(cf, cf))}</b>\n\n"
+            "• All = episodes + packs/zips\n"
+            "• Episodes only = single-episode cards\n"
+            "• Packs/Zips only = season/full .zip packs"
         )
 
     async def _cmd_autodetect(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -3601,6 +3635,72 @@ class Bot:
         want_on = data.endswith(":yes")
         # Turning ON with no channel is useless — warn but still store choice.
         _ad.set_on(want_on)
+        if query.message is not None:
+            # Series ON -> ask content filter first (All / Episodes / Packs),
+            # same choice as the search accept-all flow. The content callback
+            # lands back on the toggle screen.
+            if want_on and _ad.get_feed() == "series":
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_content_text(),
+                        reply_markup=self._autodetect_content_keyboard(),
+                        parse_mode=ParseMode.HTML)
+                except _TelegramError.BadRequest:
+                    try:
+                        await query.edit_message_text(
+                            self._autodetect_content_text().replace("<b>", "").replace("</b>", ""),
+                            reply_markup=self._autodetect_content_keyboard())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return
+            try:
+                await query.edit_message_text(
+                    self._autodetect_toggle_text(),
+                    reply_markup=self._autodetect_toggle_keyboard(),
+                    parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_toggle_text().replace("<b>", "").replace("</b>", ""),
+                        reply_markup=self._autodetect_toggle_keyboard())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def _on_autodetect_content(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or not self.cfg.is_owner(query.from_user.id):
+            return  # silent
+        data = query.data or ""
+        if data == "autodetect:content:show":
+            # Revisit the content picker from the toggle screen.
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_content_text(),
+                        reply_markup=self._autodetect_content_keyboard(),
+                        parse_mode=ParseMode.HTML)
+                except _TelegramError.BadRequest:
+                    try:
+                        await query.edit_message_text(
+                            self._autodetect_content_text().replace("<b>", "").replace("</b>", ""),
+                            reply_markup=self._autodetect_content_keyboard())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            return
+        parts = data.split(":")
+        if len(parts) != 3 or parts[1] != "content" or parts[2] not in ("all", "ep", "pack"):
+            return
+        from xdmovies import autodetect_store as _ad
+        _ad.set_card_filter(_CONTENT_CALLBACK[parts[2]])
         if query.message is not None:
             try:
                 await query.edit_message_text(
@@ -4848,6 +4948,10 @@ class Bot:
         app.add_handler(CallbackQueryHandler(
             self._on_autodetect_set,
             pattern=r"^autodetect:set:(yes|no)$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_autodetect_content,
+            pattern=r"^autodetect:content:(show|all|ep|pack)$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_autodetect_back,

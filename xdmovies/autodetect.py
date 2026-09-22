@@ -136,12 +136,15 @@ async def _check_once(bot) -> tuple[List[str], str]:
     return new_urls, "new" if new_urls else "clean"
 
 
-def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int) -> None:
+def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int,
+                  card_filter: str = "all") -> None:
     """Build one silent channel Job per URL and push to the queue.
 
     Fire-and-forget via asyncio.create_task on the running loop's _enqueue.
     Reuses the scrape_all child pattern: post_to_channel + silent=True
     skips qmode/dmode pickers and progress chatter; batch posts to channel.
+    card_filter ("all" | "episodes" | "packs") narrows series cards via
+    the existing extractor.filter_cards_by_content path in _run_for_user.
     """
     try:
         from xdmovies.bot import Job  # local import to avoid cycle at module load
@@ -149,6 +152,8 @@ def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int) -> None:
         Job = None
     if Job is None or not urls:
         return
+    if card_filter not in ("all", "episodes", "packs"):
+        card_filter = "all"
     for u in urls:
         try:
             job = Job(
@@ -159,6 +164,7 @@ def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int) -> None:
                 username="",
                 post_to_channel=channel_id,
                 silent=True,
+                card_filter=card_filter,
             )
             asyncio.get_running_loop().create_task(bot._enqueue(job))
         except Exception as e:
@@ -184,11 +190,18 @@ async def _loop(bot) -> None:
                 except Exception:
                     cid = 0
                 owner = getattr(getattr(bot, "cfg", None), "owner_id", 0)
+                # Series feed applies the owner's content filter (all /
+                # episodes / packs); movies + all feeds resolve everything.
+                try:
+                    from xdmovies import autodetect_store as _ad
+                    cf = _ad.get_card_filter() if _ad.get_feed() == "series" else "all"
+                except Exception:
+                    cf = "all"
                 if cid:
-                    _enqueue_jobs(bot, urls, cid, owner)
+                    _enqueue_jobs(bot, urls, cid, owner, card_filter=cf)
                     logger.info(
                         f"[autodetect] enqueued {len(urls)} new url(s) "
-                        f"-> channel {cid} ({reason})"
+                        f"-> channel {cid} ({reason}, content={cf})"
                     )
             elif reason not in ("off", "clean", "baselined"):
                 logger.debug(f"[autodetect] tick skipped: {reason}")

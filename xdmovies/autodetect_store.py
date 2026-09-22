@@ -21,6 +21,7 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "xdmovies_state"
 _STATE_PATH = STATE_DIR / "autodetect.json"
 _SCHEMA = 1
 _VALID_FEEDS = ("all", "movies", "series")
+_VALID_CONTENT = ("all", "episodes", "packs")
 _SEEN_CAP = 500
 
 
@@ -29,6 +30,7 @@ def _load() -> Dict:
     defaults: Dict = {
         "enabled": False,
         "feed": "all",
+        "card_filter": "all",
         "seen_urls": [],
         "last_check_ts": 0,
         "updated_at": 0,
@@ -42,12 +44,16 @@ def _load() -> Dict:
         feed = data.get("feed")
         if feed not in _VALID_FEEDS:
             feed = "all"
+        cf = data.get("card_filter")
+        if cf not in _VALID_CONTENT:
+            cf = "all"
         seen = data.get("seen_urls")
         if not isinstance(seen, list):
             seen = []
         return {
             "enabled": bool(data.get("enabled", False)),
             "feed": feed,
+            "card_filter": cf,
             "seen_urls": [u for u in seen if isinstance(u, str)],
             "last_check_ts": _safe_float(data.get("last_check_ts")),
             "updated_at": _safe_float(data.get("updated_at")),
@@ -71,6 +77,10 @@ def _save(state: Dict) -> None:
             "schema_version": _SCHEMA,
             "enabled": bool(state.get("enabled", False)),
             "feed": state.get("feed") if state.get("feed") in _VALID_FEEDS else "all",
+            "card_filter": (
+                state.get("card_filter")
+                if state.get("card_filter") in _VALID_CONTENT else "all"
+            ),
             "seen_urls": list(state.get("seen_urls", []))[-_SEEN_CAP:],
             "last_check_ts": _safe_float(state.get("last_check_ts")),
             "updated_at": time.time(),
@@ -126,6 +136,26 @@ def set_feed(feed: str) -> str:
         return "all"
 
 
+def get_card_filter() -> str:
+    """Series content filter: "all" | "episodes" | "packs". Default "all"."""
+    try:
+        cf = _load().get("card_filter", "all")
+        return cf if cf in _VALID_CONTENT else "all"
+    except Exception:
+        return "all"
+
+
+def set_card_filter(card_filter: str) -> str:
+    """Persist the series content filter. Returns stored value."""
+    try:
+        st = _load()
+        st["card_filter"] = card_filter if card_filter in _VALID_CONTENT else "all"
+        _save(st)
+        return st["card_filter"]
+    except Exception:
+        return "all"
+
+
 def load_seen() -> List[str]:
     """Canonical detail URLs already handled. Never raises."""
     try:
@@ -165,6 +195,7 @@ def status_text() -> str:
         st = _load()
         state = "ON" if st.get("enabled") else "OFF"
         feed = st.get("feed", "all")
+        cf = st.get("card_filter", "all")
         last = _safe_float(st.get("last_check_ts"))
         seen_n = len(st.get("seen_urls", []))
         if last:
@@ -172,6 +203,7 @@ def status_text() -> str:
             when = f"{age_m}m ago"
         else:
             when = "never"
-        return f"{state} feed={feed} seen={seen_n} last_check={when}"
+        extra = f" content={cf}" if feed == "series" else ""
+        return f"{state} feed={feed}{extra} seen={seen_n} last_check={when}"
     except Exception:
         return "unknown"
