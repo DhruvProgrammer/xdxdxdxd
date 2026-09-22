@@ -478,6 +478,39 @@ def _fmt_dur(seconds: float) -> str:
     return f"{h}h {m:02d}m"
 
 
+def _parse_cancel_args(raw) -> Tuple[List[int], List[str]]:
+    """Parse `/cancel 2` / `/cancel 2,4,8` args into queue positions.
+
+    Splits on commas/whitespace. Returns (sorted unique 1-based indices,
+    invalid tokens). Never raises.
+    """
+    want: List[int] = []
+    bad: List[str] = []
+    seen = set()
+    try:
+        toks: List[str] = []
+        for tok in raw or []:
+            toks.extend(str(tok).replace(",", " ").split())
+        for piece in toks:
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                v = int(piece)
+            except ValueError:
+                bad.append(piece)
+                continue
+            if v < 1 or v in seen:
+                if v not in seen:
+                    bad.append(piece)
+                continue
+            seen.add(v)
+            want.append(v)
+    except Exception:
+        pass
+    return sorted(want), bad
+
+
 def _pretty_title(url: str) -> Tuple[str, str]:
     """(icon, short title) derived from an xdmovies URL slug.
 
@@ -2504,7 +2537,8 @@ class Bot:
             "/queue -- show who's waiting\n"
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
             "/scrapeallchannel -- scrape to your channel (owner only)\n"
-            "/cancel -- stop your running/queued job\n"
+            "/cancel -- stop yours: bare = running + all queued, "
+            "/cancel 2 or /cancel 2,4 = those /queue numbers only\n"
             "/qmode -- toggle quality picker for series\n"
             "/dmode -- toggle section (Packs/Episodes) picker for series\n"
             "/settings -- choose which details result cards show\n"
@@ -2685,6 +2719,16 @@ class Bot:
             return  # silent ignore
         _SCRAPECHAN_PENDING.pop(uid, None)
 
+        # Indexed cancel: `/cancel 2` or `/cancel 2,4,8`. Positions are
+        # 1-based over YOUR OWN queued jobs (urgent lane first, then
+        # normal FIFO -- the same order the dispatcher picks them up).
+        # The running job is never indexed; bare `/cancel` keeps the old
+        # cancel-everything-of-mine behavior.
+        raw_args = list(getattr(context, "args", None) or [])
+        if raw_args:
+            await self._cmd_cancel_indexed(update, context, uid, raw_args)
+            return
+
         cancelled_running = False
         cancelled_queued = 0
         removed_jobs: List[Tuple[int, str]] = []  # (depth, url)
@@ -2766,6 +2810,108 @@ class Bot:
             text = "ℹ️ nothing to cancel -- no running or queued job for you."
         await _send_safe(context.bot, update.effective_chat.id, text,
                            parse_mode=ParseMode.HTML)
+
+    async def _cmd_cancel_indexed(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE",
+                                  uid: int, raw_args: List[str]) -> None:
+        """Cancel specific queued positions: `/cancel 2` / `/cancel 2,4,8`.
+
+        Positions are 1-based over the requester's OWN queued jobs only
+        (urgent lane first, then normal FIFO -- dispatcher pick order).
+        Rebuilds both deques live under the queue lock (never resurrects
+        a job the dispatcher popped mid-snapshot), then replies with what
+        was cancelled plus the refreshed, re-numbered remainder.
+        """
+        want, bad = _parse_cancel_args(raw_args)
+        try:
+            urgent_items = await self._snapshot_urgent()
+        except Exception:
+            urgent_items = []
+        try:
+            items = await self._snapshot_queue()
+        except Exception:
+            items = []
+        mine = [j for j in urgent_items if getattr(j, "user_id", None) == uid]
+        mine += [j for j in items if getattr(j, "user_id", None) == uid]
+
+        if not mine:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "ℹ️ you have no queued jobs -- nothing to cancel by number. "
+                "Send /queue to see the current list.",
+                parse_mode=ParseMode.HTML)
+            return
+
+        valid = [i for i in want if 1 <= i <= len(mine)]
+        out_of_range = [str(i) for i in want if not (1 <= i <= len(mine))]
+        targets = {id(mine[i - 1]) for i in valid}
+        cancelled: List[Tuple[int, str]] = []  # (position, url)
+
+        async with self._queue_cond:
+            for lane_name in ("_urgent", "queue"):
+                try:
+                    lane = getattr(self, lane_name)
+                    live = list(lane)
+                    lane.clear()
+                    for j in live:
+                        if id(j) in targets:
+                            try:
+                                j.cancel_event.set()
+                                j.status = "cancelled"
+                                j.finished_at = time.time()
+                            except Exception:
+                                pass
+                        else:
+                            lane.append(j)
+                except Exception:
+                    _LOG.exception("indexed cancel lane rebuild failed: %s", lane_name)
+            self._queue_cond.notify_all()
+
+        # Titles for the reply (best-effort; snapshot objects are ours).
+        for i in valid:
+            try:
+                j = mine[i - 1]
+                if id(j) in targets:
+                    _icon, _title = _pretty_title(getattr(j, "url", "") or "")
+                    cancelled.append((i, f"{_icon} {_title}"))
+            except Exception:
+                pass
+
+        # Fresh remainder, re-numbered from 1.
+        try:
+            urg2 = await self._snapshot_urgent()
+        except Exception:
+            urg2 = []
+        try:
+            items2 = await self._snapshot_queue()
+        except Exception:
+            items2 = []
+        mine2 = [j for j in urg2 if getattr(j, "user_id", None) == uid]
+        mine2 += [j for j in items2 if getattr(j, "user_id", None) == uid]
+
+        lines: List[str] = []
+        if cancelled:
+            got = ", ".join(f"#{i} {t}" for i, t in cancelled)
+            lines.append(f"🛑 cancelled {got}.")
+        else:
+            lines.append("ℹ️ nothing cancelled.")
+        bad_all = out_of_range + bad
+        if bad_all:
+            lines.append(
+                f"⚠️ ignored: {', '.join(bad_all)} "
+                f"(you have <b>{len(mine)}</b> queued).")
+        if mine2:
+            lines.append(f"\n📋 your remaining queue (<b>{len(mine2)}</b>):")
+            for k, j in enumerate(mine2, 1):
+                try:
+                    _icon2, _title2 = _pretty_title(getattr(j, "url", "") or "")
+                    lines.append(f"<b>{k}.</b> {_icon2} {_title2}")
+                except Exception:
+                    pass
+        else:
+            lines.append("\n📋 your queue is now empty.")
+        lines.append("\nTip: /queue shows live positions; bare /cancel stops everything of yours.")
+        await _send_safe(context.bot, update.effective_chat.id, "\n".join(lines),
+                         parse_mode=ParseMode.HTML)
 
     async def _cmd_restart(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Owner-only full restart: stop every job, then re-exec the process.
@@ -4858,7 +5004,7 @@ class Bot:
                 BotCommand("search", "find a movie/series, tap to scrape"),
                 BotCommand("status", "show bot health"),
                 BotCommand("queue", "show running + queued jobs"),
-                BotCommand("cancel", "stop my running/queued job(s)"),
+                BotCommand("cancel", "cancel queued job(s) by /queue number, or all"),
                 BotCommand("restart", "restart the whole bot (owner only)"),
                 BotCommand("scrapeall", "scrape all movies or series"),
                 BotCommand("scrapeallchannel", "scrape to channel (owner only)"),

@@ -70,15 +70,23 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
 
     Mirrors the proven solve_server._auto_nudge: give CF a chance to
     auto-verify, else click the Turnstile checkbox, then re-check.
-    Backup layers (added 2026-09-08): a missed first click no longer
-    goes straight to the human solve-link -- up to 3 clicks re-scanning
-    frames each time (widgets often render late; multiple frames may
-    exist), then one page reload + fresh cycle as a last resort.
-    On a fresh solve, saves the NEW cf_clearance (IP+UA bound to this
-    browser) so next runs and keep-alive reuse it. Returns True when the
-    challenge is gone. Never raises; worst case costs ~35s on a page
-    that stays blocked (caller then raises CFChallengeError as before).
+    Nudge policy: at most 3 DISPATCHED clicks, each followed by a 10s
+    verify window (polling challenge-gone + fresh-cookie every second).
+    Every click is verified: detached frames are skipped via re-scan
+    each attempt, the click runs with an 8s timeout, and only a
+    no-exception return counts toward the 3-click budget (a failed
+    dispatch retries the next frame without burning budget; frames AND
+    points rotate per attempt since widgets often render late and
+    multiple frames may exist). Last resort is one reload + a 10s
+    passive verify (no click -- budget spent). On a fresh solve, saves
+    the NEW cf_clearance (IP+UA bound to this browser) so next runs
+    and keep-alive reuse it. Returns True when the challenge is gone.
+    Never raises; worst case costs ~60s on a page that stays blocked
+    (caller then raises CFChallengeError as before).
     """
+    # Nudge budget: max dispatched clicks + verify gap after each click.
+    NUDGE_MAX_CLICKS = 3
+    NUDGE_GAP_S = 10
     try:
         from xdmovies.cookie_store import set_cookies_for_domain
     except Exception:
@@ -112,6 +120,26 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
         except Exception:
             return False
 
+    async def _verify_window() -> bool:
+        """10s gap after a click: poll every second for challenge-gone
+        or a fresh cf_clearance cookie."""
+        for _ in range(NUDGE_GAP_S):
+            try:
+                if await clear():
+                    return True
+            except Exception:
+                pass
+            try:
+                if await fresh_cookie():
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+        try:
+            return await clear()
+        except Exception:
+            return False
+
     # Backup-nudge click points, rotated per attempt (a click that
     # lands beside the checkbox is the classic single-shot miss).
     _NUDGE_POINTS = ((30, 32), (18, 32), (42, 32))
@@ -119,9 +147,10 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
     async def _click_turnstile_frame(attempt: int):
         """Click one Turnstile frame, rotating frames AND points per
         attempt. Re-scans frames every call (widgets often render after
-        the first scan). Returns (clicked, frames_found): a failed click
-        still counts as frames_found (retry the next frame), only an
-        empty scan aborts the retry loop."""
+        the first scan) and skips detached frames (clicking a stale
+        frame silently does nothing). Returns (dispatched, found): only
+        a no-exception click counts as dispatched; an empty scan aborts
+        the retry loop."""
         try:
             frames = []
             for fr in page.frames:
@@ -130,6 +159,11 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
                 except Exception:
                     continue
                 if "challenges.cloudflare.com" in u and "turnstile" in u:
+                    try:
+                        if fr.is_detached():
+                            continue
+                    except Exception:
+                        pass
                     frames.append(fr)
         except Exception:
             return False, False
@@ -138,7 +172,14 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
         fr = frames[attempt % len(frames)]
         x, y = _NUDGE_POINTS[attempt % len(_NUDGE_POINTS)]
         try:
-            await fr.click("body", position={"x": x, "y": y}, delay=80, timeout=5000)
+            await fr.click("body", position={"x": x, "y": y}, delay=80, timeout=8000)
+            try:
+                import logging as _lg
+                _lg.getLogger("xdmovies.pipeline").info(
+                    "nudge click dispatched at (%d,%d) frame %d/%d",
+                    x, y, (attempt % len(frames)) + 1, len(frames))
+            except Exception:
+                pass
             return True, True
         except Exception:
             return False, True
@@ -167,46 +208,37 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
             if await clear():
                 await _save_cookie()
                 return True
-        # Backup nudges: up to 3 clicks, re-scanning frames each time,
-        # short-circuiting the moment CF verifies or a fresh cookie lands.
-        # Only an empty frame scan aborts early; a failed click retries
-        # the next frame.
-        for attempt in range(3):
-            _clicked, _found = await _click_turnstile_frame(attempt)
-            for _ in range(4):
-                if await clear():
-                    break
-                if await fresh_cookie():
-                    break
-                await asyncio.sleep(1.0)
+        # Nudge clicks: at most NUDGE_MAX_CLICKS dispatched clicks, each
+        # followed by a 10s verify window. Failed dispatches retry the
+        # next frame without burning budget (scan attempts bounded).
+        # Only an empty frame scan aborts early.
+        clicks = 0
+        for attempt in range(6):
             if await clear():
-                await _save_cookie()
-                return True
-            if not _found:
+                break
+            if clicks >= NUDGE_MAX_CLICKS:
+                break
+            _dispatched, _found = await _click_turnstile_frame(attempt)
+            if _dispatched:
+                clicks += 1
+            elif not _found:
                 break  # no widget rendered; further clicks pointless
-        # Last resort: one reload + fresh cycle. A re-rendered challenge
-        # is frequently solvable when the first render was not.
+            if await _verify_window():
+                break
+        if await clear():
+            await _save_cookie()
+            return True
+        # Last resort: one reload + 10s passive verify. No click here --
+        # the 3-click budget is spent. A re-rendered challenge frequently
+        # auto-verifies when the first render did not.
         try:
             await page.reload(wait_until="domcontentloaded", timeout=30000)
         except Exception:
             return False
-        for _ in range(6):
-            if await clear():
-                break
-            await asyncio.sleep(1.0)
-        if await fresh_cookie():
-            if await clear():
-                await _save_cookie()
-                return True
-        await _click_turnstile_frame(0)
-        for _ in range(6):
-            if await clear():
-                break
-            await asyncio.sleep(1.0)
-        if not await clear():
-            return False
-        await _save_cookie()
-        return True
+        if await _verify_window():
+            await _save_cookie()
+            return True
+        return False
     except Exception:
         return False
 
