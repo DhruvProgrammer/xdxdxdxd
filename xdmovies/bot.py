@@ -2480,6 +2480,7 @@ class Bot:
             "/qmode -- toggle quality picker for series\n"
             "/dmode -- toggle section (Packs/Episodes) picker for series\n"
             "/settings -- choose which details result cards show\n"
+            "/autodetect -- auto-detect new posts, resolve, post to channel (owner only)\n"
             "/restart -- restart the whole bot (owner only)\n"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -2576,12 +2577,18 @@ class Bot:
                 _chan_line = "\n<b>channel:</b> none preset\n"
         except Exception:
             _chan_line = ""
+        # Auto-detect state (30m catalog poll -> channel)
+        try:
+            from xdmovies.autodetect_store import status_text as _ad_status
+            ad_line = f"\n<b>autodetect:</b> {_html_escape(_ad_status())}\n"
+        except Exception:
+            ad_line = ""
         text = (
             "🟢 <b>alive</b> (VPS token solve-server + CloakBrowser, no VPN layer)\n"
             f"queue: <b>{depth}</b>\n"
             f"current: {cur}\n"
             f"last solve: {last}\n"
-            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}\n"
+            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}{ad_line}\n"
             f"<b>cookies:</b>\n{cst}"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -3462,6 +3469,176 @@ class Bot:
                     reply_markup=_settings_keyboard(prefs))
             except _TelegramError.BadRequest:
                 pass  # MessageNotModified on rapid double-tap
+            except Exception:
+                pass
+
+    # ---- /autodetect (owner-only, 30m catalog poll -> channel) -----------
+    _AD_FEED_LABELS = {"movies": "🎬 Movies", "series": "🎞️ Series", "all": "🌐 All (homepage)"}
+
+    def _autodetect_feed_keyboard(self):
+        from xdmovies import autodetect_store as _ad
+        cur = _ad.get_feed()
+        rows = []
+        for key in ("movies", "series", "all"):
+            label = self._AD_FEED_LABELS[key]
+            if key == cur:
+                label = f"✅ {label}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"autodetect:feed:{key}")])  # type: ignore[misc]
+        return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+    def _autodetect_feed_text(self) -> str:
+        from xdmovies import autodetect_store as _ad
+        cur = _ad.get_feed()
+        state = "ON" if _ad.is_on() else "OFF"
+        return (
+            "Auto-detect: poll xdmovies for new posts every 30m, "
+            "resolve them, and post to your channel.\n\n"
+            f"Current feed: <b>{self._AD_FEED_LABELS[cur]}</b>\n"
+            f"State: <b>{state}</b>\n\n"
+            "Pick the feed to watch:"
+        )
+
+    def _autodetect_toggle_keyboard(self):
+        from xdmovies import autodetect_store as _ad
+        cur = _ad.get_feed()
+        on = _ad.is_on()
+        rows = []
+        if not on:
+            rows.append([InlineKeyboardButton("🟢 Turn ON", callback_data="autodetect:set:yes")])  # type: ignore[misc]
+        else:
+            rows.append([InlineKeyboardButton("🔴 Turn OFF", callback_data="autodetect:set:no")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton("⬅️ Change feed", callback_data="autodetect:back")])  # type: ignore[misc]
+        return InlineKeyboardMarkup(rows)  # type: ignore[misc]
+
+    def _autodetect_toggle_text(self) -> str:
+        from xdmovies import autodetect_store as _ad
+        from xdmovies.scrape_all import load_channel
+        cur = _ad.get_feed()
+        on = _ad.is_on()
+        ch = load_channel()
+        cid = getattr(ch, "channel_id", 0) if ch else 0
+        ch_txt = (
+            f"<b>{_html_escape(str(getattr(ch, 'title', '') or cid))}</b>"
+            if cid else "<b>none (run /scrapeallchannel first)</b>"
+        )
+        interval = "30m"
+        return (
+            f"Auto detect: <b>{'ON' if on else 'OFF'}</b>\n"
+            f"Feed: <b>{self._AD_FEED_LABELS[cur]}</b>\n"
+            f"Interval: <b>{interval}</b>\n"
+            f"Channel: {ch_txt}\n"
+            + (
+                "New posts will be resolved and posted to the channel."
+                if on
+                else "Tap Turn ON to start watching."
+            )
+        )
+
+    async def _cmd_autodetect(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        if not self.cfg.is_owner(update.effective_user.id):
+            return  # owner-only, silent (convention from /restart)
+        text = self._autodetect_feed_text()
+        kb = self._autodetect_feed_keyboard()
+        try:
+            await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except _TelegramError.BadRequest:
+            try:
+                await update.message.reply_text(
+                    text.replace("<b>", "").replace("</b>", ""), reply_markup=kb)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _on_autodetect_feed(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None:
+            return
+        if not self.cfg.is_owner(query.from_user.id):
+            return  # silent
+        parts = (query.data or "").split(":")
+        if len(parts) != 3 or parts[0] != "autodetect" or parts[1] != "feed":
+            return
+        feed = parts[2]
+        if feed not in ("movies", "series", "all"):
+            return
+        from xdmovies import autodetect_store as _ad
+        _ad.set_feed(feed)
+        if query.message is not None:
+            try:
+                await query.edit_message_text(
+                    self._autodetect_toggle_text(),
+                    reply_markup=self._autodetect_toggle_keyboard(),
+                    parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_toggle_text().replace("<b>", "").replace("</b>", ""),
+                        reply_markup=self._autodetect_toggle_keyboard())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def _on_autodetect_set(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None:
+            return
+        if not self.cfg.is_owner(query.from_user.id):
+            return
+        data = query.data or ""
+        if data not in ("autodetect:set:yes", "autodetect:set:no"):
+            return
+        from xdmovies import autodetect_store as _ad
+        want_on = data.endswith(":yes")
+        # Turning ON with no channel is useless — warn but still store choice.
+        _ad.set_on(want_on)
+        if query.message is not None:
+            try:
+                await query.edit_message_text(
+                    self._autodetect_toggle_text(),
+                    reply_markup=self._autodetect_toggle_keyboard(),
+                    parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_toggle_text().replace("<b>", "").replace("</b>", ""),
+                        reply_markup=self._autodetect_toggle_keyboard())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def _on_autodetect_back(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or not self.cfg.is_owner(query.from_user.id):
+            return
+        if (query.data or "") != "autodetect:back":
+            return
+        if query.message is not None:
+            try:
+                await query.edit_message_text(
+                    self._autodetect_feed_text(),
+                    reply_markup=self._autodetect_feed_keyboard(),
+                    parse_mode=ParseMode.HTML)
+            except _TelegramError.BadRequest:
+                try:
+                    await query.edit_message_text(
+                        self._autodetect_feed_text().replace("<b>", "").replace("</b>", ""),
+                        reply_markup=self._autodetect_feed_keyboard())
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -4515,6 +4692,13 @@ class Bot:
             _LOG.info("keep_alive started (post refresh 25m + VPS fallback)")
         except Exception:
             _LOG.exception("keep_alive start failed (non-fatal)")
+        # auto-detect — 30m catalog poll -> new posts -> channel
+        try:
+            from xdmovies.autodetect import start_autodetect
+            await start_autodetect(self)
+            _LOG.info("autodetect loop scheduled (30m interval)")
+        except Exception:
+            _LOG.exception("autodetect start failed (non-fatal)")
         for h in application.handlers.values():
             for hh in h:
                 _LOG.info("handler: %s", type(hh).__name__)
@@ -4532,6 +4716,7 @@ class Bot:
                 BotCommand("qmode", "toggle quality picker for series"),
                 BotCommand("dmode", "toggle section picker for series"),
                 BotCommand("settings", "choose result card details"),
+                BotCommand("autodetect", "auto-detect new posts to channel (owner)"),
             ])
         except Exception:
             _LOG.exception("set_my_commands failed (non-fatal)")
@@ -4542,6 +4727,11 @@ class Bot:
             pass
 
     async def _post_stop(self, _application: "Application") -> None:
+        try:
+            from xdmovies.autodetect import stop_autodetect
+            await stop_autodetect()
+        except Exception:
+            pass
         try:
             from xdmovies.keep_alive import stop_keep_alive
             await stop_keep_alive()
@@ -4649,6 +4839,19 @@ class Bot:
         app.add_handler(CallbackQueryHandler(
             self._on_settings,
             pattern=r"^settings:(toggle:[a-z_]+|all|close)$",
+        ))
+        app.add_handler(CommandHandler("autodetect", self._cmd_autodetect))
+        app.add_handler(CallbackQueryHandler(
+            self._on_autodetect_feed,
+            pattern=r"^autodetect:feed:(movies|series|all)$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_autodetect_set,
+            pattern=r"^autodetect:set:(yes|no)$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_autodetect_back,
+            pattern=r"^autodetect:back$",
         ))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         # TEXT covers plain DMs, CAPTION covers forwarded channel
