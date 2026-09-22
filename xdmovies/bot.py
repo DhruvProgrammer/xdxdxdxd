@@ -2538,7 +2538,7 @@ class Bot:
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
             "/scrapeallchannel -- scrape to your channel (owner only)\n"
             "/cancel -- stop yours: bare = running + all queued, "
-            "/cancel 2 or /cancel 2,4 = those /queue numbers only\n"
+            "/cancel 2 or /cancel 2 4 8 (commas also work) = those /queue numbers only\n"
             "/qmode -- toggle quality picker for series\n"
             "/dmode -- toggle section (Packs/Episodes) picker for series\n"
             "/settings -- choose which details result cards show\n"

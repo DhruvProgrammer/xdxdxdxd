@@ -284,7 +284,7 @@ Example:
 | | |
 |---|---|
 | Who | all (acts on **your own** jobs only) |
-| Usage | `/cancel` · `/cancel 2` · `/cancel 2,4,8` |
+| Usage | `/cancel` · `/cancel 2` · `/cancel 2 4 8` (commas work too: `/cancel 2,4,8`) |
 | Does | Stops jobs. Bare = running + **all** your queued jobs. With numbers = only those queued positions. |
 
 Examples:
@@ -295,7 +295,7 @@ Examples:
                      📋 your remaining queue (2):
                      1. 🎬 hushar pittalu...
                      2. 🎬 phata poster...
-/cancel 2,4        → 🛑 cancelled #2 ..., #4 ...
+/cancel 2 4 8      → 🛑 cancelled #2 ..., #4 ..., #8 ...   (or /cancel 2,4,8)
 ```
 
 - Positions are 1-based over **your own queued jobs** (your urgent jobs
@@ -438,7 +438,7 @@ Behavior notes:
   FIFO-queues with position + ETA at enqueue (`deque` + lock + condition, no
   drain/re-put races). An **urgent lane** lets a pasted link jump ahead of a
   running channel scrape at the next movie boundary.
-- **Indexed cancel.** `/cancel 2` / `/cancel 2,4,8` removes exactly those
+- **Indexed cancel.** `/cancel 2` / `/cancel 2 4 8` (commas also work) removes exactly those
   queued positions (yours only); the reply re-numbers the remainder.
 - **Silent access control.** Non-allowed users get a black hole (only `/start`
   reveals their ID for allowlisting).
@@ -515,7 +515,7 @@ Short-circuit path: cards already on hub hosts resolve with no browser at all.
 (you) https://top.xdmovies.wtf/movies/urgent-film-...
 (bot) ⚡ Urgent link — running now (channel scrape paused).
       → resolves immediately → channel scrape resumes after.
-/cancel 2,4   → drop the two autodetect items you don't care about.
+/cancel 2 4   → drop the two autodetect items you don't care about.
 ```
 
 ### F. "Cloudflare is being stubborn"
