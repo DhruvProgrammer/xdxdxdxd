@@ -3484,6 +3484,7 @@ class Bot:
             if key == cur:
                 label = f"✅ {label}"
             rows.append([InlineKeyboardButton(label, callback_data=f"autodetect:feed:{key}")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton("❌ Close", callback_data="autodetect:close")])  # type: ignore[misc]
         return InlineKeyboardMarkup(rows)  # type: ignore[misc]
 
     def _autodetect_feed_text(self) -> str:
@@ -3510,6 +3511,7 @@ class Bot:
         if cur == "series":
             rows.append([InlineKeyboardButton("🎞️ Content filter", callback_data="autodetect:content:show")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("⬅️ Change feed", callback_data="autodetect:back")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton("❌ Close", callback_data="autodetect:close")])  # type: ignore[misc]
         return InlineKeyboardMarkup(rows)  # type: ignore[misc]
 
     def _autodetect_toggle_text(self) -> str:
@@ -3558,6 +3560,7 @@ class Bot:
                 label = f"✅ {label}"
             rows.append([InlineKeyboardButton(label, callback_data=f"autodetect:content:{cb}")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="autodetect:back")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton("❌ Close", callback_data="autodetect:close")])  # type: ignore[misc]
         return InlineKeyboardMarkup(rows)  # type: ignore[misc]
 
     def _autodetect_content_text(self) -> str:
@@ -3742,6 +3745,21 @@ class Bot:
                         reply_markup=self._autodetect_feed_keyboard())
                 except Exception:
                     pass
+            except Exception:
+                pass
+
+    async def _on_autodetect_close(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        if update.effective_user is None or not self.cfg.is_owner(query.from_user.id):
+            return  # silent
+        if (query.data or "") != "autodetect:close":
+            return
+        if query.message is not None:
+            try:
+                await query.message.delete()
             except Exception:
                 pass
 
@@ -4959,6 +4977,10 @@ class Bot:
         app.add_handler(CallbackQueryHandler(
             self._on_autodetect_back,
             pattern=r"^autodetect:back$",
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self._on_autodetect_close,
+            pattern=r"^autodetect:close$",
         ))
         app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
         # TEXT covers plain DMs, CAPTION covers forwarded channel
