@@ -388,6 +388,32 @@ async def _drop_msg(bot, chat_id: int, message_id: Optional[int]) -> None:
         pass
 
 
+def _op_dm(job) -> int:
+    """DM target for operational chatter (solve links, wait pills,
+    timeouts, FAILs, error tracebacks).
+
+    For channel-routed jobs the public channel must NEVER see the
+    VPS-IP solve link or any solve/timeout chatter -- those go to the
+    requester instead (job.user_id, the owner for autodetect jobs).
+    Channel-routed = chat IS the channel (chat_id == post_to_channel).
+    Scrape-channel children already run in the requester's DM
+    (chat_id != post_to_channel), so they are unaffected.
+    Result batches are NOT routed here -- they stay on the channel.
+    """
+    try:
+        chan = getattr(job, "post_to_channel", 0) or 0
+        chat = getattr(job, "chat_id", 0) or 0
+        uid = getattr(job, "user_id", 0) or 0
+        if chan and chat and chat == chan and uid:
+            return int(uid)
+        return int(chat)
+    except Exception:
+        try:
+            return int(getattr(job, "chat_id", 0) or 0)
+        except Exception:
+            return 0
+
+
 def _restart_notice_path() -> str:
     try:
         return os.path.join(tempfile.gettempdir(), "xdmovies_restart_notice.json")
@@ -1322,20 +1348,22 @@ class Bot:
             try:
                 self._last_cf_url[job.user_id] = blocked_url
             except: pass
-            # hybrid: try VPS token solve (posts need it, not home)
-            token, msg_id = await self._send_solve_link(job.chat_id, blocked_url, host, job.user_id)
+            # hybrid: try VPS token solve (posts need it, not home).
+            # Operational chatter goes to the requester's DM (_op_dm),
+            # never the public channel (it carries the VPS IP).
+            token, msg_id = await self._send_solve_link(_op_dm(job), blocked_url, host, job.user_id)
             if token:
                 # Audit finding H6: align with SESSION_TTL (300s) and
                 # shorten the wait so the user isn't left waiting after
                 # the solve_server already destroyed the session.
-                _waitpill = await _send_transient_note(self._bot, job.chat_id, "⏳ Waiting up to 120s -- open solve link and tap checkbox if you see it. Keep-alive will resume after.")
+                _waitpill = await _send_transient_note(self._bot, _op_dm(job), "⏳ Waiting up to 120s -- open solve link and tap checkbox if you see it. Keep-alive will resume after.")
                 try:
                     _solved = await self._wait_for_solve(token, timeout=120.0)
                 finally:
-                    await _drop_msg(self._bot, job.chat_id, _waitpill)
+                    await _drop_msg(self._bot, _op_dm(job), _waitpill)
                 if _solved:
                     if msg_id:
-                        try: await self._bot.delete_message(chat_id=job.chat_id, message_id=msg_id)
+                        try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id)
                         except: pass
                     # Audit finding H10: move the post-solve retry out of
                     # the except CFChallengeError block so non-CF
@@ -1367,20 +1395,20 @@ class Bot:
                     except CFChallengeError as cf2:
                         # still blocked after solve
                         host2 = getattr(cf2, "host", "") or host
-                        await _send_safe(self._bot, job.chat_id, f"[FAIL] Still blocked on <code>{host2}</code> after solve -- try again or /status", parse_mode=ParseMode.HTML)
+                        await _send_safe(self._bot, _op_dm(job), f"[FAIL] Still blocked on <code>{host2}</code> after solve -- try again or /status", parse_mode=ParseMode.HTML)
                         job.status = "error"
                         job.error = f"cf_challenge:{host2}"
                         job.finished_at = time.time()
                         return
                 else:
-                    await _send_safe(self._bot, job.chat_id, f"⏰ Solve timed out. Resend the link to get a fresh solve link (keep-alive paused).", parse_mode=ParseMode.HTML)
+                    await _send_safe(self._bot, _op_dm(job), f"⏰ Solve timed out. Resend the link to get a fresh solve link (keep-alive paused).", parse_mode=ParseMode.HTML)
                     job.status = "error"
                     job.error = f"cf_challenge:{host}"
                     job.finished_at = time.time()
                     return
             else:
                 _vps = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
-                await _send_safe(self._bot, job.chat_id, f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS {_vps}", parse_mode=ParseMode.HTML)
+                await _send_safe(self._bot, _op_dm(job), f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS {_vps}", parse_mode=ParseMode.HTML)
                 job.status = "error"
                 job.error = f"cf_challenge:{host}"
                 job.finished_at = time.time()
@@ -1403,7 +1431,7 @@ class Bot:
                     job.card_filter, len(cards), job.url,
                 )
                 await _send_safe(
-                    self._bot, job.chat_id,
+                    self._bot, _op_dm(job),
                     f"[FAIL] no {_html_escape(_label)} links found on that page "
                     f"(title: <code>{_html_escape((result.page_title or '').strip()[:80])}</code>). "
                     f"The page exists but has no {_html_escape(_label.lower())} section.",
@@ -1634,18 +1662,18 @@ class Bot:
                                     blocked2 = exc.url or url2
                                     try: self._last_cf_url[job.user_id] = blocked2
                                     except: pass
-                                    token2, msg_id2 = await self._send_solve_link(job.chat_id, blocked2, host2, job.user_id)
+                                    token2, msg_id2 = await self._send_solve_link(_op_dm(job), blocked2, host2, job.user_id)
                                     if token2:
                                         _gate2 = "latestnews" in (host2 or "")
                                         _wait2 = 240.0 if _gate2 else 90.0
-                                        _waitpill2 = await _send_transient_note(self._bot, job.chat_id, f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.")
+                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.")
                                         try:
                                             _solved2 = await self._wait_for_solve(token2, timeout=_wait2)
                                         finally:
-                                            await _drop_msg(self._bot, job.chat_id, _waitpill2)
+                                            await _drop_msg(self._bot, _op_dm(job), _waitpill2)
                                         if _solved2:
                                             if msg_id2:
-                                                try: await self._bot.delete_message(chat_id=job.chat_id, message_id=msg_id2)
+                                                try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id2)
                                                 except: pass
                                             try:
                                                 from xdmovies.solve_server import get_solved_result as _gsr2
@@ -1682,18 +1710,18 @@ class Bot:
                         blockedf = exc.url or card.url
                         try: self._last_cf_url[job.user_id] = blockedf
                         except: pass
-                        tokenf, msg_idf = await self._send_solve_link(job.chat_id, blockedf, hostf, job.user_id)
+                        tokenf, msg_idf = await self._send_solve_link(_op_dm(job), blockedf, hostf, job.user_id)
                         if tokenf:
                             _gatef = "latestnews" in (hostf or "")
                             _waitf = 240.0 if _gatef else 90.0
-                            _waitpillf = await _send_transient_note(self._bot, job.chat_id, f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.")
+                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.")
                             try:
                                 _solvedf = await self._wait_for_solve(tokenf, timeout=_waitf)
                             finally:
-                                await _drop_msg(self._bot, job.chat_id, _waitpillf)
+                                await _drop_msg(self._bot, _op_dm(job), _waitpillf)
                             if _solvedf:
                                 if msg_idf:
-                                    try: await self._bot.delete_message(chat_id=job.chat_id, message_id=msg_idf)
+                                    try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_idf)
                                     except: pass
                                 try:
                                     from xdmovies.solve_server import get_solved_result as _gsrf
@@ -2351,7 +2379,7 @@ class Bot:
         err_text = _html_escape(job.error or "unknown")
         try:
             await self._bot.send_message(
-                chat_id=job.chat_id,
+                chat_id=_op_dm(job),
                 text=(
                     f"[FAIL] error: {err_text}\n"
                     f"Full traceback: <code>{_html_escape(self.cfg.error_log_path)}</code>"
@@ -2362,7 +2390,7 @@ class Bot:
             _LOG.warning("error reply HTML failed (%s) -- retrying plain", exc)
             try:
                 await self._bot.send_message(
-                    chat_id=job.chat_id,
+                    chat_id=_op_dm(job),
                     text=(
                         f"[FAIL] error: {job.error or 'unknown'}\n"
                         f"Full traceback: {self.cfg.error_log_path}"
@@ -2429,7 +2457,7 @@ class Bot:
                             traceback.print_exc(file=f)
                         if self._bot is not None and not job.cancel_event.is_set():
                             await self._bot.send_message(
-                                chat_id=job.chat_id,
+                                chat_id=_op_dm(job),
                                 text=f"[FAIL] unhandled error: {job.error}\nFull traceback: {self.cfg.error_log_path}",
                             )
                     except Exception:
