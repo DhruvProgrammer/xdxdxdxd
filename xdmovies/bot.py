@@ -3544,15 +3544,18 @@ class Bot:
         from xdmovies import autodetect_store as _ad
         cur = _ad.get_card_filter()
         # Same three choices as the search accept-all content picker.
+        # Base emojis must NEVER be a checkmark -- only the current
+        # selection gets the ✅ prefix, otherwise "All" always looked
+        # selected (its old base emoji was ✅).
         rows = []
         for key, cb, emoji in (
-            ("all", "all", "✅"),
+            ("all", "all", "📋"),
             ("episodes", "ep", "🎞️"),
             ("packs", "pack", "🗜️"),
         ):
             label = f"{emoji} {_CONTENT_LABEL[key]}"
             if key == cur:
-                label = f"✅ {label}" if key != "all" else label
+                label = f"✅ {label}"
             rows.append([InlineKeyboardButton(label, callback_data=f"autodetect:content:{cb}")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="autodetect:back")])  # type: ignore[misc]
         return InlineKeyboardMarkup(rows)  # type: ignore[misc]
