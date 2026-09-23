@@ -203,7 +203,7 @@ def status_text() -> str:
             when = f"{age_m}m ago"
         else:
             when = "never"
-        extra = f" content={cf}" if feed == "series" else ""
+        extra = f" content={cf}" if feed in ("series", "all") else ""
         return f"{state} feed={feed}{extra} seen={seen_n} last_check={when}"
     except Exception:
         return "unknown"

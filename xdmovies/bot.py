@@ -3682,7 +3682,7 @@ class Bot:
             rows.append([InlineKeyboardButton("🟢 Turn ON", callback_data="autodetect:set:yes")])  # type: ignore[misc]
         else:
             rows.append([InlineKeyboardButton("🔴 Turn OFF", callback_data="autodetect:set:no")])  # type: ignore[misc]
-        if cur == "series":
+        if cur in ("series", "all"):
             rows.append([InlineKeyboardButton("🎞️ Content filter", callback_data="autodetect:content:show")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("⬅️ Change feed", callback_data="autodetect:back")])  # type: ignore[misc]
         rows.append([InlineKeyboardButton("❌ Close", callback_data="autodetect:close")])  # type: ignore[misc]
@@ -3701,9 +3701,9 @@ class Bot:
         )
         interval = "30m"
         content_line = ""
-        if cur == "series":
+        if cur in ("series", "all"):
             cf = _ad.get_card_filter()
-            content_line = f"\nContent: <b>{_html_escape(_CONTENT_LABEL.get(cf, cf))}</b>"
+            content_line = f"\nContent: <b>{_html_escape(_CONTENT_LABEL.get(cf, cf))}</b> (series posts)"
         return (
             f"Auto detect: <b>{'ON' if on else 'OFF'}</b>\n"
             f"Feed: <b>{self._AD_FEED_LABELS[cur]}</b>\n"
@@ -3740,12 +3740,15 @@ class Bot:
     def _autodetect_content_text(self) -> str:
         from xdmovies import autodetect_store as _ad
         cf = _ad.get_card_filter()
+        feed = _ad.get_feed()
+        scope = "Series posts" if feed == "all" else "Series detected"
         return (
-            "Series detected -- what should auto-detect resolve?\n\n"
+            f"{scope} -- what should auto-detect resolve?\n\n"
             f"Current: <b>{_html_escape(_CONTENT_LABEL.get(cf, cf))}</b>\n\n"
             "• All = episodes + packs/zips\n"
             "• Episodes only = single-episode cards\n"
             "• Packs/Zips only = season/full .zip packs"
+            + ("\n(Movie posts always resolve fully.)" if feed == "all" else "")
         )
 
     async def _cmd_autodetect(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -3816,10 +3819,11 @@ class Bot:
         # Turning ON with no channel is useless — warn but still store choice.
         _ad.set_on(want_on)
         if query.message is not None:
-            # Series ON -> ask content filter first (All / Episodes / Packs),
-            # same choice as the search accept-all flow. The content callback
-            # lands back on the toggle screen.
-            if want_on and _ad.get_feed() == "series":
+            # Series/All ON -> ask content filter first (All / Episodes /
+            # Packs), same choice as the search accept-all flow. Movies
+            # need no filter (every movie card resolves fully anyway).
+            # The content callback lands back on the toggle screen.
+            if want_on and _ad.get_feed() in ("series", "all"):
                 try:
                     await query.edit_message_text(
                         self._autodetect_content_text(),

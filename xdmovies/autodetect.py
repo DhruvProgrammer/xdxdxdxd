@@ -190,11 +190,13 @@ async def _loop(bot) -> None:
                 except Exception:
                     cid = 0
                 owner = getattr(getattr(bot, "cfg", None), "owner_id", 0)
-                # Series feed applies the owner's content filter (all /
-                # episodes / packs); movies + all feeds resolve everything.
+                # Series content filter (all / episodes / packs) applies to
+                # the series and all feeds. Movies resolve fully either way:
+                # movie cards are "custom" kind, which the filter always
+                # keeps, so the stored filter is ignored for that feed.
                 try:
                     from xdmovies import autodetect_store as _ad
-                    cf = _ad.get_card_filter() if _ad.get_feed() == "series" else "all"
+                    cf = _ad.get_card_filter() if _ad.get_feed() in ("series", "all") else "all"
                 except Exception:
                     cf = "all"
                 if cid:

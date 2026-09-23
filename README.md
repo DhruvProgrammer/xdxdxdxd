@@ -408,8 +408,11 @@ Full flow example:
 Behavior notes:
 
 - **Single feed at a time** — picking another feed replaces the previous one.
-- The content question (All / Episodes / Packs) appears **only for the Series
-  feed**, reusing the exact search accept-all filter. Movies/All resolve everything.
+- The content question (All / Episodes / Packs) appears for the **Series**
+  and **All (homepage)** feeds, reusing the exact search accept-all filter.
+  It narrows **series posts only** — movie posts always resolve fully (movie
+  cards pass through every filter). The Movies feed asks nothing and
+  resolves everything.
 - Requires the `/scrapeallchannel` preset — without it, ticks are skipped and
   the toggle screen says `Channel: none (run /scrapeallchannel first)`.
 - **First tick after enabling only takes a snapshot** (baseline) — nothing
