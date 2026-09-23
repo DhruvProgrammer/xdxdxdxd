@@ -44,10 +44,8 @@ def stealth_plugin():  # pragma: no cover - simple factory
 def _chromium_args(useragent: Optional[str]) -> Sequence[str]:
     args: list[str] = [
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
         "--disable-infobars",
         "--disable-dev-shm-usage",
-        "--no-sandbox",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-extensions",
@@ -70,8 +68,7 @@ def warn_if_stealth_missing() -> None:
 
 
 # Gate-page fingerprint consistency script. Applied via
-# ctx.add_init_script() in link_exec._gate_via_manual, alongside the
-# anti-ad script. Covers ONLY things CloakBrowser's C++ patches and
+# ctx.add_init_script() in every gate context. Covers ONLY things CloakBrowser's C++ patches and
 # playwright-stealth do not already handle, to avoid double-spoof
 # conflicts:
 #
@@ -133,6 +130,20 @@ def gate_fingerprint_script() -> str:
     return GATE_FINGERPRINT_SCRIPT
 
 
+async def apply_gate_context_init_scripts(context) -> None:
+    await context.add_init_script(gate_fingerprint_script())
+    plugin = stealth_plugin()
+    if plugin is None:
+        return
+    init = getattr(plugin, "init_script", None) or getattr(plugin, "init_scripts", None)
+    if isinstance(init, list):
+        for script in init:
+            if script:
+                await context.add_init_script(script)
+    elif init:
+        await context.add_init_script(init)
+
+
 def chromium_launch_kwargs(
     *,
     browser_type: str,
@@ -160,6 +171,8 @@ __all__ = [
     "stealth_available",
     "stealth_import_error",
     "stealth_plugin",
+    "apply_gate_context_init_scripts",
+    "gate_fingerprint_script",
     "chromium_launch_kwargs",
     "is_chromium_family",
     "warn_if_stealth_missing",

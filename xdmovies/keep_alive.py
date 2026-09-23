@@ -18,13 +18,17 @@ No invisible_playwright, no persistent profile; uses cookie_store + browser_stea
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import re
 import time
 import random
 from typing import Optional, Tuple
+from urllib.parse import urlsplit
 
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file, open_private_text
+from xdmovies.browser_runtime import close_browser_objects, is_cf_challenge_page
 from xdmovies.logger_utils import logger
 
 # CF is on posts, so we need a real movie page to refresh
@@ -47,7 +51,7 @@ def _state_path() -> str:
     for p in STATE_PATH_CANDIDATES:
         d = os.path.dirname(os.path.abspath(p))
         try:
-            os.makedirs(d, exist_ok=True)
+            ensure_private_directory(d)
         except Exception:
             continue
         return os.path.abspath(p)
@@ -65,7 +69,7 @@ def _targets_path() -> str:
     for p in REFRESH_TARGETS_PATH_CANDIDATES:
         d = os.path.dirname(os.path.abspath(p))
         try:
-            os.makedirs(d, exist_ok=True)
+            ensure_private_directory(d)
         except Exception:
             continue
         return os.path.abspath(p)
@@ -77,7 +81,8 @@ def _load_state() -> dict:
     if not os.path.isfile(STATE_PATH):
         return {}
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        ensure_private_file(STATE_PATH)
+        with open_private_text(STATE_PATH, "r", encoding="utf-8") as f:
             d = json.load(f)
             return d if isinstance(d, dict) else {}
     except Exception:
@@ -85,11 +90,8 @@ def _load_state() -> dict:
 
 def _save_state(d: dict) -> None:
     try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
-        os.replace(tmp, STATE_PATH)
+        ensure_private_directory(os.path.dirname(STATE_PATH))
+        atomic_write_json(STATE_PATH, d)
     except Exception:
         pass
 
@@ -97,7 +99,8 @@ def _load_targets() -> list:
     if not os.path.isfile(TARGETS_PATH):
         return []
     try:
-        with open(TARGETS_PATH, "r", encoding="utf-8") as f:
+        ensure_private_file(TARGETS_PATH)
+        with open_private_text(TARGETS_PATH, "r", encoding="utf-8") as f:
             arr = json.load(f)
             return arr if isinstance(arr, list) else []
     except Exception:
@@ -105,17 +108,20 @@ def _load_targets() -> list:
 
 def _save_targets(arr: list) -> None:
     try:
-        os.makedirs(os.path.dirname(TARGETS_PATH), exist_ok=True)
-        tmp = TARGETS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(arr[-20:], f, indent=2)  # keep last 20
-        os.replace(tmp, TARGETS_PATH)
+        ensure_private_directory(os.path.dirname(TARGETS_PATH))
+        atomic_write_json(TARGETS_PATH, arr[-20:])
     except Exception:
         pass
 
 def remember_movie_url(url: str) -> None:
     """Call from bot after successful movie fetch to keep refresh target smart."""
-    if not url or "xdmovies.wtf/movies/" not in url and "xdmovies.wtf/series/" not in url:
+    try:
+        parsed = urlsplit((url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        valid_path = parsed.path.startswith(("/movies/", "/series/"))
+    except ValueError:
+        return
+    if parsed.scheme not in ("http", "https") or host != "xdmovies.wtf" and not host.endswith(".xdmovies.wtf") or not valid_path:
         return
     arr = _load_targets()
     if url in arr:
@@ -136,8 +142,10 @@ def _get_last_solve_ts(domain_key: str = "xdmovies.wtf") -> Optional[float]:
     try:
         from xdmovies.cookie_store import get_entry
         e = get_entry(domain_key)
-        if e and e.get("_updated_at"):
-            return float(e["_updated_at"])
+        if e:
+            for field_name in ("_last_used_at", "_updated_at"):
+                if e.get(field_name):
+                    return float(e[field_name])
     except Exception:
         pass
     # fallback to state file
@@ -151,6 +159,11 @@ def _get_last_solve_ts(domain_key: str = "xdmovies.wtf") -> Optional[float]:
     return None
 
 def _touch_keep_alive(domain_key: str = "xdmovies.wtf") -> None:
+    try:
+        from xdmovies.cookie_store import mark_successful_use
+        mark_successful_use(domain_key)
+    except Exception:
+        pass
     st = _load_state()
     st.setdefault(domain_key, {})["last_refresh_ok"] = time.time()
     st[domain_key]["last_refresh_ok_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -167,98 +180,94 @@ def _classify_turnstile_mode(frame_url: str) -> str:
             return k
     return "unknown"
 
-async def _classify_and_nudge(page, context) -> bool:
-    """Respect mode: non-interactive = passive wait (no click), light/managed = one nudge."""
+def _keepalive_domain_ok(cookie_domain: str, target_url: str) -> bool:
+    try:
+        target = (urlsplit(target_url or "").hostname or "").lower().rstrip(".")
+        candidate = (cookie_domain or "").lower().lstrip(".").rstrip(".")
+    except ValueError:
+        return False
+    if not target or not candidate:
+        return False
+    return candidate == target or candidate.endswith("." + target) or target.endswith("." + candidate)
+
+
+async def _fresh_keepalive_cookie(context, target_url: str, pre_injected: set[str]) -> str:
+    try:
+        for cookie in await context.cookies():
+            if str(cookie.get("name") or "").lower() != "cf_clearance":
+                continue
+            value = str(cookie.get("value") or "")
+            if not value or len(value) <= 20 or value in pre_injected:
+                continue
+            if _keepalive_domain_ok(str(cookie.get("domain") or ""), target_url):
+                return value
+    except Exception:
+        pass
+    return ""
+
+
+async def _save_keepalive_cookie(page, context, target_url: str, pre_injected: set[str]) -> bool:
+    value = await _fresh_keepalive_cookie(context, target_url, pre_injected)
+    if not value:
+        return False
+    try:
+        user_agent = str(await page.evaluate("navigator.userAgent") or "")
+        from xdmovies.cookie_store import set_cookies_for_domain
+        await asyncio.to_thread(
+            set_cookies_for_domain,
+            "xdmovies.wtf",
+            f"cf_clearance={value}",
+            user_agent=user_agent,
+        )
+
+        logger.info("[keep_alive] captured a fresh cf_clearance")
+        return True
+    except Exception as exc:
+        logger.warning(f"[keep_alive] cookie save failed: {type(exc).__name__}")
+        return False
+
+
+async def _classify_and_nudge(page, context, target_url: str, pre_injected: set[str]) -> bool:
     frame = None
     try:
-        for fr in page.frames:
-            u = (fr.url or "").lower()
-            if "challenges.cloudflare.com" in u and "turnstile" in u:
-                frame = fr
+        for candidate in page.frames:
+            candidate_url = (candidate.url or "").lower()
+            if "challenges.cloudflare.com" in candidate_url and "turnstile" in candidate_url:
+                frame = candidate
                 break
-            if "challenge-platform" in u:
-                frame = fr
+            if "challenge-platform" in candidate_url:
+                frame = candidate
                 break
     except Exception:
         frame = None
+    mode = _classify_turnstile_mode(frame.url if frame is not None else "")
+    logger.info(f"[keep_alive] challenge mode={mode}")
+    if mode == "non-interactive":
+        for _ in range(5):
+            if await _save_keepalive_cookie(page, context, target_url, pre_injected):
+                return True
+            try:
+                if not await is_cf_challenge_page(page):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+        return False
     if frame is None:
         return False
     try:
-        url = (frame.url or "").lower()
-        mode = _classify_turnstile_mode(url)
-        logger.info(f"[keep_alive] challenge mode={mode} url={url[:90]}")
-        if mode == "non-interactive":
-            logger.info("[keep_alive] non-interactive (latestnews invisible, no box) — passive wait, no nudge")
-            # just wait 8s for fingerprint auto-verify, don't click
-            await asyncio.sleep(8)
-            # check cookie after wait
-            for _ in range(5):
-                try:
-                    cookies = await context.cookies()
-                    for c in cookies:
-                        if c.get("name") == "cf_clearance" and len(c.get("value","")) > 20:
-                            from xdmovies.cookie_store import set_cookies_for_domain
-                            set_cookies_for_domain("xdmovies.wtf", f"cf_clearance={c['value']}")
-                            return True
-                except Exception:
-                    pass
-                await asyncio.sleep(1.5)
-            # also check page no longer challenge
-            try:
-                from xdmovies.pipeline import _is_cf_challenge_page
-                if not await _is_cf_challenge_page(page):
-                    cookies = await context.cookies()
-                    for c in cookies:
-                        if c.get("name") == "cf_clearance":
-                            from xdmovies.cookie_store import set_cookies_for_domain
-                            set_cookies_for_domain("xdmovies.wtf", f"cf_clearance={c['value']}")
-                            return True
-            except Exception:
-                pass
-            return False
-        # light/managed/interactive: one nudge
-    except Exception:
-        pass
-    try:
         await frame.click("body", position={"x": 18, "y": 32}, delay=80, timeout=5000)
         logger.info("[keep_alive] nudged challenge frame at 18,32")
-    except Exception as e:
-        logger.debug(f"[keep_alive] frame.click failed: {e}")
+    except Exception as exc:
+        logger.debug(f"[keep_alive] frame click failed: {type(exc).__name__}")
         return False
-    # poll for cookie up to 20s
     for _ in range(10):
         await asyncio.sleep(2)
+        if await _save_keepalive_cookie(page, context, target_url, pre_injected):
+            return True
         try:
-            cookies = await context.cookies()
-            for c in cookies:
-                if c.get("name") == "cf_clearance" and len(c.get("value","")) > 20:
-                    # save
-                    try:
-                        from xdmovies.cookie_store import set_cookies_for_domain, _normalize_domain
-                        # domain is xdmovies.wtf
-                        set_cookies_for_domain("xdmovies.wtf", f"cf_clearance={c['value']}")
-                        logger.info("[keep_alive] auto-captured cf_clearance after nudge")
-                        return True
-                    except Exception as e:
-                        logger.warning(f"[keep_alive] save failed: {e}")
-                        return False
-        except Exception:
-            pass
-        # also check if page no longer challenge
-        try:
-            from xdmovies.pipeline import _is_cf_challenge_page
-            if not await _is_cf_challenge_page(page):
-                # check cookie again via context
-                cookies = await context.cookies()
-                for c in cookies:
-                    if c.get("name") == "cf_clearance":
-                        try:
-                            from xdmovies.cookie_store import set_cookies_for_domain
-                            set_cookies_for_domain("xdmovies.wtf", f"cf_clearance={c['value']}")
-                            return True
-                        except Exception:
-                            pass
-                # page cleared but no cookie yet - wait a bit more
+            if not await is_cf_challenge_page(page):
+                return True
         except Exception:
             pass
     return False
@@ -267,12 +276,16 @@ async def _silent_refresh_once(target_url: str) -> Tuple[bool, str]:
     """Try silent refresh on a post URL. Returns (ok, reason)."""
     try:
         from xdmovies.cookie_store import get_cookies_for_url, get_user_agent_for_url
-        from xdmovies.pipeline import _is_cf_challenge_page
-    except Exception as e:
-        return False, f"import_fail:{e}"
+    except Exception as exc:
+        return False, f"import_fail:{type(exc).__name__}"
     cookies = get_cookies_for_url(target_url)
     if not cookies:
         return False, "no_cookie_stored"
+    pre_injected = {
+        str(cookie.get("value") or "")
+        for cookie in cookies
+        if str(cookie.get("name") or "").lower() == "cf_clearance" and cookie.get("value")
+    }
     ua = get_user_agent_for_url(target_url)
     # need at least cf_clearance
     has_cf = any(c.get("name","").lower()=="cf_clearance" for c in cookies)
@@ -290,64 +303,92 @@ async def _silent_refresh_once(target_url: str) -> Tuple[bool, str]:
             ctx_kwargs = {}
             if ua:
                 ctx_kwargs["user_agent"] = ua
-            try:
-                ctx = await browser.new_context(**ctx_kwargs)
-            except Exception:
-                ctx = browser  # older cloakbrowser returns context directly
+            ctx = await browser.new_context(**ctx_kwargs)
             try:
                 await ctx.add_cookies(cookies)
             except Exception:
-                try:
-                    await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
-                except Exception:
-                    pass
-            try:
-                page = await ctx.new_page()
-            except Exception:
-                page = await browser.new_page()
-            # block heavy media
+                await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
+            page = await ctx.new_page()
             try:
                 await page.route(re.compile(r"\.(png|jpe?g|css|woff2?|gif|svg|ico)$"), lambda r: r.abort())
             except Exception:
                 pass
-            # goto post (CF is on posts, not home)
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=35000)
+            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=35000)
             try:
                 await page.wait_for_load_state("load", timeout=4000)
             except Exception:
                 pass
             await asyncio.sleep(1.0)
-            is_chal = await _is_cf_challenge_page(page)
+            is_chal = await is_cf_challenge_page(page, response=response)
             if not is_chal:
-                # warm success - no challenge, cookie still valid, no need to save
-                logger.info(f"[keep_alive] silent hit ok (no challenge) {target_url[:70]}")
+                logger.info("[keep_alive] silent hit succeeded with the stored cookie")
                 return True, "still_valid"
-            # challenge -> try light nudge auto-solve
-            logger.info(f"[keep_alive] challenge detected on refresh target, trying nudge")
-            ok = await _classify_and_nudge(page, ctx)
-            if ok:
-                return True, "auto_nudged"
-            else:
-                return False, "need_human"
-        except Exception as e:
-            return False, f"goto_fail:{e}"
+            logger.info("[keep_alive] challenge detected on refresh target, trying nudge")
+            ok = await _classify_and_nudge(page, ctx, target_url, pre_injected)
+            return (True, "auto_nudged") if ok else (False, "need_human")
+        except Exception as exc:
+            return False, f"goto_fail:{type(exc).__name__}"
         finally:
-            try:
-                if page is not None:
-                    await page.close()
-            except Exception:
-                pass
-            try:
-                if ctx is not None and ctx is not browser:
-                    await ctx.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
-    except Exception as e:
-        return False, f"pw_fail:{e}"
+            await close_browser_objects([page, ctx, browser], timeout=10.0)
+    except Exception as exc:
+        return False, f"pw_fail:{type(exc).__name__}"
+
+async def _request_human_solve(bot_app, target: str, owner: int) -> bool:
+    from xdmovies.solve_server import (
+        SESSION_TTL,
+        SolveBusyError,
+        create_session,
+        destroy_session,
+        get_public_url,
+        wait_for_solve,
+    )
+    token = None
+    solve_task = None
+    try:
+        token = await create_session(target, user_id=owner, host="xdmovies.wtf", chat_id=owner)
+        solve_task = asyncio.create_task(wait_for_solve(token, timeout=float(SESSION_TTL - 5)))
+        if not bot_app or not getattr(bot_app, "bot", None):
+            raise RuntimeError("telegram bot unavailable")
+        public_url = get_public_url(token)
+        await bot_app.bot.send_message(
+            chat_id=owner,
+            text=(
+                "🔄 <b>Keep-alive needs human</b> — <code>xdmovies.wtf</code> challenge escalated.\n"
+                f"Post: <code>{html.escape(target, quote=True)}</code>\n"
+                f"👉 Solve (auto-captures): {html.escape(public_url, quote=True)}\n"
+                "After solve, keep-alive resumes."
+            ),
+            parse_mode="HTML",
+        )
+        solved = bool(await solve_task)
+        if solved:
+            logger.info("[keep_alive] owner solve captured successfully")
+        return solved
+    except SolveBusyError as exc:
+        logger.warning(f"[keep_alive] solve request busy: {exc}")
+        return False
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[keep_alive] notify failed: {type(exc).__name__}")
+        return False
+    finally:
+        if solve_task is not None and not solve_task.done():
+            solve_task.cancel()
+        if solve_task is not None:
+            await asyncio.gather(solve_task, return_exceptions=True)
+        if token is not None and _unobserved_session(token):
+            await destroy_session(token)
+
+
+def _unobserved_session(token: str) -> bool:
+    try:
+        from xdmovies.solve_server import get_session
+        sess = get_session(token)
+        return bool(sess and not sess.solved)
+    except Exception:
+        return False
+
 
 _keep_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
@@ -370,24 +411,17 @@ async def _loop(bot_app) -> None:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             age = time.time() - last_ts
-            # also consider last successful silent hit
-            st = _load_state()
-            last_ok = st.get("xdmovies.wtf", {}).get("last_refresh_ok")
-            if last_ok:
-                # age is min of cookie age and last_ok age
-                age = min(age, time.time() - float(last_ok))
             if age < REFRESH_AFTER:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             # time to refresh
             target = _pick_refresh_target()
-            logger.info(f"[keep_alive] 25m gap reached (age {int(age)}s), refreshing post {target[:70]}")
+            logger.info(f"[keep_alive] 25m gap reached (age {int(age)}s), refreshing a stored post")
             ok, reason = await _silent_refresh_once(target)
             if ok:
                 logger.info(f"[keep_alive] refresh success: {reason}")
-                _touch_keep_alive("xdmovies.wtf")
+                await asyncio.to_thread(_touch_keep_alive, "xdmovies.wtf")
                 consecutive_need_human = 0
-                # also touch cookie_store updated_at? no, just keep_alive state
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             else:
@@ -398,27 +432,17 @@ async def _loop(bot_app) -> None:
                     now = time.time()
                     if consecutive_need_human >= 2 and (now - last_notify_ts) > 1800:
                         try:
-                            from xdmovies.solve_server import create_session, get_public_url
                             from xdmovies.bot_config import load_config
-                            cfg = load_config()
-                            owner = cfg.owner_id
-                            # create token for the target
-                            token = await create_session(target, user_id=owner, host="xdmovies.wtf", chat_id=owner)
-                            url = get_public_url(token)
-                            # send via bot
-                            if bot_app and hasattr(bot_app, "bot") and bot_app.bot:
-                                await bot_app.bot.send_message(
-                                    chat_id=owner,
-                                    text=(f"🔄 <b>Keep-alive needs human</b> — <code>xdmovies.wtf</code> challenge escalated.\n"
-                                          f"Post: <code>{target}</code>\n"
-                                          f"👉 Solve (auto-captures): {url}\n"
-                                          f"After solve, loop resumes unlimited."),
-                                    parse_mode="HTML"
-                                )
-                                last_notify_ts = now
-                                logger.info(f"[keep_alive] notified owner with VPS link {url[:60]}")
-                        except Exception as e:
-                            logger.warning(f"[keep_alive] notify failed: {e}")
+                            owner = load_config().owner_id
+                            solved = await _request_human_solve(bot_app, target, owner)
+                            if solved:
+                                consecutive_need_human = 0
+                                last_notify_ts = 0.0
+                                await asyncio.sleep(CHECK_INTERVAL)
+                                continue
+                            last_notify_ts = now
+                        except Exception as exc:
+                            logger.warning(f"[keep_alive] solve request failed: {type(exc).__name__}")
                     # backoff 10m before retry
                     await asyncio.sleep(600)
                     continue
@@ -431,8 +455,8 @@ async def _loop(bot_app) -> None:
                     continue
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.exception(f"[keep_alive] loop error: {e}")
+        except Exception as exc:
+            logger.exception(f"[keep_alive] loop error: {type(exc).__name__}")
             await asyncio.sleep(60)
 
 async def start_keep_alive(bot_app) -> None:

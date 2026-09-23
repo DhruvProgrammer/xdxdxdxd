@@ -13,56 +13,78 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DUMP_DIR = os.path.join(_THIS_DIR, "xdmovies_dumps")
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from xdmovies.extractor import Card, extract_cards_from_html
-from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, _normalize_domain
+from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, mark_successful_use, _normalize_domain
+from xdmovies.bot_config import ensure_private_directory, open_private_text
+from xdmovies.browser_runtime import close_browser_objects, is_cf_challenge_page
+ensure_private_directory(_DUMP_DIR)
 
-# ---------------------------------------------------------------------------
+_DUMP_MAX_FILES = 20
+_DUMP_MAX_AGE_SECONDS = 7 * 86400
+
+
+def _prune_failure_dumps(max_files: int = _DUMP_MAX_FILES,
+                         max_age_seconds: int = _DUMP_MAX_AGE_SECONDS) -> None:
+    now = time.time()
+    entries = []
+    try:
+        names = os.listdir(_DUMP_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name == "latest_movie_page.html":
+            continue
+        if not (
+            name.startswith("latest_movie_page_") and name.endswith(".html")
+            or name.startswith("gate_") and (name.endswith(".html") or name.endswith(".json"))
+        ):
+            continue
+        path = os.path.join(_DUMP_DIR, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if now - stat.st_mtime > max(0, max_age_seconds):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        entries.append((stat.st_mtime, path))
+    entries.sort(reverse=True)
+    for _mtime, path in entries[max(0, max_files):]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _write_failure_dump(html: str) -> None:
+    ensure_private_directory(_DUMP_DIR)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:8]}"
+    dump_path = os.path.join(_DUMP_DIR, f"latest_movie_page_{stamp}.html")
+    with open_private_text(dump_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(html or "")
+    with open_private_text(os.path.join(_DUMP_DIR, "latest_movie_page.html"), "w", encoding="utf-8", errors="replace") as f:
+        f.write(html or "")
+    _prune_failure_dumps()
+
+
+_prune_failure_dumps()
 # Challenge detection (lightweight, no solver needed)
 # ---------------------------------------------------------------------------
 
-async def _is_cf_challenge_page(page) -> bool:
-    # Strong detection: title + body markers + challenge form + CF headers
-    try:
-        title = (await page.title()) or ""
-        tl = title.lower()
-        if "just a moment" in tl or "checking your browser" in tl or "attention required" in tl or "ddos protection" in tl or "security check" in tl:
-            return True
-    except Exception:
-        pass
-    try:
-        html = await page.content()
-        hl = html.lower()
-        # CF interstitial markers
-        if "cf-mitigated" in hl: return True
-        if "cf-please-wait" in hl or "cf-spinner-please-wait" in hl: return True
-        if "challenge-platform" in hl and "turnstile" in hl: return True
-        if "cf-challenge" in hl or "cf-browser-verification" in hl: return True
-        if "checking your browser before accessing" in hl: return True
-        # also check for Turnstile iframe still present + tiny body
-        if len(html) < 8000 and ("challenges.cloudflare.com" in html or "cf-challenge" in hl):
-            try:
-                cnt = await page.locator("#challenge-form, #cf-challenge-running, .cf-turnstile").count()
-                if cnt > 0: return True
-            except: pass
-            if len(html) < 5000:
-                return True
-    except Exception:
-        pass
-    try:
-        cnt = await page.locator("#challenge-form, #cf-challenge-running").count()
-        if cnt > 0:
-            return True
-    except Exception:
-        pass
-    return False
+_is_cf_challenge_page = is_cf_challenge_page
 
 
 async def _try_auto_nudge(page, ctx, url: str) -> bool:
@@ -195,7 +217,12 @@ async def _try_auto_nudge(page, ctx, url: str) -> bool:
             except Exception:
                 ua = None
             try:
-                set_cookies_for_domain(_normalize_domain(url), f"cf_clearance={val}", user_agent=ua)
+                await asyncio.to_thread(
+                    set_cookies_for_domain,
+                    _normalize_domain(url),
+                    f"cf_clearance={val}",
+                    user_agent=ua,
+                )
             except Exception:
                 pass
 
@@ -289,13 +316,13 @@ async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> 
             await page.route(re.compile(r"\.(png|jpe?g|css|woff2?|gif|svg|ico)$"), lambda r: r.abort())
         except Exception:
             pass
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             await page.wait_for_load_state("load", timeout=4000)
         except Exception:
             pass
         await asyncio.sleep(0.8)
-        is_chal = await _is_cf_challenge_page(page)
+        is_chal = await _is_cf_challenge_page(page, response=response)
         html = await page.content()
         if is_chal:
             # Auto-nudge first: CF often auto-verifies within seconds and
@@ -323,22 +350,10 @@ async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> 
                 reason=("no_cookie_stored" if not cookies else "still_challenge"),
                 host=_normalize_domain(url),
             )
+        await asyncio.to_thread(mark_successful_use, _normalize_domain(url))
         return html
     finally:
-        try:
-            if page is not None:
-                await page.close()
-        except Exception:
-            pass
-        try:
-            if ctx is not None:
-                await ctx.close()
-        except Exception:
-            pass
-        try:
-            await browser.close()
-        except Exception:
-            pass
+        await close_browser_objects([page, ctx, browser], timeout=10.0)
 
 
 async def _solve_movie_page(movie_url: str, session_id: str, headless: bool) -> str:
@@ -357,13 +372,7 @@ async def extract_download_links(movie_url: str, session_id: str = "xdmovies_vid
     cards = extract_cards_from_html(html)
     if not cards:
         try:
-            os.makedirs("xdmovies_dumps", exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dump_path = os.path.join("xdmovies_dumps", f"latest_movie_page_{stamp}.html")
-            with open(dump_path, "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
-            with open("xdmovies_dumps/latest_movie_page.html", "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
+            await asyncio.to_thread(_write_failure_dump, html)
         except Exception:
             pass
     return [c.url for c in cards]
@@ -381,13 +390,7 @@ async def extract_cards_async(movie_url: str, session_id: str = "xdmovies_video_
     cards = extract_cards_from_html(html)
     if not cards:
         try:
-            os.makedirs("xdmovies_dumps", exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dump_path = os.path.join("xdmovies_dumps", f"latest_movie_page_{stamp}.html")
-            with open(dump_path, "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
-            with open("xdmovies_dumps/latest_movie_page.html", "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
+            await asyncio.to_thread(_write_failure_dump, html)
         except Exception:
             pass
     return cards
@@ -410,6 +413,7 @@ class ExtractionResult:
     bypass_status: str
     challenge_mode: str
     elapsed_time_seconds: float
+    success: bool = True
     page_title: str = ""
     audios: str = ""
     rating: str = ""
@@ -428,13 +432,7 @@ async def extract_with_diagnostics(movie_url: str, session_id: str = "xdmovies_v
     elapsed = round(time.time() - start, 3)
     if not cards:
         try:
-            os.makedirs("xdmovies_dumps", exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dump_path = os.path.join("xdmovies_dumps", f"latest_movie_page_{stamp}.html")
-            with open(dump_path, "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
-            with open("xdmovies_dumps/latest_movie_page.html", "w", encoding="utf-8", errors="replace") as f:
-                f.write(html or "")
+            await asyncio.to_thread(_write_failure_dump, html)
         except Exception:
             pass
     page_title = _extract_page_title(html or "", url=movie_url)
@@ -444,7 +442,7 @@ async def extract_with_diagnostics(movie_url: str, session_id: str = "xdmovies_v
         meta = extract_page_meta(html or "")
     except Exception:
         audios, meta = "", {}
-    return ExtractionResult(cards=cards, html_len=len(html or ""), bypass_status=bypass_status, challenge_mode=challenge_mode, elapsed_time_seconds=elapsed, page_title=page_title, audios=audios,
+    return ExtractionResult(cards=cards, html_len=len(html or ""), bypass_status=bypass_status, challenge_mode=challenge_mode, elapsed_time_seconds=elapsed, success=bool(cards), page_title=page_title, audios=audios,
                             rating=(meta or {}).get("rating", ""), genres=(meta or {}).get("genres", ""),
                             air_date=(meta or {}).get("air_date", ""), sources=(meta or {}).get("sources", ""))
 

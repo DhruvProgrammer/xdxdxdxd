@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,56 +42,89 @@ _LOCK_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     ".xdmovies_bot.lock",
 )
-_LOCK = None  # set in main()
+_LOCK = None
 
-def _acquire_single_instance_lock() -> "fcntl.flock|None":
-    """Best-effort advisory lock. On Windows (no fcntl) we fall back to a
-    stale-lock check on the lockfile's mtime.
 
-    Returns the fd on POSIX when the lock is OURS, else None. IMPORTANT:
-    on POSIX, None means ANOTHER LIVE instance holds the flock (kernel
-    releases it on process death, so it can never be stale) -- main()
-    must refuse to start a second poller in that case. Two pollers split
-    Telegram updates between them, so one instance can run a job with
-    stale code while the other answers commands: silent wrong behavior
-    with zero errors in either log.
-    """
-    try:
-        import fcntl  # type: ignore[import-not-found]
-        fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+class _SingleInstanceLock:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.fd: Optional[int] = None
+        self.token = uuid.uuid4().hex
+        self.owned = False
+
+    def acquire(self) -> bool:
+        fd = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+            fd = os.open(self.path, flags, 0o600)
+            bot_config.ensure_private_file(self.path)
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(fd).st_size < 1:
+                    os.write(fd, b" ")
+                    os.ftruncate(fd, 1)
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            payload = json.dumps(
+                {"pid": os.getpid(), "token": self.token, "started_at": time.time()},
+                separators=(",", ":"),
+            ).encode("ascii")
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, payload)
+            self.fd = fd
+            self.owned = True
+            return True
         except (BlockingIOError, OSError):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return False
+
+    def close(self) -> None:
+        fd = self.fd
+        if fd is None or not self.owned:
+            return
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 512)
+            try:
+                owned = json.loads(raw.decode("ascii")).get("token") == self.token
+            except Exception:
+                owned = False
+            if owned:
+                os.ftruncate(fd, 1)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b" ")
+        except OSError:
+            pass
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
             try:
                 os.close(fd)
-            except Exception:
+            except OSError:
                 pass
-            return None
-        os.write(fd, str(os.getpid()).encode("ascii"))
-        return fd
-    except ImportError:
-        # Windows path: check if the lockfile is stale.
-        try:
-            if os.path.isfile(_LOCK_PATH):
-                age = time.time() - os.path.getmtime(_LOCK_PATH)
-                if age < 60:
-                    try:
-                        with open(_LOCK_PATH, "r") as f:
-                            pid = int((f.read() or "0").strip() or 0)
-                        if pid and pid != os.getpid():
-                            try:
-                                import psutil  # type: ignore[import-not-found]
-                                if psutil.pid_exists(pid):
-                                    return None
-                            except ImportError:
-                                return None  # can't tell; assume live
-                    except Exception:
-                        return None
-            with open(_LOCK_PATH, "w") as f:
-                f.write(str(os.getpid()))
-            return None
-        except OSError:
-            return None
+            self.fd = None
+            self.owned = False
+
+
+def _acquire_single_instance_lock() -> Optional[_SingleInstanceLock]:
+    lock = _SingleInstanceLock(_LOCK_PATH)
+    return lock if lock.acquire() else None
 
 # Heavy pipeline imports are deferred to _run_for_user() so this module
 # can be imported without Playwright being ready.
@@ -423,7 +457,7 @@ def _restart_notice_path() -> str:
 
 def _write_restart_notice(chat_id: int) -> None:
     try:
-        with open(_restart_notice_path(), "w", encoding="utf-8") as f:
+        with bot_config.open_private_text(_restart_notice_path(), "w", encoding="utf-8") as f:
             json.dump({"chat_id": chat_id, "at": time.time()}, f)
     except Exception:
         pass
@@ -542,6 +576,14 @@ def _masked_uid(user_id: int) -> str:
     return f"...{s[-4:]}" if len(s) > 4 else (s or "?")
 
 
+def _url_host_label(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url or "").hostname or "unknown-host").lower()
+    except Exception:
+        return "unknown-host"
+
+
 def _is_gate_url(url: str) -> bool:
     """True for direct latestnewsonline.sbs gate links (single-movie jobs
     and per-card routing). Host-based, so ad lookalikes can never match.
@@ -605,7 +647,7 @@ async def _enrich_hub_dest(dest: str, card) -> str:
         # Keep the hub URL as-is; _rf (gamerxyt token URL) is
         # deliberately ignored — only _rt/_rs below are used.
         if _rf and _rf != dest:
-            _LOG.info("hub dest kept at hub page (gamerxyt upgrade skipped): %s", dest[:100])
+            _LOG.info("hub dest kept at hub page (gamerxyt upgrade skipped): %s", _url_host_label(dest))
         try:
             if _rt and (not card.title or card.title in ("Gate link", "Download link")):
                 card.title = _rt
@@ -704,6 +746,48 @@ def _user_mention(user_id: int, user_name: str = "", username: str = "") -> str:
 # restart drops pending setups (user just re-sends the command).
 _SCRAPECHAN_PENDING: Dict[int, float] = {}
 _SCRAPECHAN_PENDING_TTL = 600.0
+_SCRAPE_PROMPTS: Dict[str, dict] = {}
+_SCRAPE_PROMPT_TTL = 600.0
+
+
+def _new_scrape_prompt(prefix: str, uid: int, route: str, chat_id: int, channel_id: int) -> str:
+    now = time.time()
+    for token, entry in tuple(_SCRAPE_PROMPTS.items()):
+        if now - float(entry.get("created_at", 0)) > _SCRAPE_PROMPT_TTL:
+            _SCRAPE_PROMPTS.pop(token, None)
+        elif entry.get("uid") == uid and entry.get("route") == route:
+            _SCRAPE_PROMPTS.pop(token, None)
+    token = uuid.uuid4().hex[:8]
+    while token in _SCRAPE_PROMPTS:
+        token = uuid.uuid4().hex[:8]
+    _SCRAPE_PROMPTS[token] = {
+        "prefix": prefix,
+        "uid": uid,
+        "route": route,
+        "chat_id": chat_id,
+        "channel_id": channel_id,
+        "message_id": 0,
+        "created_at": now,
+    }
+    return token
+
+
+def _scrape_prompt_entry(token: str, query) -> Optional[dict]:
+    entry = _SCRAPE_PROMPTS.get(token)
+    if entry is None:
+        return None
+    if time.time() - float(entry.get("created_at", 0)) > _SCRAPE_PROMPT_TTL:
+        _SCRAPE_PROMPTS.pop(token, None)
+        return None
+    message = getattr(query, "message", None)
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    if (
+        int(getattr(getattr(query, "from_user", None), "id", 0) or 0) != int(entry.get("uid", 0))
+        or int(getattr(message, "chat_id", 0) or 0) != int(entry.get("chat_id", 0))
+        or message_id != int(entry.get("message_id", 0))
+    ):
+        return None
+    return entry
 
 
 # /search pick cache: user_id -> (timestamp, query, [SearchResult]).
@@ -711,10 +795,31 @@ _SCRAPECHAN_PENDING_TTL = 600.0
 # 15-minute channel-confirm window or late Yes taps would find the
 # cache gone. In-memory only; a restart drops pending picks (user just
 # re-sends /search).
-_SEARCH_CACHE: Dict[int, Tuple[float, str, list]] = {}
+_SEARCH_CACHE: Dict[int, tuple] = {}
 _SEARCH_CACHE_TTL = 1200.0
+
+
+def _bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)).strip() or str(default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)).strip() or str(default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 _SEARCH_FETCH_LIMIT = 30
 _SEARCH_PAGE_SIZE = 5
+_SEARCH_TIMEOUT_TASKS: Dict[int, asyncio.Task] = {}
+_TXT_SEARCH_CANCEL: Dict[int, asyncio.Event] = {}
+SCRAPE_MAX_PAGES = max(1, int(os.environ.get("XDMOVIES_SCRAPE_MAX_PAGES", "1000") or "1000"))
 
 # Accept-all content choice: which cards of each series page to resolve.
 # "all" keeps everything (previous behavior). "episodes"/"packs" keeps
@@ -732,8 +837,14 @@ _CONTENT_CALLBACK = {"all": "all", "ep": "episodes", "pack": "packs"}
 # search (~1s), so an 800-line file means ~15 min before the list
 # appears -- raise via XDMOVIES_TXT_MAX_LINES if you accept the wait.
 # Oversize files are rejected before download.
-_TXT_MAX_LINES = int(os.environ.get("XDMOVIES_TXT_MAX_LINES", "10000") or "10000")
+_TXT_MAX_LINES = _bounded_env_int("XDMOVIES_TXT_MAX_LINES", 10000, 1, 10000)
 _TXT_MAX_BYTES = 65536
+_TXT_SEARCH_DEADLINE = _bounded_env_float(
+    "XDMOVIES_TXT_DEADLINE", 60.0, 5.0, 600.0
+)
+_TXT_SEARCH_CONCURRENCY = _bounded_env_int(
+    "XDMOVIES_TXT_CONCURRENCY", 4, 1, 8
+)
 
 
 def _extract_forwarded_channel(message) -> Tuple[Optional[int], str]:
@@ -987,7 +1098,38 @@ def _search_confirm_human_timeout() -> str:
         return f"{mins:.0f} min" if mins == int(mins) else f"{mins:.1f} min"
     return f"{_SEARCH_CONFIRM_TIMEOUT:.0f}s"
 
-def _search_page_keyboard(results, page: int):
+def _search_cancel(uid: int) -> None:
+    task = _SEARCH_TIMEOUT_TASKS.pop(uid, None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+    _SEARCH_CONFIRM.pop(uid, None)
+    _SEARCH_CACHE.pop(uid, None)
+
+
+def _new_search_session(uid: int, label: str, results, chat_id: int) -> str:
+    _search_cancel(uid)
+    token = uuid.uuid4().hex[:8]
+    while any(len(entry) > 3 and entry[3] == token for entry in _SEARCH_CACHE.values()):
+        token = uuid.uuid4().hex[:8]
+    _SEARCH_CACHE[uid] = (time.time(), label, results, token, 0, chat_id)
+    return token
+
+
+def _search_session(uid: int, token: str, query) -> Optional[tuple]:
+    entry = _SEARCH_CACHE.get(uid)
+    if entry is None or len(entry) < 6 or entry[3] != token:
+        return None
+    if time.time() - entry[0] > _SEARCH_CACHE_TTL:
+        _search_cancel(uid)
+        return None
+    message = getattr(query, "message", None)
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    if message_id != int(entry[4] or 0) or int(getattr(message, "chat_id", 0) or 0) != int(entry[5] or 0):
+        return None
+    return entry
+
+
+def _search_page_keyboard(token: str, results, page: int):
     """(page, total_pages, InlineKeyboardMarkup) for one 5-per-page slice.
     Page is 1-based and clamped. Module-level (must stay outside class Bot)."""
     total_pages = max(1, (len(results) + _SEARCH_PAGE_SIZE - 1) // _SEARCH_PAGE_SIZE)
@@ -1007,19 +1149,19 @@ def _search_page_keyboard(results, page: int):
             label = f"{icon} {title}"
         if len(label) > 60:
             label = label[:57] + "..."
-        rows.append([InlineKeyboardButton(label, callback_data=f"search:pick:{idx}")])  # type: ignore[misc]
+        rows.append([InlineKeyboardButton(label, callback_data=f"search:{token}:pick:{idx}")])  # type: ignore[misc]
     nav = []
     if len(results) > 1:
         # Bulk row above the nav: enqueue everything (capped). Only
         # shown when there is actually a choice to bulk-accept.
-        nav.append(InlineKeyboardButton("✅ Accept all", callback_data="search:acceptall"))  # type: ignore[misc]
+        nav.append(InlineKeyboardButton("✅ Accept all", callback_data=f"search:{token}:acceptall"))  # type: ignore[misc]
         rows.append(nav)
         nav = []
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"search:page:{page - 1}"))  # type: ignore[misc]
-    nav.append(InlineKeyboardButton("❌ Close", callback_data="search:close"))  # type: ignore[misc]
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"search:{token}:page:{page - 1}"))  # type: ignore[misc]
+    nav.append(InlineKeyboardButton("❌ Close", callback_data=f"search:{token}:close"))  # type: ignore[misc]
     if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"search:page:{page + 1}"))  # type: ignore[misc]
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"search:{token}:page:{page + 1}"))  # type: ignore[misc]
     rows.append(nav)
     return page, total_pages, InlineKeyboardMarkup(rows)  # type: ignore[misc]
 
@@ -1060,6 +1202,7 @@ class Job:
     cancel_event: "asyncio.Event" = field(default_factory=asyncio.Event)
     job_type: str = "resolve"  # resolve | scrape_all
     content_type: str = ""     # all | movies | series
+    scrape_route: str = ""
     # Who queued it -- captured at enqueue so /queue can show a clickable
     # name instead of a raw id. May be empty for legacy/programmatic jobs.
     user_name: str = ""
@@ -1112,6 +1255,8 @@ class Bot:
         # virtual X server with $DISPLAY set. Same behavior on both,
         # no env-var dance.
         self.headless = False
+        self.max_queue = max(1, int(cfg.max_sessions))
+        self.max_user_queue = max(1, min(self.max_queue, 2))
         # Audit finding M4: replace `asyncio.Queue` with a deque + Lock
         # so /queue and /cancel can read the full queue contents
         # atomically without racing the dispatcher's `popleft()`. The
@@ -1132,10 +1277,12 @@ class Bot:
         # Drained movie-by-movie inside _run_scrape_all; _pick_next also
         # prefers it so a queued-but-not-started scrape can't starve it.
         self._urgent: collections.deque[Job] = collections.deque()
+        self._active_scrape_children: Dict[str, Job] = {}
         self.current: Optional[Job] = None
         self.last_solve_ago: Optional[float] = None
         self.error_count: int = 0
         self._dispatcher_task: Optional[asyncio.Task] = None
+        self._restarting = False
         self._app: Optional["Application"] = None
         self._bot = None  # telegram.Bot, set in _post_init
         # user_id -> flag. When /cancel is invoked, the bot marks the
@@ -1163,18 +1310,69 @@ class Bot:
         cur = self.current
         return cur is not None and getattr(cur, "job_type", "") == "scrape_all"
 
-    async def _enqueue(self, job: Job, urgent: bool = False) -> int:
+    async def _enqueue(self, job: Job, urgent: bool = False, dedupe: bool = False) -> int:
         async with self._queue_cond:
+            active = [self.current, *self.queue, *self._urgent, *self._active_scrape_children.values()]
+            if dedupe and any(
+                item is not None and getattr(item, "url", "") == job.url
+                for item in active
+            ):
+                return -1
+            if len(self.queue) + len(self._urgent) >= self.max_queue:
+                return -2
+            user_depth = sum(1 for item in active if getattr(item, "user_id", None) == job.user_id)
+            if user_depth >= self.max_user_queue:
+                return -3
             if urgent:
                 job.priority = 1
                 self._urgent.append(job)
             else:
                 job.priority = 0
                 self.queue.append(job)
-            # Wake the dispatcher (if blocked in _pick_next waiting for
-            # the queue to become non-empty).
             self._queue_cond.notify_all()
             return len(self._urgent) + len(self.queue)
+
+    async def _enqueue_scrape(self, job: Job, prepare=None) -> int:
+        async with self._queue_cond:
+            active = [self.current, *self.queue, *self._urgent]
+            if any(
+                item is not None
+                and getattr(item, "job_type", "") == "scrape_all"
+                and getattr(item, "content_type", "") == job.content_type
+                and getattr(item, "scrape_route", "") == job.scrape_route
+                for item in active
+            ):
+                return -1
+            if len(self.queue) + len(self._urgent) >= self.max_queue:
+                return -2
+            user_depth = sum(1 for item in active if getattr(item, "user_id", None) == job.user_id)
+            if user_depth >= self.max_user_queue:
+                return -3
+            if prepare is not None:
+                await asyncio.to_thread(prepare)
+            self.queue.append(job)
+            self._queue_cond.notify_all()
+            return len(self._urgent) + len(self.queue)
+
+    async def _set_scrape_child(self, url: str, job: Job) -> None:
+        async with self._queue_cond:
+            self._active_scrape_children[url] = job
+            self._queue_cond.notify_all()
+
+    async def _clear_scrape_child(self, url: str, job: Job) -> None:
+        async with self._queue_cond:
+            if self._active_scrape_children.get(url) is job:
+                self._active_scrape_children.pop(url, None)
+            self._queue_cond.notify_all()
+
+    async def _snapshot_live_urls(self) -> set[str]:
+        async with self._queue_cond:
+            urls = {
+                getattr(job, "url", "")
+                for job in [self.current, *self.queue, *self._urgent, *self._active_scrape_children.values()]
+                if job is not None and getattr(job, "url", "")
+            }
+            return urls
 
     async def _pop_urgent(self) -> Optional[Job]:
         """Pop one urgent job (FIFO). None when empty. Never blocks."""
@@ -1196,8 +1394,11 @@ class Bot:
             while not self.queue and not self._urgent:
                 await self._queue_cond.wait()
             if self._urgent:
-                return self._urgent.popleft()
-            return self.queue.popleft()
+                job = self._urgent.popleft()
+            else:
+                job = self.queue.popleft()
+            self.current = job
+            return job
 
     async def _snapshot_queue(self) -> List[Job]:
         """Atomic snapshot under the queue lock."""
@@ -1244,7 +1445,7 @@ class Bot:
                 except asyncio.CancelledError:
                     raise
                 except BaseException as exc:
-                    _LOG.exception("urgent job failed: %s", urgent.url)
+                    _LOG.exception("urgent job failed for host %s", _url_host_label(urgent.url))
                     try:
                         urgent.error = f"{exc.__class__.__name__}: {exc}"
                         urgent.status = "cancelled" if urgent.cancel_event.is_set() else "error"
@@ -1386,24 +1587,17 @@ class Bot:
             # never the public channel (it carries the VPS IP).
             token, msg_id = await self._send_solve_link(_op_dm(job), blocked_url, host, job.user_id)
             if token:
-                # Audit finding H6: align with SESSION_TTL (300s) and
-                # shorten the wait so the user isn't left waiting after
-                # the solve_server already destroyed the session.
-                _waitpill = await _send_transient_note(self._bot, _op_dm(job), "⏳ Waiting up to 120s -- open solve link and tap checkbox if you see it. Keep-alive will resume after.")
-                try:
-                    _solved = await self._wait_for_solve(token, timeout=120.0)
-                finally:
-                    await _drop_msg(self._bot, _op_dm(job), _waitpill)
+                _solved = await self._wait_for_solve_message(
+                    job,
+                    _op_dm(job),
+                    token,
+                    msg_id,
+                    120.0,
+                    "⏳ Waiting up to 120s -- open solve link and tap checkbox if you see it. Keep-alive will resume after.",
+                )
+                if job.cancel_event.is_set():
+                    return
                 if _solved:
-                    if msg_id:
-                        try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id)
-                        except: pass
-                    # Audit finding H10: move the post-solve retry out of
-                    # the except CFChallengeError block so non-CF
-                    # exceptions are also caught by the parent's generic
-                    # except Exception. The previous structure raised the
-                    # unhandled exception as an "unhandled error" from the
-                    # dispatcher with no _fail() bookkeeping.
                     try:
                         result = await _extract_with_diagnostics(job.url, session_id=session_id, headless=False)  # type: ignore[misc]
                         cards = result.cards
@@ -1429,19 +1623,35 @@ class Bot:
                         # still blocked after solve
                         host2 = getattr(cf2, "host", "") or host
                         await _send_safe(self._bot, _op_dm(job), f"[FAIL] Still blocked on <code>{host2}</code> after solve -- try again or /status", parse_mode=ParseMode.HTML)
+                        if job.cancel_event.is_set():
+                            job.status = "cancelled"
+                            job.finished_at = time.time()
+                            return
                         job.status = "error"
                         job.error = f"cf_challenge:{host2}"
                         job.finished_at = time.time()
                         return
                 else:
                     await _send_safe(self._bot, _op_dm(job), f"⏰ Solve timed out. Resend the link to get a fresh solve link (keep-alive paused).", parse_mode=ParseMode.HTML)
+                    if job.cancel_event.is_set():
+                        job.status = "cancelled"
+                        job.finished_at = time.time()
+                        return
                     job.status = "error"
                     job.error = f"cf_challenge:{host}"
                     job.finished_at = time.time()
                     return
+            elif msg_id is not None:
+                self._stop_after_reported_solve_failure(job, f"solve_unavailable:{host}")
+                return
             else:
-                _vps = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
-                await _send_safe(self._bot, _op_dm(job), f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS {_vps}", parse_mode=ParseMode.HTML)
+                _vps = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "").rstrip("/")
+                _vps_note = f"check VPS {_vps}" if _vps else "check the solve-server configuration"
+                await _send_safe(self._bot, _op_dm(job), f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- {_vps_note}", parse_mode=ParseMode.HTML)
+                if job.cancel_event.is_set():
+                    job.status = "cancelled"
+                    job.finished_at = time.time()
+                    return
                 job.status = "error"
                 job.error = f"cf_challenge:{host}"
                 job.finished_at = time.time()
@@ -1470,7 +1680,7 @@ class Bot:
                     f"The page exists but has no {_html_escape(_label.lower())} section.",
                     parse_mode=ParseMode.HTML,
                 )
-                job.status = "done"
+                job.status = "cancelled" if job.cancel_event.is_set() else "done"
                 job.finished_at = time.time()
                 self.last_solve_ago = 0.0
                 return
@@ -1507,7 +1717,7 @@ class Bot:
                     if _title else ""
                 )
                 await _send_safe(
-                    self._bot, job.chat_id,
+                    self._bot, _op_dm(job),
                     f"[FAIL] xdmovies returned an empty page for this URL "
                     f"(<code>{result.html_len} bytes</code>{_title_part}). "
                     f"The slug may be invalid or the site may be serving "
@@ -1519,27 +1729,20 @@ class Bot:
                 # Real page (e.g. "House of the Dragon - Series") but
                 # the listing has no download links. Don't blame the slug.
                 await _send_safe(
-                    self._bot, job.chat_id,
+                    self._bot, _op_dm(job),
                     f"[FAIL] no download links found on that page "
                     f"(title: <code>{_html_escape(_title[:80])}</code>, "
                     f"<code>{result.html_len} bytes</code>). The page "
                     f"exists but the download section is empty.",
                     parse_mode=ParseMode.HTML,
                 )
-            job.status = "done"
+            if job.cancel_event.is_set():
+                job.status = "cancelled"
+                job.finished_at = time.time()
+                return
+            job.status = "error"
+            job.error = "empty_page_stub" if _looks_like_error else "empty_download_section"
             job.finished_at = time.time()
-            self.last_solve_ago = 0.0
-            # Audit finding M5: touch keep-alive on every successful
-            # job so the 25m refresh loop restarts from now. Otherwise
-            # the loop fires 25m after the *last solve*, not the *last
-            # successful use*, and a user running the bot all day would
-            # see the keep-alive fire only once an hour after the first
-            # solve instead of 25m after the most recent one.
-            try:
-                from xdmovies.keep_alive import _touch_keep_alive
-                _touch_keep_alive("xdmovies.wtf")
-            except Exception as _e:
-                _LOG.debug(f"keep_alive touch failed: {_e!r}")
             return
 
         # /dmode section picker (series only, dmode ON, 2+ groups):
@@ -1658,7 +1861,7 @@ class Bot:
                     dest = await _finalize_gate_card(
                         card, card.url,
                         types.SimpleNamespace(page_title="", html_len=0, cards=[card]))
-                    _LOG.info("direct dest card, skipping follow+gate: %s", card.url[:100])
+                    _LOG.info("direct dest card, skipping follow+gate: %s", _url_host_label(card.url))
                     results.append((card, dest, None))
                     job.resolved += 1
                     try:
@@ -1674,7 +1877,7 @@ class Bot:
                     # follow hop would just reload this same page in
                     # another browser. Skip straight to the gate drive.
                     url2, status2, page_text = card.url, 200, ""
-                    _LOG.info("gate card, skipping follow hop: %s", card.url[:100])
+                    _LOG.info("gate card, skipping follow hop: %s", _url_host_label(card.url))
                 else:
                     url2, status2, page_text = await _follow_download_link(  # type: ignore[misc]
                         card.url, session_id=shared_session, headless=self.headless
@@ -1699,15 +1902,17 @@ class Bot:
                                     if token2:
                                         _gate2 = "latestnews" in (host2 or "")
                                         _wait2 = 240.0 if _gate2 else 90.0
-                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.")
-                                        try:
-                                            _solved2 = await self._wait_for_solve(token2, timeout=_wait2)
-                                        finally:
-                                            await _drop_msg(self._bot, _op_dm(job), _waitpill2)
+                                        _solved2 = await self._wait_for_solve_message(
+                                            job,
+                                            _op_dm(job),
+                                            token2,
+                                            msg_id2,
+                                            _wait2,
+                                            f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.",
+                                        )
+                                        if job.cancel_event.is_set():
+                                            return
                                         if _solved2:
-                                            if msg_id2:
-                                                try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id2)
-                                                except: pass
                                             try:
                                                 from xdmovies.solve_server import get_solved_result as _gsr2
                                                 _r2 = _gsr2(token2) or {}
@@ -1720,18 +1925,22 @@ class Bot:
                                                 dest = await _execute_button_flow(url2, session_id=shared_session, headless=False)  # type: ignore
                                                 if dest: break
                                             except: pass
+                                    elif msg_id2 is not None:
+                                        self._stop_after_reported_solve_failure(job, f"solve_unavailable:{host2}")
+                                        return
                                     err = f"CF challenge on {host2} -- opened solve link {blocked2}, still blocked"
                                     break
+
                             except Exception:
                                 pass
                             err = f"button flow: {exc.__class__.__name__}: {exc}"
-                            _LOG.exception("button flow failed for %s", url2)
+                            _LOG.exception("button flow failed for host %s", _url_host_label(url2))
                             break
                         if dest:
                             dest = await _finalize_gate_card(card, dest, result)
                             break
                         if _btn_attempt == 0:
-                            _LOG.warning("button flow returned empty for %s, retrying once", url2)
+                            _LOG.warning("button flow returned empty for host %s, retrying once", _url_host_label(url2))
                             await asyncio.sleep(2.0)
                         else:
                             err = f"button flow returned empty (final status {status2})"
@@ -1747,15 +1956,17 @@ class Bot:
                         if tokenf:
                             _gatef = "latestnews" in (hostf or "")
                             _waitf = 240.0 if _gatef else 90.0
-                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.")
-                            try:
-                                _solvedf = await self._wait_for_solve(tokenf, timeout=_waitf)
-                            finally:
-                                await _drop_msg(self._bot, _op_dm(job), _waitpillf)
+                            _solvedf = await self._wait_for_solve_message(
+                                job,
+                                _op_dm(job),
+                                tokenf,
+                                msg_idf,
+                                _waitf,
+                                f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.",
+                            )
+                            if job.cancel_event.is_set():
+                                return
                             if _solvedf:
-                                if msg_idf:
-                                    try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_idf)
-                                    except: pass
                                 try:
                                     from xdmovies.solve_server import get_solved_result as _gsrf
                                     _rf = _gsrf(tokenf) or {}
@@ -1786,12 +1997,15 @@ class Bot:
                                                 continue
                                         except: pass
                                 except: pass
+                        elif msg_idf is not None:
+                            self._stop_after_reported_solve_failure(job, f"solve_unavailable:{hostf}")
+                            return
                         err = f"CF challenge on {hostf} -- opened solve link {blockedf}, still blocked"
                     else:
                         err = f"{exc.__class__.__name__}: {exc}"
                 except Exception:
                     err = f"{exc.__class__.__name__}: {exc}"
-                _LOG.exception("resolve failed for %s", card.url)
+                _LOG.exception("resolve failed for host %s", _url_host_label(card.url))
 
             results.append((card, dest, err))
             if dest and not err:
@@ -1804,6 +2018,11 @@ class Bot:
                 await self._send_or_edit_batch(job, result.page_title, results, in_progress_idx=i)
             except Exception:
                 _LOG.debug("batch edit failed at card %d/%d", i, n)
+
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            return
 
         # summary
         elapsed = time.time() - started
@@ -1829,18 +2048,35 @@ class Bot:
         except Exception:
             pass
 
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            return
         job.status = "done" if job.failed == 0 else "done_with_errors"
         job.finished_at = time.time()
         self.last_solve_ago = 0.0
-        # remember movie posts for keep-alive refresh (CF is on posts, not
-        # home). Gate-direct and download-direct jobs have no post page --
-        # nothing to remember.
         if not _is_gate_url(job.url) and not _is_download_url(job.url):
             try:
                 from xdmovies.keep_alive import remember_movie_url
-                remember_movie_url(job.url)
+                await asyncio.to_thread(remember_movie_url, job.url)
             except Exception:
                 pass
+
+    async def _scrape_failure(self, job: Job, state, session_id: str, message: str) -> None:
+        state.finished = False
+        try:
+            from xdmovies.scrape_all import save_checkpoint
+            await asyncio.to_thread(save_checkpoint, state)
+        except Exception:
+            pass
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            return
+        job.status = "error"
+        job.error = message
+        job.finished_at = time.time()
+        await _send_safe(self._bot, _op_dm(job), f"[FAIL] {message}", parse_mode=ParseMode.HTML)
 
     async def _run_scrape_all(self, job: Job) -> None:
         from xdmovies.scrape_all import (
@@ -1852,16 +2088,18 @@ class Bot:
         )
 
         kind = job.content_type
-        state = load_checkpoint(kind)
+        state = load_checkpoint(kind, route=job.scrape_route)
         if state.finished:
-            state.next_page = 1
-            state.pages_completed = 0
+            from xdmovies.scrape_all import ScrapeCheckpoint
+            state = ScrapeCheckpoint(kind=kind, route=job.scrape_route)
         state.finished = False
-        save_checkpoint(state)
+        await asyncio.to_thread(save_checkpoint, state)
         completed = set(state.completed_urls)
         session_id = f"tg_scrapeall_{kind}_{uuid.uuid4().hex[:8]}"
         job.started_at = time.time()
         job.status = "running"
+        expected_total_pages: Optional[int] = None
+        last_page_fingerprint: Optional[tuple[str, ...]] = None
 
         # Audit finding H11: route CF challenges on catalog pages through
         # the same solve flow as a normal job. Need the exception class
@@ -1877,6 +2115,14 @@ class Bot:
 
         while not job.cancel_event.is_set():
             page_number = state.next_page
+            if page_number > SCRAPE_MAX_PAGES:
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Scraping stopped at the page cap ({SCRAPE_MAX_PAGES}).",
+                )
+                return
             page_url = catalog_page_url(kind, page_number)
             await self._set_progress(
                 job,
@@ -1898,42 +2144,89 @@ class Bot:
                 # page_number.
                 cf_host = getattr(cf_exc, "host", "") or "xdmovies.wtf"
                 blocked = cf_exc.url or page_url
-                token, _msg = await self._send_solve_link(
-                    job.chat_id, blocked, cf_host, job.user_id
+                token, message_id = await self._send_solve_link(
+                    _op_dm(job), blocked, cf_host, job.user_id
                 )
                 if token:
-                    await _send_safe(
-                        self._bot, job.chat_id,
-                        f"🔒 Scraping <b>{kind}</b> catalog hit a CF challenge. "
-                        f"Open the solve link if you see it; the scrape will resume.",
-                        parse_mode=ParseMode.HTML,
+                    solved = await self._wait_for_solve_message(
+                        job,
+                        _op_dm(job),
+                        token,
+                        message_id,
+                        120.0,
+                        f"⏳ Waiting up to 120s -- open the solve link if you see it.",
                     )
-                    if await self._wait_for_solve(token, timeout=120.0):
-                        # Re-loop the same page number (do not advance).
+                    if job.cancel_event.is_set():
+                        return
+                    if solved:
                         continue
-                # Either the user didn't solve, or solve didn't catch the
-                # challenge. Save checkpoint and bail.
-                save_checkpoint(state)
-                job.error = f"cf_challenge on catalog page {page_number}"
-                job.finished_at = time.time()
-                await _send_safe(
-                    self._bot, job.chat_id,
-                    f"[FAIL] Could not bypass CF on catalog page {page_number}. "
+                if message_id is not None:
+                    state.finished = False
+                    try:
+                        await asyncio.to_thread(save_checkpoint, state)
+                    except Exception:
+                        pass
+                    self._stop_after_reported_solve_failure(job, f"solve_unavailable:{cf_host}")
+                    return
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Could not bypass CF on catalog page {page_number}. "
                     f"Scrape paused. Send /scrapeall to resume after solving.",
-                    parse_mode=ParseMode.HTML,
                 )
                 return
             except Exception as exc:
                 job.error = f"catalog page {page_number}: {exc.__class__.__name__}: {exc}"
-                save_checkpoint(state)
+                await asyncio.to_thread(save_checkpoint, state)
                 await self._fail(job, session_id)
                 return
 
-            pending = [url for url in page_urls if url not in completed]
             if not page_urls:
-                state.finished = True
-                save_checkpoint(state)
-                break
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Catalog page {page_number} contained no detail links; scrape paused.",
+                )
+                return
+            if not pagination:
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Catalog pagination metadata is missing on page {page_number}; scrape paused.",
+                )
+                return
+            current_page, total_pages = pagination
+            if current_page != page_number or total_pages < current_page:
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Catalog pagination metadata is invalid on page {page_number}; scrape paused.",
+                )
+                return
+            if expected_total_pages is not None and total_pages != expected_total_pages:
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Catalog page count changed during the scrape; scrape paused.",
+                )
+                return
+            expected_total_pages = total_pages
+            fingerprint = tuple(page_urls)
+            if last_page_fingerprint == fingerprint:
+                await self._scrape_failure(
+                    job,
+                    state,
+                    session_id,
+                    f"Catalog page {page_number} repeated the previous page; scrape paused.",
+                )
+                return
+            last_page_fingerprint = fingerprint
+            pending = [url for url in page_urls if url not in completed]
 
             for index, url in enumerate(pending, 1):
                 if job.cancel_event.is_set():
@@ -1944,13 +2237,17 @@ class Bot:
                     f"total completed: <b>{len(completed)}</b>\n"
                     f"<code>{_html_escape(url)}</code>",
                 )
-                child = Job(user_id=job.user_id, chat_id=job.chat_id, url=url,
+                child = Job(user_id=job.user_id, chat_id=job.user_id, url=url,
                             user_name=job.user_name, username=job.username,
                             post_to_channel=job.post_to_channel,
-                            silent=bool(job.post_to_channel))
+                            silent=bool(job.post_to_channel),
+                            scrape_route=job.scrape_route)
                 child.cancel_event = job.cancel_event
+                await self._set_scrape_child(url, child)
                 try:
                     await self._run_for_user(child)
+                    if job.cancel_event.is_set():
+                        break
                     if child.status in {"done", "done_with_errors"}:
                         completed.add(url)
                         state.completed_urls.append(url)
@@ -1962,8 +2259,11 @@ class Bot:
                 except Exception as exc:
                     state.failed[url] = f"{exc.__class__.__name__}: {exc}"
                     job.failed += 1
-                    _LOG.exception("scrapeall item failed: %s", url)
-                save_checkpoint(state)
+                    _LOG.exception("scrapeall item failed for host %s", _url_host_label(url))
+                finally:
+                    await self._clear_scrape_child(url, child)
+                await asyncio.to_thread(save_checkpoint, state)
+
                 # Urgent lane (movie boundary): the current movie just hit
                 # 10/10 + checkpoint. If a user sent an urgent link while
                 # it resolved, run all urgents now, then resume the scrape
@@ -1973,7 +2273,7 @@ class Bot:
                         try:
                             if self._bot is not None:
                                 await _send_safe(
-                                    self._bot, job.chat_id,
+                                    self._bot, _op_dm(job),
                                     "⏸ <b>Channel scrape paused</b> — ⚡ urgent link(s) running now. "
                                     "Resuming right after.",
                                     parse_mode=ParseMode.HTML,
@@ -1991,8 +2291,9 @@ class Bot:
                             try:
                                 if self._bot is not None:
                                     await _send_safe(
-                                        self._bot, job.chat_id,
-                                        f"▶️ <b>Channel scrape resumed</b> — {int(_n_urg or 0)} urgent job(s) done. "
+                                    self._bot, _op_dm(job),
+                                    f"▶️ <b>Channel scrape resumed</b> — {int(_n_urg or 0)} urgent job(s) done. "
+
                                         f"Continuing <b>{kind}</b> page <b>{page_number}</b>.",
                                         parse_mode=ParseMode.HTML,
                                     )
@@ -2006,12 +2307,12 @@ class Bot:
             if job.cancel_event.is_set():
                 break
             state.pages_completed += 1
-            if pagination and page_number >= pagination[1]:
+            if page_number == total_pages:
                 state.finished = True
-                save_checkpoint(state)
+                await asyncio.to_thread(save_checkpoint, state)
                 break
             state.next_page = page_number + 1
-            save_checkpoint(state)
+            await asyncio.to_thread(save_checkpoint, state)
 
         if job.cancel_event.is_set():
             job.status = "cancelled"
@@ -2033,7 +2334,7 @@ class Bot:
                     f"failed: <b>{len(state.failed)}</b>"
                 )
         job.finished_at = time.time()
-        await _send_safe(self._bot, job.chat_id, text, parse_mode=ParseMode.HTML)
+        await _send_safe(self._bot, _op_dm(job), text, parse_mode=ParseMode.HTML)
 
     # --- batched results message ----------------------------------------
     def _format_batch_text(
@@ -2397,13 +2698,13 @@ class Bot:
         self.error_count += 1
         job.status = "error"
         job.finished_at = time.time()
-        try:
-            with open(self.cfg.error_log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} user={job.user_id} url={job.url} ===\n")
-                traceback.print_exc(file=f)
-        except Exception:
-            pass
-        _LOG.exception("job failed: %s", job.error)
+        _LOG.error(
+            "job failed user=%s url=%s: %s\n%s",
+            job.user_id,
+            job.url,
+            job.error or "unknown",
+            traceback.format_exc(),
+        )
         if self._bot is None:
             return
         # HTML-escape `job.error` because it may carry user-extracted
@@ -2457,7 +2758,6 @@ class Bot:
         while True:
             try:
                 job = await self._pick_next()
-                self.current = job
                 _LOG.info(
                     "starting job user=%d url=%s queue_depth=%d",
                     job.user_id, job.url, self._queue_depth(),
@@ -2485,9 +2785,6 @@ class Bot:
                         self.error_count += 1
                     _LOG.exception("dispatcher caught baseexception for job")
                     try:
-                        with open(self.cfg.error_log_path, "a", encoding="utf-8") as f:
-                            f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} OUTER user={job.user_id} status={job.status} ===\n")
-                            traceback.print_exc(file=f)
                         if self._bot is not None and not job.cancel_event.is_set():
                             await self._bot.send_message(
                                 chat_id=_op_dm(job),
@@ -2496,7 +2793,10 @@ class Bot:
                     except Exception:
                         pass
                 finally:
-                    self.current = None
+                    async with self._queue_cond:
+                        if self.current is job:
+                            self.current = None
+                        self._queue_cond.notify_all()
                     self.last_solve_ago = 0.0
                     # Every job ends here (done / error / cancelled / crash):
                     # drop its transient progress + enqueue notes so the
@@ -2607,7 +2907,12 @@ class Bot:
         # /solve flows (Cloudflare fingerprints the Oracle Cloud ASN).
         vpn_line = "\n<b>vpn:</b> [FAIL] none (direct from VPS IP -- expect CF to flag this)\n"
         try:
-            r = subprocess.run(["systemctl", "is-active", "xdmovies-vnc"], capture_output=True, timeout=2)
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["systemctl", "is-active", "xdmovies-vnc"],
+                capture_output=True,
+                timeout=2,
+            )
             if r.returncode == 0 and r.stdout.strip() == b"active":
                 desktop_line = "\n<b>desktop:</b> [OK] XFCE on :0 (noVNC :6080)\n"
             else:
@@ -2718,6 +3023,9 @@ class Bot:
         if not bot_config.is_allowed(uid, self.cfg):
             return  # silent ignore
         _SCRAPECHAN_PENDING.pop(uid, None)
+        txt_cancel = _TXT_SEARCH_CANCEL.get(uid)
+        if txt_cancel is not None:
+            txt_cancel.set()
 
         # Indexed cancel: `/cancel 2` or `/cancel 2,4,8`. Positions are
         # 1-based over YOUR OWN queued jobs (urgent lane first, then
@@ -2731,66 +3039,31 @@ class Bot:
 
         cancelled_running = False
         cancelled_queued = 0
-        removed_jobs: List[Tuple[int, str]] = []  # (depth, url)
+        removed_jobs: List[Tuple[int, str]] = []
 
-        # 1. If the currently-running job belongs to this user, mark it
-        #    cancelled. The dispatcher observes the cancel_event at the
-        #    next per-card boundary and exits cleanly.
-        if self.current is not None and self.current.user_id == uid:
-            self.current.cancel_event.set()
-            cancelled_running = True
-
-        # 2. Audit finding M4: take an atomic snapshot of the queue
-        # under the lock, then mutate the deque in place. This avoids
-        # the previous drain-and-reput race where the dispatcher could
-        # start a job mid-refill and reorder the queue.
-        items = await self._snapshot_queue()
-        try:
-            urgent_items = await self._snapshot_urgent()
-        except Exception:
-            urgent_items = []
-        kept: List[Job] = []
-        kept_urgent: List[Job] = []
         async with self._queue_cond:
-            self.queue.clear()
-            for j in items:
-                if j.user_id == uid:
-                    j.cancel_event.set()
-                    j.status = "cancelled"
-                    j.finished_at = time.time()
-                    cancelled_queued += 1
-                    removed_jobs.append((cancelled_queued, j.url))
-                else:
-                    kept.append(j)
-            for j in kept:
-                self.queue.append(j)
-            # Urgent lane: same per-user cancel so a ⚡ job can be
-            # withdrawn while the scrape is still paused on it.
-            try:
-                self._urgent.clear()
-                for j in urgent_items:
-                    if j.user_id == uid:
-                        j.cancel_event.set()
-                        j.status = "cancelled"
-                        j.finished_at = time.time()
+            current = self.current
+            if current is not None and current.user_id == uid:
+                current.cancel_event.set()
+                current.status = "cancelled"
+                current.finished_at = time.time()
+                cancelled_running = True
+            for lane in (self._urgent, self.queue):
+                kept = []
+                for job in tuple(lane):
+                    if job.user_id == uid:
+                        job.cancel_event.set()
+                        job.status = "cancelled"
+                        job.finished_at = time.time()
                         cancelled_queued += 1
-                        removed_jobs.append((cancelled_queued, j.url))
+                        removed_jobs.append((cancelled_queued, job.url))
                     else:
-                        kept_urgent.append(j)
-                for j in kept_urgent:
-                    self._urgent.append(j)
-            except Exception:
-                pass
-            # Wake the dispatcher if it was blocked in _pick_next
-            # waiting for a non-empty queue.
+                        kept.append(job)
+                lane.clear()
+                lane.extend(kept)
             self._queue_cond.notify_all()
 
-        # 3. The real cancel signal is `Job.cancel_event` (asyncio.Event),
-        #    set on the cancelled job above. The dispatcher and per-card
-        #    loop already observe it. The redundant `_cancel_flags` dict
-        #    (audit M1) was removed.
 
-        # 4. Reply to the user with what we did.
         if cancelled_running and cancelled_queued:
             text = (
                 f"🛑 cancelled your running job and removed "
@@ -2927,6 +3200,9 @@ class Bot:
         if not self.cfg.is_owner(update.effective_user.id):
             return  # owner only, silent ignore
         chat_id = update.effective_chat.id
+        if self._restarting:
+            return
+        self._restarting = True
         try:
             if self._bot is not None:
                 await self._bot.send_message(
@@ -2936,52 +3212,24 @@ class Bot:
                 )
         except Exception:
             pass
-        # 1. Stop everything: running job + every queued job, all users.
         try:
-            if self.current is not None:
-                try:
-                    self.current.cancel_event.set()
-                except Exception:
-                    pass
-            try:
-                items = await self._snapshot_queue()
-            except Exception:
-                items = []
-            try:
-                try:
-                    urgent_items = await self._snapshot_urgent()
-                except Exception:
-                    urgent_items = []
-                async with self._queue_cond:
-                    for j in items:
-                        try:
-                            j.cancel_event.set()
-                            j.status = "cancelled"
-                            j.finished_at = time.time()
-                        except Exception:
-                            pass
-                    for j in urgent_items:
-                        try:
-                            j.cancel_event.set()
-                            j.status = "cancelled"
-                            j.finished_at = time.time()
-                        except Exception:
-                            pass
-                    self.queue.clear()
-                    try:
-                        self._urgent.clear()
-                    except Exception:
-                        pass
-                    try:
-                        self._queue_cond.notify_all()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            from xdmovies.autodetect import stop_autodetect
+            await stop_autodetect()
         except Exception:
             pass
-        # 2. Tear down solve server (closes session browsers) + keep-alive.
-        # Fresh copies boot in _post_init after the re-exec.
+        async with self._queue_cond:
+            active = [self.current, *self.queue, *self._urgent]
+            for job in active:
+                if job is None:
+                    continue
+                job.cancel_event.set()
+                job.status = "cancelled"
+                job.finished_at = time.time()
+            self.queue.clear()
+            self._urgent.clear()
+            self._active_scrape_children.clear()
+            self._queue_cond.notify_all()
+        await self._stop_dispatcher()
         try:
             from xdmovies.solve_server import stop_server
             await stop_server()
@@ -3076,7 +3324,17 @@ class Bot:
         if data not in ("qmode:set:yes", "qmode:set:no"):
             return
         from xdmovies import qmode_store
-        on = qmode_store.set_qmode(query.from_user.id, data == "qmode:set:yes")
+        try:
+            on = await asyncio.to_thread(
+                qmode_store.set_qmode, query.from_user.id, data == "qmode:set:yes"
+            )
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save quality mode: {_html_escape(exc.__class__.__name__)}",
+            )
+            return
         text = (
             f"Quality mode: <b>{'ON' if on else 'OFF'}</b>\n"
             + ("Series links will now ask which quality to resolve."
@@ -3180,13 +3438,13 @@ class Bot:
             pass
         try:
             if job.silent or job.post_to_channel:
-                _LOG.info("qmode picker skipped (silent/channel-routed job) for %s", job.url)
+                _LOG.info("qmode picker skipped (silent/channel-routed job) for host %s", _url_host_label(job.url))
                 return list(cards)
             if "/series/" not in (job.url or "").lower():
-                _LOG.info("qmode picker skipped (not a series URL) for %s", job.url)
+                _LOG.info("qmode picker skipped (not a series URL) for host %s", _url_host_label(job.url))
                 return list(cards)
             if not qmode_store.is_qmode_on(job.user_id):
-                _LOG.info("qmode picker skipped (qmode OFF for user %d) for %s", job.user_id, job.url)
+                _LOG.info("qmode picker skipped (qmode OFF for user %d) for host %s", job.user_id, _url_host_label(job.url))
                 return list(cards)
         except Exception:
             return list(cards)
@@ -3200,7 +3458,7 @@ class Bot:
             _LOG.exception("quality grouping failed (non-fatal) -- resolving all")
             return list(cards)
         if len(groups) <= 1:
-            _LOG.info("qmode picker skipped (%d quality group) for %s", len(groups), job.url)
+            _LOG.info("qmode picker skipped (%d quality group) for host %s", len(groups), _url_host_label(job.url))
             return list(cards)
         if len(groups) > QPICK_MAX_GROUPS:
             await _send_safe(
@@ -3346,7 +3604,17 @@ class Bot:
         if data not in ("dmode:set:yes", "dmode:set:no"):
             return
         from xdmovies import dmode_store
-        on = dmode_store.set_dmode(query.from_user.id, data == "dmode:set:yes")
+        try:
+            on = await asyncio.to_thread(
+                dmode_store.set_dmode, query.from_user.id, data == "dmode:set:yes"
+            )
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save download mode: {_html_escape(exc.__class__.__name__)}",
+            )
+            return
         text = (
             f"Download mode: <b>{'ON' if on else 'OFF'}</b>\n"
             + ("Series links will now ask which sections (Packs/Episodes) to resolve."
@@ -3451,13 +3719,13 @@ class Bot:
             pass
         try:
             if job.silent or job.post_to_channel:
-                _LOG.info("dmode picker skipped (silent/channel-routed job) for %s", job.url)
+                _LOG.info("dmode picker skipped (silent/channel-routed job) for host %s", _url_host_label(job.url))
                 return list(cards)
             if "/series/" not in (job.url or "").lower():
-                _LOG.info("dmode picker skipped (not a series URL) for %s", job.url)
+                _LOG.info("dmode picker skipped (not a series URL) for host %s", _url_host_label(job.url))
                 return list(cards)
             if not dmode_store.is_dmode_on(job.user_id):
-                _LOG.info("dmode picker skipped (dmode OFF for user %d) for %s", job.user_id, job.url)
+                _LOG.info("dmode picker skipped (dmode OFF for user %d) for host %s", job.user_id, _url_host_label(job.url))
                 return list(cards)
         except Exception:
             return list(cards)
@@ -3471,7 +3739,7 @@ class Bot:
             _LOG.exception("section grouping failed (non-fatal) -- resolving all")
             return list(cards)
         if len(groups) <= 1:
-            _LOG.info("dmode picker skipped (%d section group) for %s", len(groups), job.url)
+            _LOG.info("dmode picker skipped (%d section group) for host %s", len(groups), _url_host_label(job.url))
             return list(cards)
         if len(groups) > DPICK_MAX_GROUPS:
             await _send_safe(
@@ -3628,14 +3896,26 @@ class Bot:
                 except Exception:
                     pass
             return
-        if data == "settings:all":
-            prefs = settings_store.get_settings(query.from_user.id)
-            for key, _label, _emoji in settings_store.ALL_FIELDS:
-                prefs = settings_store.set_field(query.from_user.id, key, True)
-        elif data.startswith("settings:toggle:"):
-            key = data.split(":", 2)[-1]
-            prefs = settings_store.toggle_field(query.from_user.id, key)
-        else:
+        try:
+            if data == "settings:all":
+                prefs = settings_store.get_settings(query.from_user.id)
+                for key, _label, _emoji in settings_store.ALL_FIELDS:
+                    prefs = await asyncio.to_thread(
+                        settings_store.set_field, query.from_user.id, key, True
+                    )
+            elif data.startswith("settings:toggle:"):
+                key = data.split(":", 2)[-1]
+                prefs = await asyncio.to_thread(
+                    settings_store.toggle_field, query.from_user.id, key
+                )
+            else:
+                return
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save settings: {_html_escape(exc.__class__.__name__)}",
+            )
             return
         if query.message is not None:
             try:
@@ -3785,7 +4065,15 @@ class Bot:
         if feed not in ("movies", "series", "all"):
             return
         from xdmovies import autodetect_store as _ad
-        _ad.set_feed(feed)
+        try:
+            await asyncio.to_thread(_ad.set_feed, feed)
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save auto-detect feed: {_html_escape(exc.__class__.__name__)}",
+            )
+            return
         if query.message is not None:
             try:
                 await query.edit_message_text(
@@ -3816,8 +4104,15 @@ class Bot:
             return
         from xdmovies import autodetect_store as _ad
         want_on = data.endswith(":yes")
-        # Turning ON with no channel is useless — warn but still store choice.
-        _ad.set_on(want_on)
+        try:
+            await asyncio.to_thread(_ad.set_on, want_on)
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save auto-detect state: {_html_escape(exc.__class__.__name__)}",
+            )
+            return
         if query.message is not None:
             # Series/All ON -> ask content filter first (All / Episodes /
             # Packs), same choice as the search accept-all flow. Movies
@@ -3884,7 +4179,17 @@ class Bot:
         if len(parts) != 3 or parts[1] != "content" or parts[2] not in ("all", "ep", "pack"):
             return
         from xdmovies import autodetect_store as _ad
-        _ad.set_card_filter(_CONTENT_CALLBACK[parts[2]])
+        try:
+            await asyncio.to_thread(
+                _ad.set_card_filter, _CONTENT_CALLBACK[parts[2]]
+            )
+        except Exception as exc:
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                f"[FAIL] could not save auto-detect filter: {_html_escape(exc.__class__.__name__)}",
+            )
+            return
         if query.message is not None:
             try:
                 await query.edit_message_text(
@@ -3946,15 +4251,19 @@ class Bot:
             return
         if not bot_config.is_allowed(update.effective_user.id, self.cfg):
             return
+        token = _new_scrape_prompt(
+            "scrapeall", update.effective_user.id, f"dm:{update.effective_user.id}", update.effective_chat.id, 0
+        )
         keyboard = InlineKeyboardMarkup([  # type: ignore[misc]
-            [InlineKeyboardButton("📚 All", callback_data="scrapeall:select:all")],  # type: ignore[misc]
+            [InlineKeyboardButton("📚 All", callback_data=f"scrapeall:{token}:select:all")],  # type: ignore[misc]
             [
-                InlineKeyboardButton("🎬 Movies", callback_data="scrapeall:select:movies"),  # type: ignore[misc]
-                InlineKeyboardButton("🎞️ Series", callback_data="scrapeall:select:series"),  # type: ignore[misc]
+                InlineKeyboardButton("🎬 Movies", callback_data=f"scrapeall:{token}:select:movies"),  # type: ignore[misc]
+                InlineKeyboardButton("🎞️ Series", callback_data=f"scrapeall:{token}:select:series"),  # type: ignore[misc]
             ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="scrapeall:cancel:-")],  # type: ignore[misc]
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"scrapeall:{token}:cancel:-")],  # type: ignore[misc]
         ])
-        await update.message.reply_text("What do you want to scrape?", reply_markup=keyboard)
+        sent = await update.message.reply_text("What do you want to scrape?", reply_markup=keyboard)
+        _SCRAPE_PROMPTS[token]["message_id"] = int(getattr(sent, "message_id", 0) or 0)
 
     async def _on_scrapeall_choice(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         query = update.callback_query
@@ -3965,12 +4274,15 @@ class Bot:
             return
         data = query.data or ""
         parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "scrapeall":
+        if len(parts) != 4 or parts[0] != "scrapeall":
             return
-        action, kind = parts[1], parts[2]
+        token = parts[1]
+        entry = _scrape_prompt_entry(token, query)
+        if entry is None or entry.get("prefix") != "scrapeall":
+            return
+        action, kind = parts[2], parts[3]
         if action == "cancel":
-            # Fourth button: dismiss the choice prompt, start nothing.
-            # Editing without reply_markup removes the keyboard.
+            _SCRAPE_PROMPTS.pop(token, None)
             if query.message is None:
                 return
             await query.edit_message_text("❌ Scrape choice cancelled -- nothing started.")
@@ -3979,15 +4291,16 @@ class Bot:
             return
         if kind not in {"all", "movies", "series"}:
             return
-        if query.message is None:
-            return
-        from xdmovies.scrape_all import has_resumable_history, load_checkpoint
-        state = load_checkpoint(kind)
+        if action in {"resume", "start"}:
+            _SCRAPE_PROMPTS.pop(token, None)
+        route = str(entry["route"])
+        from xdmovies.scrape_all import has_resumable_history, load_checkpoint, save_checkpoint
+        state = load_checkpoint(kind, route=route)
         if action == "select" and has_resumable_history(state):
             label = {"all": "All", "movies": "Movies", "series": "Series"}[kind]
             keyboard = InlineKeyboardMarkup([[  # type: ignore[misc]
-                InlineKeyboardButton("▶ Resume", callback_data=f"scrapeall:resume:{kind}"),  # type: ignore[misc]
-                InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapeall:start:{kind}"),  # type: ignore[misc]
+                InlineKeyboardButton("▶ Resume", callback_data=f"scrapeall:{token}:resume:{kind}"),  # type: ignore[misc]
+                InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapeall:{token}:start:{kind}"),  # type: ignore[misc]
             ]])
             _failed = f", <b>{len(state.failed)}</b> failed" if state.failed else ""
             await query.edit_message_text(
@@ -4000,22 +4313,12 @@ class Bot:
             return
         if action == "select":
             action = "start"
+        _SCRAPE_PROMPTS.pop(token, None)
 
-        if self.current is not None and self.current.job_type == "scrape_all":
-            await query.edit_message_text("⏳ A scrape-all job is already running.")
-            return
-        items: List[Job] = []
-        # Audit finding M4: atomic snapshot, mutate in place.
-        items = await self._snapshot_queue()
-        duplicate = any(job.job_type == "scrape_all" and job.content_type == kind for job in items)
-        if duplicate:
-            await query.edit_message_text(f"⏳ A {kind} scrape is already queued.")
-            return
         from xdmovies.scrape_all import catalog_page_url
         if action == "start":
-            from xdmovies.scrape_all import ScrapeCheckpoint, save_checkpoint
-            state = ScrapeCheckpoint(kind=kind)
-            save_checkpoint(state)
+            from xdmovies.scrape_all import ScrapeCheckpoint
+            state = ScrapeCheckpoint(kind=kind, route=route)
         was_finished = state.finished
         if was_finished and action == "resume":
             await query.edit_message_text(f"ℹ️ {kind.title()} has already finished; choose start again to restart it.")
@@ -4025,14 +4328,24 @@ class Bot:
         _q_name, _q_uname = _display_name(query.from_user)
         job = Job(
             user_id=query.from_user.id,
-            chat_id=query.message.chat.id,
+            chat_id=query.from_user.id,
             url=catalog_page_url(kind, state.next_page),
             job_type="scrape_all",
             content_type=kind,
+            scrape_route=route,
             user_name=_q_name,
             username=_q_uname,
         )
-        position = await self._enqueue(job)
+        position = await self._enqueue_scrape(
+            job,
+            prepare=(lambda: save_checkpoint(state)) if action == "start" else None,
+        )
+        if position == -1:
+            await query.edit_message_text(f"⏳ A {kind} scrape is already active for this route.")
+            return
+        if position in (-2, -3):
+            await query.edit_message_text("⚠️ queue is full; wait for a running job or cancel one with /cancel.")
+            return
         action_label = "Starting from beginning" if action == "start" else "Resuming"
         await query.edit_message_text(
             f"[OK] {action_label} {kind} scrape from page {state.next_page}. Queue position: {position}."
@@ -4135,19 +4448,23 @@ class Bot:
             InlineKeyboardButton = InlineKeyboardMarkup = None  # type: ignore
         if InlineKeyboardMarkup is None:
             return
+        token = _new_scrape_prompt(
+            "scrapechan", update.effective_user.id, f"channel:{ch.channel_id}", update.effective_chat.id, ch.channel_id
+        )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 All", callback_data="scrapechan:select:all")],
+            [InlineKeyboardButton("📚 All", callback_data=f"scrapechan:{token}:select:all")],
             [
-                InlineKeyboardButton("🎬 Movies", callback_data="scrapechan:select:movies"),
-                InlineKeyboardButton("🎞️ Series", callback_data="scrapechan:select:series"),
+                InlineKeyboardButton("🎬 Movies", callback_data=f"scrapechan:{token}:select:movies"),
+                InlineKeyboardButton("🎞️ Series", callback_data=f"scrapechan:{token}:select:series"),
             ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="scrapechan:cancel:-")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"scrapechan:{token}:cancel:-")],
         ])
         shown = ch.title or str(ch.channel_id)
-        await update.message.reply_text(
+        sent = await update.message.reply_text(
             f"What do you want to scrape into <b>{_html_escape(shown)}</b>?",
             reply_markup=keyboard, parse_mode=ParseMode.HTML,
         )
+        _SCRAPE_PROMPTS[token]["message_id"] = int(getattr(sent, "message_id", 0) or 0)
 
     async def _on_scrapechan_choice(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         query = update.callback_query
@@ -4158,10 +4475,15 @@ class Bot:
             return  # owner only, silent ignore
         data = query.data or ""
         parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "scrapechan":
+        if len(parts) != 4 or parts[0] != "scrapechan":
             return
-        action, kind = parts[1], parts[2]
+        token = parts[1]
+        entry = _scrape_prompt_entry(token, query)
+        if entry is None or entry.get("prefix") != "scrapechan":
+            return
+        action, kind = parts[2], parts[3]
         if action == "cancel":
+            _SCRAPE_PROMPTS.pop(token, None)
             if query.message is None:
                 return
             await query.edit_message_text("❌ Channel scrape choice cancelled -- nothing started.")
@@ -4170,18 +4492,19 @@ class Bot:
             return
         if kind not in {"all", "movies", "series"}:
             return
-        if query.message is None:
-            return
+        if action in {"resume", "start"}:
+            _SCRAPE_PROMPTS.pop(token, None)
+        route = str(entry["route"])
         try:
             from xdmovies.scrape_all import load_channel
             ch = load_channel()
         except Exception:
             ch = None
-        if ch is None:
-            await query.edit_message_text("⚠️ No channel set. Run /scrapeallchannel and forward a channel message first.")
+        if ch is None or int(getattr(ch, "channel_id", 0) or 0) != int(entry.get("channel_id", 0) or 0):
+            await query.edit_message_text("⚠️ Channel target changed. Run /scrapeallchannel again.")
             return
-        from xdmovies.scrape_all import has_resumable_history, load_checkpoint
-        state = load_checkpoint(kind)
+        from xdmovies.scrape_all import has_resumable_history, load_checkpoint, save_checkpoint
+        state = load_checkpoint(kind, route=route)
         if action == "select" and has_resumable_history(state):
             label = {"all": "All", "movies": "Movies", "series": "Series"}[kind]
             try:
@@ -4191,8 +4514,8 @@ class Bot:
             if InlineKeyboardMarkup is None:
                 return
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("▶ Resume", callback_data=f"scrapechan:resume:{kind}"),
-                InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapechan:start:{kind}"),
+                InlineKeyboardButton("▶ Resume", callback_data=f"scrapechan:{token}:resume:{kind}"),
+                InlineKeyboardButton("↻ Start from beginning", callback_data=f"scrapechan:{token}:start:{kind}"),
             ]])
             _failed_c = f", <b>{len(state.failed)}</b> failed" if state.failed else ""
             await query.edit_message_text(
@@ -4205,20 +4528,10 @@ class Bot:
             return
         if action == "select":
             action = "start"
-        if self.current is not None and self.current.job_type == "scrape_all":
-            await query.edit_message_text("⏳ A scrape-all job is already running.")
-            return
-        items: List[Job] = []
-        items = await self._snapshot_queue()
-        duplicate = any(job.job_type == "scrape_all" and job.content_type == kind for job in items)
-        if duplicate:
-            await query.edit_message_text(f"⏳ A {kind} scrape is already queued.")
-            return
         from xdmovies.scrape_all import catalog_page_url
         if action == "start":
-            from xdmovies.scrape_all import ScrapeCheckpoint, save_checkpoint
-            state = ScrapeCheckpoint(kind=kind)
-            save_checkpoint(state)
+            from xdmovies.scrape_all import ScrapeCheckpoint
+            state = ScrapeCheckpoint(kind=kind, route=route)
         was_finished = state.finished
         if was_finished and action == "resume":
             await query.edit_message_text(f"ℹ️ {kind.title()} has already finished; choose start again to restart it.")
@@ -4228,15 +4541,25 @@ class Bot:
         _q_name, _q_uname = _display_name(query.from_user)
         job = Job(
             user_id=query.from_user.id,
-            chat_id=query.message.chat.id,
+            chat_id=query.from_user.id,
             url=catalog_page_url(kind, state.next_page),
             job_type="scrape_all",
             content_type=kind,
+            scrape_route=route,
             user_name=_q_name,
             username=_q_uname,
             post_to_channel=ch.channel_id,
         )
-        position = await self._enqueue(job)
+        position = await self._enqueue_scrape(
+            job,
+            prepare=(lambda: save_checkpoint(state)) if action == "start" else None,
+        )
+        if position == -1:
+            await query.edit_message_text(f"⏳ A {kind} scrape is already active for this route.")
+            return
+        if position in (-2, -3):
+            await query.edit_message_text("⚠️ queue is full; wait for a running job or cancel one with /cancel.")
+            return
         action_label = "Starting from beginning" if action == "start" else "Resuming"
         shown = ch.title or str(ch.channel_id)
         await query.edit_message_text(
@@ -4294,12 +4617,16 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return
-        _SEARCH_CACHE[uid] = (time.time(), query, results)
-        page, total_pages, keyboard = _search_page_keyboard(results, 1)
-        await update.message.reply_text(
+        token = _new_search_session(uid, query, results, update.effective_chat.id)
+        page, total_pages, keyboard = _search_page_keyboard(token, results, 1)
+        sent = await update.message.reply_text(
             _search_page_text(query, results, page, total_pages),
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
+        )
+        _SEARCH_CACHE[uid] = (
+            _SEARCH_CACHE[uid][0], query, results, token,
+            int(getattr(sent, "message_id", 0) or 0), update.effective_chat.id,
         )
 
     async def _acceptall_enqueue(self, uid: int, chat_id: int, results,
@@ -4319,8 +4646,12 @@ class Bot:
             card_filter = "all"
         seen_urls: set = set()
         jobs = []
-        for res in results:
+        capped = list(results or [])[:_SEARCH_FETCH_LIMIT]
+        skipped_duplicates = 0
+        skipped_full = 0
+        for res in capped:
             if res.url in seen_urls:
+                skipped_duplicates += 1
                 continue
             seen_urls.add(res.url)
             job = Job(user_id=uid, chat_id=chat_id, url=res.url,
@@ -4328,11 +4659,17 @@ class Bot:
                       post_to_channel=to_channel, silent=bool(to_channel),
                       card_filter=card_filter)
             try:
-                await self._enqueue(job)
+                position = await self._enqueue(job, dedupe=True)
             except Exception:
                 continue
+            if position == -1:
+                skipped_duplicates += 1
+                continue
+            if position in (-2, -3):
+                skipped_full += 1
+                continue
             jobs.append(job)
-        skipped = len(results) - len(jobs)
+        skipped = max(0, len(results or []) - len(capped))
         lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
         if card_filter != "all":
             lines[0] += f" ({_html_escape(_CONTENT_LABEL[card_filter])})"
@@ -4342,8 +4679,12 @@ class Bot:
             except Exception:
                 icon, title = "🔗", job.url
             lines.append(f"{idx}. {icon} {title}")
-        if skipped > 0:
-            lines.append(f"⚠️ +{skipped} duplicates skipped.")
+        if skipped:
+            lines.append(f"⚠️ +{skipped} results ignored (search cap {_SEARCH_FETCH_LIMIT}).")
+        if skipped_duplicates:
+            lines.append(f"⚠️ +{skipped_duplicates} duplicates skipped.")
+        if skipped_full:
+            lines.append(f"⚠️ +{skipped_full} not queued because the queue is full.")
         try:
             if self._bot is not None:
                 await _send_safe(self._bot, chat_id, "\n".join(lines),
@@ -4352,38 +4693,43 @@ class Bot:
             pass
         return len(jobs)
 
-    async def _acceptall_confirm_timeout(self, uid: int, token) -> None:
-        """60s default-NO for the channel confirm: no answer in time means
-        scrape in DM. Token-invalidated by re-taps/answers. Never raises."""
+    async def _acceptall_confirm_timeout(self, uid: int, session_token: str, confirm_token: str) -> None:
         try:
             await asyncio.sleep(_SEARCH_CONFIRM_TIMEOUT)
-        except Exception:
-            return
-        try:
-            cur = _SEARCH_CONFIRM.get(uid)
-            if cur is None or cur[0] is not token:
-                return  # answered in time or superseded by a re-tap
-            _, chat_id, message_id, user_name, username = cur[:5]
-            _filter_to = cur[5] if len(cur) > 5 else "all"
-            if _filter_to not in _CONTENT_FILTERS:
-                _filter_to = "all"
-            _SEARCH_CONFIRM.pop(uid, None)
-            entry = _SEARCH_CACHE.pop(uid, None)
-            if entry is None:
+            current = _SEARCH_CONFIRM.get(uid)
+            entry = _SEARCH_CACHE.get(uid)
+            if (
+                current is None
+                or entry is None
+                or len(current) < 7
+                or current[0] != confirm_token
+                or current[6] != session_token
+                or len(entry) < 5
+                or entry[3] != session_token
+            ):
                 return
-            _ts, _label, results = entry
+            _, chat_id, message_id, user_name, username, card_filter = current[:6]
+            results = entry[2]
+            _SEARCH_CONFIRM.pop(uid, None)
+            _SEARCH_CACHE.pop(uid, None)
             if self._bot is None:
                 return
             try:
                 await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
             except Exception:
                 pass
-            # Timeout default is NO (scrape here in DM) -- queued, never
-            # rejected: every link queues.
-            await self._acceptall_enqueue(uid, chat_id, results, user_name, username,
-                                          to_channel=0, card_filter=_filter_to)
+            await self._acceptall_enqueue(
+                uid, chat_id, results, user_name, username,
+                to_channel=0, card_filter=card_filter,
+            )
+        except asyncio.CancelledError:
+            return
         except Exception:
-            pass
+            return
+        finally:
+            task = _SEARCH_TIMEOUT_TASKS.get(uid)
+            if task is asyncio.current_task():
+                _SEARCH_TIMEOUT_TASKS.pop(uid, None)
 
     async def _on_search_pick(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         query = update.callback_query
@@ -4393,233 +4739,180 @@ class Bot:
         if update.effective_user is None or update.effective_chat is None:
             return
         if not bot_config.is_allowed(query.from_user.id, self.cfg):
-            return  # silent ignore
+            return
         uid = query.from_user.id
-        data = query.data or ""
-        parts = data.split(":")
-        if parts[:2] == ["search", "close"]:
-            # ❌ Close: remove the whole results list, drop the cache
-            # (and any pending channel-confirm for it).
-            _SEARCH_CACHE.pop(uid, None)
-            _SEARCH_CONFIRM.pop(uid, None)
+        parts = (query.data or "").split(":")
+        if len(parts) < 3 or parts[0] != "search":
+            return
+        token = parts[1]
+        entry = _search_session(uid, token, query)
+        if entry is None:
+            return
+        action = parts[2]
+        if action == "close" and len(parts) == 3:
+            _search_cancel(uid)
             if query.message is not None:
                 try:
                     await query.message.delete()
                 except Exception:
                     pass
             return
-        if parts[:2] == ["search", "acceptall"]:
-            # ✅ Accept all: don't enqueue yet -- first ask WHAT to scrape
-            # (All / Episodes / Packs-Zips), then "scrape to channel?".
-            # Cache is kept until the answers (or timeout) consume it.
-            entry_all = _SEARCH_CACHE.get(uid)
-            if entry_all is None or time.time() - entry_all[0] > _SEARCH_CACHE_TTL:
-                _SEARCH_CACHE.pop(uid, None)
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text("⌛ Search expired -- send /search again.")
-                    except Exception:
-                        pass
-                return
-            _ts_all, _label_all, _results_all = entry_all
-            _kb_content = InlineKeyboardMarkup([  # type: ignore[misc]
-                [InlineKeyboardButton("✅ All (EP+Pack)", callback_data="search:content:all")],  # type: ignore[misc]
-                [InlineKeyboardButton("🎞️ Episodes only", callback_data="search:content:ep")],  # type: ignore[misc]
-                [InlineKeyboardButton("🗜️ Packs/Zips only", callback_data="search:content:pack")],  # type: ignore[misc]
-                [InlineKeyboardButton("❌ Close", callback_data="search:close")],  # type: ignore[misc]
+        results = entry[2]
+        if action == "acceptall" and len(parts) == 3:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ All (EP+Pack)", callback_data=f"search:{token}:content:all")],
+                [InlineKeyboardButton("🎞️ Episodes only", callback_data=f"search:{token}:content:ep")],
+                [InlineKeyboardButton("🗜️ Packs/Zips only", callback_data=f"search:{token}:content:pack")],
+                [InlineKeyboardButton("❌ Close", callback_data=f"search:{token}:close")],
             ])
             if query.message is not None:
                 try:
                     await query.edit_message_text(
-                        f"Scrape <b>{len(_results_all)} links</b> -- what should I resolve?",
-                        reply_markup=_kb_content,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-            return
-        if len(parts) == 3 and parts[0] == "search" and parts[1] == "content" \
-                and parts[2] in ("all", "ep", "pack"):
-            # Content choice: store the filter, then ask "scrape to
-            # channel?" exactly as before. The confirm entry carries the
-            # filter through to enqueue (and to the timeout default).
-            entry_ct = _SEARCH_CACHE.get(uid)
-            if entry_ct is None or time.time() - entry_ct[0] > _SEARCH_CACHE_TTL:
-                _SEARCH_CACHE.pop(uid, None)
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text("⌛ Search expired -- send /search again.")
-                    except Exception:
-                        pass
-                return
-            _ts_ct, _label_ct, _results_ct = entry_ct
-            _filter = _CONTENT_CALLBACK[parts[2]]
-            _tok = object()
-            _nm0, _un0 = _display_name(update.effective_user)
-            _SEARCH_CONFIRM[uid] = (_tok, update.effective_chat.id,
-                                    query.message.message_id if query.message is not None else 0,
-                                    _nm0, _un0, _filter)
-            _kb_yn = InlineKeyboardMarkup([[  # type: ignore[misc]
-                InlineKeyboardButton("✅ Yes, to channel", callback_data="search:tochan:yes"),  # type: ignore[misc]
-                InlineKeyboardButton("❌ No, here in DM", callback_data="search:tochan:no"),  # type: ignore[misc]
-            ]])
-            if query.message is not None:
-                try:
-                    await query.edit_message_text(
-                        f"Scrape <b>{len(_results_ct)} links</b> "
-                        f"({_html_escape(_CONTENT_LABEL[_filter])}) to your channel?"
-                        f" (No answer in {_search_confirm_human_timeout()} = No, scrape here.)",
-                        reply_markup=_kb_yn,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-            try:
-                asyncio.get_running_loop().create_task(
-                    self._acceptall_confirm_timeout(uid, _tok))
-            except Exception:
-                pass
-            return
-        if len(parts) == 3 and parts[0] == "search" and parts[1] == "tochan" \
-                and parts[2] in ("yes", "no"):
-            # Answer (or nothing -- the timeout task owns the default-NO).
-            _cur = _SEARCH_CONFIRM.pop(uid, None)
-            if _cur is None:
-                return  # already answered / timed out; ignore double taps
-            _tok_got = _cur[0]
-            # 6-tuple (token, chat_id, message_id, name, username, filter);
-            # len-guard keeps it tolerant if the shape ever changes.
-            _filter_yn = _cur[5] if len(_cur) > 5 else "all"
-            if _filter_yn not in _CONTENT_FILTERS:
-                _filter_yn = "all"
-            entry_yn = _SEARCH_CACHE.get(uid)
-            if entry_yn is None or time.time() - entry_yn[0] > _SEARCH_CACHE_TTL:
-                _SEARCH_CACHE.pop(uid, None)
-                if query.message is not None:
-                    try:
-                        await query.edit_message_text("⌛ Search expired -- send /search again.")
-                    except Exception:
-                        pass
-                return
-            _ts_yn, _label_yn, _results_yn = entry_yn
-            _to_channel = 0
-            _chan_note = ""
-            if parts[2] == "yes":
-                try:
-                    from xdmovies.scrape_all import load_channel
-                    _ch = load_channel()
-                except Exception:
-                    _ch = None
-                if _ch is None or not int(getattr(_ch, "channel_id", 0) or 0):
-                    _SEARCH_CACHE.pop(uid, None)
-                    if query.message is not None:
-                        try:
-                            await query.edit_message_text(
-                                "No channel set -- send /scrapeallchannel and forward "
-                                "a channel message first, then accept again.")
-                        except Exception:
-                            pass
-                    return
-                _to_channel = int(_ch.channel_id)
-                try:
-                    _chan_note = f" → <b>{_html_escape(getattr(_ch, 'title', '') or str(_to_channel))}</b>"
-                except Exception:
-                    _chan_note = ""
-            _SEARCH_CACHE.pop(uid, None)
-            if query.message is not None:
-                try:
-                    await query.message.delete()
-                except Exception:
-                    pass
-            _nm_yn, _un_yn = _display_name(update.effective_user)
-            _n = await self._acceptall_enqueue(uid, update.effective_chat.id,
-                                               _results_yn, _nm_yn, _un_yn,
-                                               to_channel=_to_channel,
-                                               card_filter=_filter_yn)
-            if _to_channel and _n:
-                try:
-                    if self._bot is not None:
-                        await _send_safe(self._bot, update.effective_chat.id,
-                                         f"📢 Scraping to channel{_chan_note}. Progress lands there; "
-                                         f"this chat stays quiet.",
-                                         parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-            return
-        if len(parts) != 3 or parts[0] != "search" or parts[1] not in ("pick", "page"):
-            return
-        try:
-            idx = int(parts[2])
-        except ValueError:
-            return
-        entry = _SEARCH_CACHE.get(uid)
-        if entry is None or time.time() - entry[0] > _SEARCH_CACHE_TTL:
-            _SEARCH_CACHE.pop(uid, None)
-            if query.message is not None:
-                try:
-                    await query.edit_message_text("⌛ Search expired -- send /search again.")
-                except Exception:
-                    pass
-            return
-        _ts, cached_query, results = entry
-        if parts[1] == "page":
-            page, total_pages, keyboard = _search_page_keyboard(results, idx)
-            if query.message is not None:
-                try:
-                    await query.edit_message_text(
-                        _search_page_text(cached_query, results, page, total_pages),
+                        f"Scrape <b>{len(results)} links</b> -- what should I resolve?",
                         reply_markup=keyboard,
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
             return
-        if idx < 0 or idx >= len(results):
+        if action == "content" and len(parts) == 4 and parts[3] in _CONTENT_CALLBACK:
+            card_filter = _CONTENT_CALLBACK[parts[3]]
+            confirm_token = uuid.uuid4().hex[:8]
+            _SEARCH_CONFIRM[uid] = (
+                confirm_token,
+                update.effective_chat.id,
+                int(getattr(query.message, "message_id", 0) or 0),
+                *_display_name(update.effective_user),
+                card_filter,
+                token,
+            )
+            old_task = _SEARCH_TIMEOUT_TASKS.pop(uid, None)
+            if old_task is not None:
+                old_task.cancel()
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes, to channel", callback_data=f"search:{token}:tochan:{confirm_token}:yes"),
+                InlineKeyboardButton("❌ No, here in DM", callback_data=f"search:{token}:tochan:{confirm_token}:no"),
+            ]])
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        f"Scrape <b>{len(results)} links</b> "
+                        f"({_html_escape(_CONTENT_LABEL[card_filter])}) to your channel?"
+                        f" (No answer in {_search_confirm_human_timeout()} = No, scrape here.)",
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            task = asyncio.create_task(
+                self._acceptall_confirm_timeout(uid, token, confirm_token)
+            )
+            _SEARCH_TIMEOUT_TASKS[uid] = task
             return
-        picked = results[idx]
-        # Urgent lane: search pick while a channel scrape runs jumps
-        # ahead (movie-boundary preempt). Otherwise the pick just queues.
-        if self._is_scrape_running():
-            _nm, _un = _display_name(update.effective_user)
-            job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
-                      user_name=_nm, username=_un, priority=1)
-            try:
-                pos = await self._enqueue(job, urgent=True)
-            except Exception:
-                pos = 1
-            _SEARCH_CACHE.pop(uid, None)
-            _SEARCH_CONFIRM.pop(uid, None)
+        if action == "tochan" and len(parts) == 5 and parts[4] in ("yes", "no"):
+            current = _SEARCH_CONFIRM.get(uid)
+            if current is None or current[0] != parts[3] or current[6] != token:
+                return
+            filter_value = current[5]
+            chat_id = current[1]
+            to_channel = 0
+            channel_note = ""
+            if parts[4] == "yes":
+                try:
+                    from xdmovies.scrape_all import load_channel
+                    channel = load_channel()
+                except Exception:
+                    channel = None
+                if channel is None or not int(getattr(channel, "channel_id", 0) or 0):
+                    _search_cancel(uid)
+                    if query.message is not None:
+                        try:
+                            await query.edit_message_text(
+                                "No channel set -- send /scrapeallchannel and forward "
+                                "a channel message first, then accept again."
+                            )
+                        except Exception:
+                            pass
+                    return
+                to_channel = int(channel.channel_id)
+                channel_note = f" → <b>{_html_escape(getattr(channel, 'title', '') or str(to_channel))}</b>"
+            _search_cancel(uid)
             if query.message is not None:
                 try:
                     await query.message.delete()
                 except Exception:
                     pass
-            try:
-                job.enqueue_msg_id = await _send_safe(
-                    self._bot, update.effective_chat.id,
-                    "⚡ <b>Urgent queued</b> — runs after the current movie finishes 10/10, "
-                    "then the channel scrape resumes.",
+            name, username = current[3], current[4]
+            count = await self._acceptall_enqueue(
+                uid, chat_id, results, name, username,
+                to_channel=to_channel, card_filter=filter_value,
+            )
+            if to_channel and count:
+                await _send_safe(
+                    self._bot, chat_id,
+                    f"📢 Scraping to channel{channel_note}. Progress lands there; this chat stays quiet.",
                     parse_mode=ParseMode.HTML,
                 )
-            except Exception:
-                pass
             return
-        # Every pick queues -- no per-user busy rejection.
-        _nm, _un = _display_name(update.effective_user)
-        job = Job(user_id=uid, chat_id=update.effective_chat.id, url=picked.url,
-                  user_name=_nm, username=_un)
-        pos = await self._enqueue(job)
-        _SEARCH_CACHE.pop(uid, None)
-        _SEARCH_CONFIRM.pop(uid, None)
-        # Clean chat: delete the results list now that a pick was made.
-        # The confirm note below still shows what was queued. Delete may
-        # fail (message too old, rights); never let that break the pick.
+        if action not in {"pick", "page"} or len(parts) != 4:
+            return
+        try:
+            index = int(parts[3])
+        except ValueError:
+            return
+        if action == "page":
+            page, total_pages, keyboard = _search_page_keyboard(token, results, index)
+            if query.message is not None:
+                try:
+                    await query.edit_message_text(
+                        _search_page_text(entry[1], results, page, total_pages),
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            return
+        if index < 0 or index >= len(results):
+            return
+        picked = results[index]
+        urgent = self._is_scrape_running()
+        name, username = _display_name(update.effective_user)
+        job = Job(
+            user_id=uid,
+            chat_id=update.effective_chat.id,
+            url=picked.url,
+            user_name=name,
+            username=username,
+            priority=1 if urgent else 0,
+        )
+        _search_cancel(uid)
         if query.message is not None:
             try:
                 await query.message.delete()
             except Exception:
                 pass
-        job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, picked.url, pos)
+        position = await self._enqueue(job, urgent=urgent, dedupe=True)
+        if position == -1:
+            await _send_safe(self._bot, update.effective_chat.id, "[FAIL] that link is already active.")
+            return
+        if position in (-2, -3):
+            await _send_safe(
+                self._bot,
+                update.effective_chat.id,
+                "[FAIL] queue is full; wait for a running job or cancel one with /cancel.",
+            )
+            return
+        if urgent:
+            job.enqueue_msg_id = await _send_safe(
+                self._bot, update.effective_chat.id,
+                "⚡ <b>Urgent queued</b> — runs after the current movie finishes 10/10, "
+                "then the channel scrape resumes.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            job.enqueue_msg_id = await self._confirm_enqueued(
+                context, update.effective_chat.id, picked.url, position
+            )
 
     async def _on_document(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Handle an uploaded .txt file: one movie/series title per line.
@@ -4683,7 +4976,7 @@ class Bot:
             )
             return
         try:
-            from xdmovies.search import search_titles
+            from xdmovies.search import search_titles_batch
         except Exception as exc:
             _LOG.warning("search import failed: %r", exc)
             await _send_safe(
@@ -4692,18 +4985,41 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return
-        flat = []
-        no_match = []
+        cancel_event = asyncio.Event()
+        _TXT_SEARCH_CANCEL[uid] = cancel_event
+        progress_message = None
         try:
-            for title in titles:
+            progress_message = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🔎 Searching {len(titles)} titles…",
+            )
+
+            async def progress(done: int, total: int) -> None:
+                if progress_message is None:
+                    return
                 try:
-                    found = await search_titles(title, limit=5)
-                except Exception as exc:
-                    raise exc
-                if found:
-                    flat.extend(found)
-                else:
-                    no_match.append(title)
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=progress_message.message_id,
+                        text=f"🔎 Searching titles: {done}/{total}…",
+                    )
+                except Exception:
+                    pass
+
+            batch = await search_titles_batch(
+                titles,
+                per_title_limit=5,
+                deadline=_TXT_SEARCH_DEADLINE,
+                max_concurrency=_TXT_SEARCH_CONCURRENCY,
+                result_cap=_SEARCH_FETCH_LIMIT,
+                progress=progress,
+                cancel_event=cancel_event,
+            )
+            flat = list(batch.results or [])
+            no_match = list(batch.no_match or [])
+            failed_titles = list(batch.failed or [])
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             _LOG.warning("txt batch search failed: %r", exc)
             await _send_safe(
@@ -4712,8 +5028,36 @@ class Bot:
                 parse_mode=ParseMode.HTML,
             )
             return
+        finally:
+            _TXT_SEARCH_CANCEL.pop(uid, None)
+            if progress_message is not None:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=progress_message.message_id,
+                    )
+                except Exception:
+                    pass
+        if batch.cancelled:
+            await _send_safe(
+                context.bot,
+                update.effective_chat.id,
+                "🛑 .txt search cancelled.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if batch.timed_out:
+            await _send_safe(
+                context.bot,
+                update.effective_chat.id,
+                f"⏱ Search deadline reached after {int(_TXT_SEARCH_DEADLINE)}s; showing partial results.",
+                parse_mode=ParseMode.HTML,
+            )
         if not flat:
-            msg = "Not found."
+            if failed_titles:
+                msg = "[FAIL] search was unavailable for every title -- try again later."
+            else:
+                msg = "Not found."
             if dropped:
                 msg += f"\n⚠️ +{dropped} lines ignored (max {_TXT_MAX_LINES})."
             await _send_safe(
@@ -4723,8 +5067,8 @@ class Bot:
             )
             return
         label = f"📄 {file_name} ({len(titles)} titles)"
-        _SEARCH_CACHE[uid] = (time.time(), label, flat)
-        page, total_pages, keyboard = _search_page_keyboard(flat, 1)
+        token = _new_search_session(uid, label, flat, update.effective_chat.id)
+        page, total_pages, keyboard = _search_page_keyboard(token, flat, 1)
         msg_text = _search_page_text(label, flat, page, total_pages)
         # NOTE: suffix lines below show only on page 1 (page turns
         # re-render via _search_page_text). Accepted: keeps nav simple.
@@ -4733,12 +5077,20 @@ class Bot:
             shown = ", ".join(no_match[:5])
             more = f" +{len(no_match) - 5} more" if len(no_match) > 5 else ""
             suffix += f"\n❌ Not found: {shown}{more}"
+        if failed_titles:
+            shown = ", ".join(failed_titles[:5])
+            more = f" +{len(failed_titles) - 5} more" if len(failed_titles) > 5 else ""
+            suffix += f"\n⚠️ Search failed: {shown}{more}"
         if dropped:
             suffix += f"\n⚠️ +{dropped} lines ignored (max {_TXT_MAX_LINES})."
-        await update.message.reply_text(
+        sent = await update.message.reply_text(
             msg_text + suffix,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
+        )
+        _SEARCH_CACHE[uid] = (
+            _SEARCH_CACHE[uid][0], label, flat, token,
+            int(getattr(sent, "message_id", 0) or 0), update.effective_chat.id,
         )
 
     async def _enqueue_urgent_links(self, uid: int, chat_id: int,
@@ -4752,7 +5104,9 @@ class Bot:
                     job = Job(user_id=uid, chat_id=chat_id, url=u,
                               user_name=user_name, username=username,
                               priority=1)
-                    await self._enqueue(job, urgent=True)
+                    position = await self._enqueue(job, urgent=True, dedupe=True)
+                    if position < 0:
+                        continue
                     jobs.append(job)
                 except Exception:
                     continue
@@ -4807,14 +5161,18 @@ class Bot:
             # No exact match — let the user pick instead of scraping the
             # wrong title. Reuses the /search picker flow (cache + buttons).
             try:
-                _SEARCH_CACHE[uid] = (time.time(), raw_title, results)
-                page, total_pages, keyboard = _search_page_keyboard(results, 1)
+                token = _new_search_session(uid, raw_title, results, chat_id)
+                page, total_pages, keyboard = _search_page_keyboard(token, results, 1)
                 text = (
                     f"⚠️ No exact match for <code>{_html_escape(raw_title)}</code> — "
                     f"tap the right one below (wrong auto-pick disabled).\n"
                     + _search_page_text(raw_title, results, page, total_pages)
                 )
-                await _send_markup_safe(self._bot, chat_id, text, keyboard)
+                sent = await _send_markup_safe(self._bot, chat_id, text, keyboard)
+                if sent is not None:
+                    _SEARCH_CACHE[uid] = (
+                        _SEARCH_CACHE[uid][0], raw_title, results, token, sent, chat_id,
+                    )
             except Exception:
                 _LOG.exception("channel title picker failed")
                 await _send_safe(
@@ -4840,7 +5198,7 @@ class Bot:
                   user_name=user_name, username=username,
                   priority=1 if urgent else 0)
         try:
-            pos = await self._enqueue(job, urgent=urgent)
+            pos = await self._enqueue(job, urgent=urgent, dedupe=True)
         except Exception:
             await _send_safe(self._bot, chat_id, "[FAIL] could not queue that title -- try again.")
             return False
@@ -4926,14 +5284,30 @@ class Bot:
                 job = Job(user_id=uid, chat_id=update.effective_chat.id, url=urls[0],
                           user_name=_nm, username=_un)
                 pos = await self._enqueue(job)
+                if pos in (-2, -3):
+                    await _send_safe(
+                        context.bot,
+                        update.effective_chat.id,
+                        "[FAIL] queue is full; wait for a running job or cancel one with /cancel.",
+                    )
+                    return
                 job.enqueue_msg_id = await self._confirm_enqueued(context, update.effective_chat.id, urls[0], pos)
                 return
             jobs = []
             for url in urls:
                 job = Job(user_id=uid, chat_id=update.effective_chat.id, url=url,
                           user_name=_nm, username=_un)
-                await self._enqueue(job)
+                pos = await self._enqueue(job)
+                if pos in (-2, -3):
+                    continue
                 jobs.append(job)
+            if not jobs:
+                await _send_safe(
+                    context.bot,
+                    update.effective_chat.id,
+                    "[FAIL] queue is full; wait for a running job or cancel one with /cancel.",
+                )
+                return
             lines = [f"📥 <b>Queued {len(jobs)} links</b> -- resolving one by one."]
             for idx, job in enumerate(jobs, 1):
                 icon, title = _pretty_title(job.url)
@@ -4978,7 +5352,7 @@ class Bot:
     async def _post_init(self, application: "Application") -> None:
         self._app = application
         self._bot = application.bot
-        _LOG.info("bot initialized (token=...%s)", self.cfg.token[-6:])
+        _LOG.info("bot initialized")
         try:
             from xdmovies.solve_server import start_server
             await start_server()
@@ -5025,7 +5399,22 @@ class Bot:
         except Exception:
             pass
 
+    async def _stop_dispatcher(self) -> None:
+        task = self._dispatcher_task
+        self._dispatcher_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOG.exception("dispatcher shutdown failed")
+
     async def _post_stop(self, _application: "Application") -> None:
+        await self._stop_dispatcher()
         try:
             from xdmovies.autodetect import stop_autodetect
             await stop_autodetect()
@@ -5041,47 +5430,116 @@ class Bot:
             await stop_server()
         except Exception:
             pass
-        if self._dispatcher_task is not None:
-            self._dispatcher_task.cancel()
-            try:
-                await self._dispatcher_task
-            except asyncio.CancelledError:
-                pass
-            self._dispatcher_task = None
+
+    def _stop_after_reported_solve_failure(self, job: Job, error: str) -> None:
+        job.status = "cancelled" if job.cancel_event.is_set() else "error"
+        job.error = error
+        job.finished_at = time.time()
 
     async def _send_solve_link(self, chat_id: int, url: str, host: str, user_id: int):
+        token = None
         try:
-            from xdmovies.solve_server import create_session, get_public_url
+            from xdmovies.solve_server import SolveBusyError, create_session, get_public_url
             token = await create_session(url, user_id, host, chat_id)
             public_url = get_public_url(token)
             msg = await self._bot.send_message(chat_id=chat_id,
-                text=(f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\n\n"
-                      f"Link: <code>{url}</code>\n\n"
-                      f"👉 <b>Tap to solve (auto-captures, no paste):</b>\n{public_url}\n\n"
+                text=(f"🔒 <b>Cloudflare blocked</b> -- <code>{_html_escape(host)}</code>\n\n"
+                      f"Link: <code>{_html_escape(url)}</code>\n\n"
+                      f"👉 <b>Tap to solve (auto-captures, no paste):</b>\n{_html_escape(public_url)}\n\n"
                       "Open it, tap checkbox on screenshot if you see it. I’ll auto-capture and delete this message to hide VPS IP."),
                 parse_mode=ParseMode.HTML)
-            return token, msg.message_id
-        except Exception as e:
-            _LOG.warning(f"solve link failed: {e}")
+            try:
+                message_id = int(msg.message_id)
+            except (AttributeError, TypeError, ValueError):
+                message_id = None
+            return token, message_id
+        except SolveBusyError:
+            sent = await _send_safe(
+                self._bot,
+                chat_id,
+                "⏳ <b>Solve server busy</b> — all solve slots are active. Wait for the current solve to finish, then retry.",
+                parse_mode=ParseMode.HTML,
+            )
+            return None, int(getattr(sent, "message_id", sent)) if sent is not None else None
+        except asyncio.CancelledError:
+            if token:
+                try:
+                    from xdmovies.solve_server import destroy_session
+                    await destroy_session(token)
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if token:
+                try:
+                    from xdmovies.solve_server import destroy_session
+                    await destroy_session(token)
+                except Exception:
+                    pass
+            _LOG.warning(f"solve link failed: {type(exc).__name__}")
             return None, None
 
-    async def _wait_for_solve(self, token: str, timeout: float = 120.0) -> bool:
+    async def _wait_for_solve(
+        self,
+        token: str,
+        timeout: float = 120.0,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        from xdmovies.solve_server import wait_for_solve
+        solve_task = asyncio.create_task(wait_for_solve(token, timeout=timeout))
+        cancel_task = asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
+        cancelled = False
         try:
-            from xdmovies.solve_server import wait_for_solve
-            # Fix B: trust wait_for_solve's return value. The previous
-            # check `get_session(token) and get_session(token).cf_value`
-            # always returned False because wait_for_solve destroys the
-            # session in its finally block BEFORE this line runs. The
-            # cookie is already saved to disk by _poll_for_cookie before
-            # it sets sess.solved=True and calls event.set(), so the
-            # capture is durable -- we don't need to re-probe the session
-            # here. This also lets the post-solve message delete at the
-            # call sites actually fire (they were guarded by `if
-            # await self._wait_for_solve(...)`, which used to evaluate
-            # False even on success).
-            return bool(await wait_for_solve(token, timeout=timeout))
+            if cancel_task is None:
+                return bool(await solve_task)
+            done, _pending = await asyncio.wait(
+                {solve_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            cancelled = cancel_task in done and not solve_task.done()
+            if cancelled:
+                solve_task.cancel()
+            try:
+                return bool(await solve_task)
+            except asyncio.CancelledError:
+                if cancelled:
+                    return False
+                raise
+        except asyncio.CancelledError:
+            raise
         except Exception:
             return False
+        finally:
+            tasks = [solve_task] + ([cancel_task] if cancel_task is not None else [])
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _wait_for_solve_message(
+        self,
+        job: Job,
+        chat_id: int,
+        token: str,
+        message_id: Optional[int],
+        timeout: float,
+        note: str,
+    ) -> bool:
+        wait_message_id = None
+        try:
+            wait_message_id = await _send_transient_note(self._bot, chat_id, note)
+            solved = await self._wait_for_solve(token, timeout=timeout, cancel_event=job.cancel_event)
+        except BaseException:
+            from xdmovies.solve_server import destroy_session
+            await destroy_session(token)
+            raise
+        finally:
+            await _drop_msg(self._bot, chat_id, wait_message_id)
+            await _drop_msg(self._bot, chat_id, message_id)
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            job.finished_at = time.time()
+        return solved
 
     def build_application(self) -> "Application":
         if not _PTB_AVAILABLE:
@@ -5106,15 +5564,15 @@ class Bot:
         app.add_handler(CommandHandler("search", self._cmd_search))
         app.add_handler(CallbackQueryHandler(
             self._on_search_pick,
-            pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:content:(all|ep|pack)$|^search:tochan:(yes|no)$",
+            pattern=r"^search:[0-9a-f]{8}:(pick|page):\d+$|^search:[0-9a-f]{8}:(close|acceptall)$|^search:[0-9a-f]{8}:content:(all|ep|pack)$|^search:[0-9a-f]{8}:tochan:[0-9a-f]{8}:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapeall_choice,
-            pattern=r"^scrapeall:(select|resume|start):(all|movies|series)$|^scrapeall:cancel:-$",
+            pattern=r"^scrapeall:[0-9a-f]{8}:(select|resume|start):(all|movies|series)$|^scrapeall:[0-9a-f]{8}:cancel:-$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_scrapechan_choice,
-            pattern=r"^scrapechan:(select|resume|start):(all|movies|series)$|^scrapechan:cancel:-$",
+            pattern=r"^scrapechan:[0-9a-f]{8}:(select|resume|start):(all|movies|series)$|^scrapechan:[0-9a-f]{8}:cancel:-$",
         ))
         app.add_handler(CallbackQueryHandler(
             self._on_qmode_choice,
@@ -5202,13 +5660,7 @@ def main() -> None:
     """Sync entry point -- wraps `Bot.run`."""
     global _LOCK, _BOT_MAX_SESSIONS
     _LOCK = _acquire_single_instance_lock()
-    if _LOCK is None and os.name == "posix":
-        # Another LIVE bot holds the flock (kernel-managed: never stale).
-        # Refuse to start: a second poller would split Telegram updates
-        # with the running instance (commands answered by one, jobs run
-        # by the other, possibly on older code) with zero errors logged.
-        # /restart is safe: os.execv closes our non-inheritable fd first,
-        # so the new image re-acquires cleanly.
+    if _LOCK is None:
         print(
             f"another xdmovies-bot instance is already running "
             f"(lock {_LOCK_PATH} held); refusing to start a second poller. "
@@ -5217,11 +5669,10 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
-    # On Windows _LOCK is None even on success (lockfile write is the
-    # signal). We can't reliably detect a stolen instance there without
-    # psutil; assume success if the lockfile write succeeded.
     cfg = bot_config.load_config()
     bot_config.configure_logging(cfg)
+    from xdmovies.cloak_stealth import configure_session_limit
+    configure_session_limit(cfg.max_sessions)
     _BOT_MAX_SESSIONS = cfg.max_sessions
     _LOG.info(
         "config loaded: pid=%d owner=%d admin_ids=%s max_sessions=%d",
@@ -5234,13 +5685,5 @@ def main() -> None:
     try:
         bot.run()
     finally:
-        try:
-            if _LOCK is not None:
-                os.close(_LOCK)  # type: ignore[arg-type]
-        except Exception:
-            pass
-        try:
-            if os.path.isfile(_LOCK_PATH):
-                os.remove(_LOCK_PATH)
-        except OSError:
-            pass
+        if _LOCK is not None:
+            _LOCK.close()

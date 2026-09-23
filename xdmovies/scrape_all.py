@@ -1,6 +1,7 @@
 """Catalog parsing and durable progress for the /scrapeall command."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
+
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file
 
 
 CATALOG_URLS = {
@@ -29,13 +32,17 @@ def catalog_page_url(kind: str, page: int) -> str:
     return f"{base}&page={page}"
 
 
-def checkpoint_path(kind: str) -> Path:
-    return STATE_DIR / f"scrapeall_{kind}.json"
+def checkpoint_path(kind: str, route: str = "default") -> Path:
+    if route in ("", "default"):
+        return STATE_DIR / f"scrapeall_{kind}.json"
+    route_id = hashlib.sha256(route.encode("utf-8")).hexdigest()[:16]
+    return STATE_DIR / f"scrapeall_{kind}_{route_id}.json"
 
 
 @dataclass
 class ScrapeCheckpoint:
     kind: str
+    route: str = "default"
     next_page: int = 1
     completed_urls: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
@@ -45,11 +52,13 @@ class ScrapeCheckpoint:
     schema_version: int = 1
 
 
-def load_checkpoint(kind: str) -> ScrapeCheckpoint:
-    path = checkpoint_path(kind)
+def load_checkpoint(kind: str, route: str = "default") -> ScrapeCheckpoint:
+    ensure_private_directory(STATE_DIR)
+    path = checkpoint_path(kind, route)
     if not path.exists():
-        return ScrapeCheckpoint(kind=kind)
+        return ScrapeCheckpoint(kind=kind, route=route)
     try:
+        ensure_private_file(path)
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("schema_version") != 1 or data.get("kind") != kind:
             raise ValueError("incompatible scrape checkpoint")
@@ -59,15 +68,10 @@ def load_checkpoint(kind: str) -> ScrapeCheckpoint:
 
 
 def save_checkpoint(state: ScrapeCheckpoint) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(STATE_DIR)
     state.updated_at = time.time()
-    path = checkpoint_path(state.kind)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(asdict(state), handle, ensure_ascii=True, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    path = checkpoint_path(state.kind, state.route)
+    atomic_write_json(path, asdict(state), sort_keys=True)
 
 
 def has_resumable_history(state: ScrapeCheckpoint) -> bool:
@@ -95,10 +99,12 @@ def channel_path() -> Path:
 
 
 def load_channel() -> Optional[ScrapeChannel]:
+    ensure_private_directory(STATE_DIR)
     path = channel_path()
     if not path.exists():
         return None
     try:
+        ensure_private_file(path)
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("schema_version") != 1 or not int(data.get("channel_id") or 0):
             raise ValueError("incompatible scrape channel file")
@@ -108,15 +114,10 @@ def load_channel() -> Optional[ScrapeChannel]:
 
 
 def save_channel(cfg: ScrapeChannel) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(STATE_DIR)
     cfg.updated_at = time.time()
     path = channel_path()
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(asdict(cfg), handle, ensure_ascii=True, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    atomic_write_json(path, asdict(cfg), sort_keys=True)
 
 
 def _canonical_detail_url(href: str, base_url: str, kind: str) -> str | None:
@@ -162,11 +163,19 @@ def extract_catalog_urls(html: str, kind: str, base_url: str) -> list[str]:
 
 
 def extract_pagination_info(html: str) -> tuple[int, int] | None:
-    match = re.search(
-        r"PAGINATION_INFO\s*=\s*\{[^}]*currentPage\s*:\s*(\d+)[^}]*totalPages\s*:\s*(\d+)",
+    block = re.search(
+        r"PAGINATION_INFO\s*=\s*\{([^}]*)\}",
         html or "",
         re.IGNORECASE,
     )
-    if not match:
+    if not block:
         return None
-    return int(match.group(1)), int(match.group(2))
+    current = re.search(r"\bcurrentPage\s*:\s*(\d+)", block.group(1), re.IGNORECASE)
+    total = re.search(r"\btotalPages\s*:\s*(\d+)", block.group(1), re.IGNORECASE)
+    if not current or not total:
+        return None
+    current_page = int(current.group(1))
+    total_pages = int(total.group(1))
+    if current_page < 1 or total_pages < current_page:
+        return None
+    return current_page, total_pages

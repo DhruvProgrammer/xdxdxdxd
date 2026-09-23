@@ -39,28 +39,10 @@ def _catalog_url(feed: str) -> str:
 
 
 async def _collect_live_urls_async(bot) -> set:
-    out: set = set()
     try:
-        cur = getattr(bot, "current", None)
-        if cur is not None and getattr(cur, "url", ""):
-            out.add(cur.url)
+        return await bot._snapshot_live_urls()
     except Exception:
-        pass
-    try:
-        if hasattr(bot, "_snapshot_queue"):
-            for j in (await bot._snapshot_queue()) or []:
-                if getattr(j, "url", ""):
-                    out.add(j.url)
-    except Exception:
-        pass
-    try:
-        if hasattr(bot, "_snapshot_urgent"):
-            for j in (await bot._snapshot_urgent()) or []:
-                if getattr(j, "url", ""):
-                    out.add(j.url)
-    except Exception:
-        pass
-    return out
+        return set()
 
 
 async def _check_once(bot) -> tuple[List[str], str]:
@@ -81,7 +63,7 @@ async def _check_once(bot) -> tuple[List[str], str]:
     cid = getattr(ch, "channel_id", 0) if ch else 0
     if not cid:
         logger.info("[autodetect] ON but no channel preset — skipping tick")
-        store.touch_check(0)
+        await asyncio.to_thread(store.touch_check, 0)
         return [], "no_channel"
 
     feed = store.get_feed()
@@ -102,73 +84,76 @@ async def _check_once(bot) -> tuple[List[str], str]:
             try:
                 from xdmovies.cookie_store import CFChallengeError  # noqa: F401
                 owner = getattr(getattr(bot, "cfg", None), "owner_id", 0)
-                token, _m = await bot._send_solve_link(
+                token, message_id = await bot._send_solve_link(
                     owner, getattr(exc, "url", "") or url, "xdmovies.wtf", owner
                 )
-                if token and await bot._wait_for_solve(token, timeout=120.0):
+                solved = False
+                if token:
+                    from xdmovies.bot import _drop_msg
+                    try:
+                        solved = await bot._wait_for_solve(token, timeout=120.0)
+                    finally:
+                        await _drop_msg(bot._bot, owner, message_id)
+                if solved:
                     html = await fetch_rendered_html(url, session_id="autodetect", headless=False)
                     page_urls = extract_catalog_urls(html, feed, url)
                 else:
-                    store.touch_check(0)
+                    await asyncio.to_thread(store.touch_check, 0)
                     return [], "cf_unsolved"
             except Exception as e2:
                 logger.warning(f"[autodetect] CF solve retry failed: {e2}")
-                store.touch_check(0)
+                await asyncio.to_thread(store.touch_check, 0)
                 return [], "cf_error"
         else:
             logger.warning(f"[autodetect] catalog fetch failed: {name}: {exc}")
-            store.touch_check(0)
+            await asyncio.to_thread(store.touch_check, 0)
             return [], f"fetch_{name}"
 
     if first_run:
         # Baseline: everything currently listed counts as already-seen.
-        store.add_seen(page_urls)
-        store.touch_check(0)
+        await asyncio.to_thread(store.add_seen, page_urls)
+        await asyncio.to_thread(store.touch_check, 0)
         logger.info(f"[autodetect] baseline seeded with {len(page_urls)} urls (feed={feed})")
         return [], "baselined"
 
     live = await _collect_live_urls_async(bot)
     new_urls = [u for u in page_urls if u not in seen and u not in live]
     new_urls = new_urls[:MAX_NEW_PER_TICK]
-    if new_urls:
-        store.add_seen(new_urls)  # mark seen at enqueue time (no re-queue on crash)
-    store.touch_check(len(new_urls))
+    await asyncio.to_thread(store.touch_check, 0)
     return new_urls, "new" if new_urls else "clean"
 
 
-def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int,
-                  card_filter: str = "all") -> None:
-    """Build one silent channel Job per URL and push to the queue.
-
-    Fire-and-forget via asyncio.create_task on the running loop's _enqueue.
-    Reuses the scrape_all child pattern: post_to_channel + silent=True
-    skips qmode/dmode pickers and progress chatter; batch posts to channel.
-    card_filter ("all" | "episodes" | "packs") narrows series cards via
-    the existing extractor.filter_cards_by_content path in _run_for_user.
-    """
+async def _enqueue_jobs(bot, urls: List[str], channel_id: int, owner_id: int,
+                        card_filter: str = "all") -> tuple[List[str], List[str]]:
     try:
-        from xdmovies.bot import Job  # local import to avoid cycle at module load
+        from xdmovies.bot import Job
     except Exception:
-        Job = None
-    if Job is None or not urls:
-        return
+        return [], list(urls or [])
     if card_filter not in ("all", "episodes", "packs"):
         card_filter = "all"
-    for u in urls:
+    enqueued: List[str] = []
+    already_active: List[str] = []
+    for url in urls or []:
         try:
             job = Job(
                 user_id=owner_id,
-                chat_id=channel_id,
-                url=u,
+                chat_id=owner_id,
+                url=url,
                 user_name="autodetect",
                 username="",
                 post_to_channel=channel_id,
                 silent=True,
                 card_filter=card_filter,
+                scrape_route=f"channel:{channel_id}",
             )
-            asyncio.get_running_loop().create_task(bot._enqueue(job))
-        except Exception as e:
-            logger.warning(f"[autodetect] enqueue failed for {u}: {e}")
+            position = await bot._enqueue(job, dedupe=True)
+            if position == -1:
+                already_active.append(url)
+            elif position >= 0:
+                enqueued.append(url)
+        except Exception as exc:
+            logger.warning(f"[autodetect] enqueue failed for {url}: {exc}")
+    return enqueued, already_active
 
 
 async def _loop(bot) -> None:
@@ -190,6 +175,7 @@ async def _loop(bot) -> None:
                 except Exception:
                     cid = 0
                 owner = getattr(getattr(bot, "cfg", None), "owner_id", 0)
+                from xdmovies import autodetect_store as store
                 # Series content filter (all / episodes / packs) applies to
                 # the series and all feeds. Movies resolve fully either way:
                 # movie cards are "custom" kind, which the filter always
@@ -200,9 +186,15 @@ async def _loop(bot) -> None:
                 except Exception:
                     cf = "all"
                 if cid:
-                    _enqueue_jobs(bot, urls, cid, owner, card_filter=cf)
+                    enqueued, already_active = await _enqueue_jobs(
+                        bot, urls, cid, owner, card_filter=cf
+                    )
+                    handled = enqueued + already_active
+                    if handled:
+                        await asyncio.to_thread(store.add_seen, handled)
                     logger.info(
-                        f"[autodetect] enqueued {len(urls)} new url(s) "
+                        f"[autodetect] enqueued {len(enqueued)} new url(s), "
+                        f"active {len(already_active)} "
                         f"-> channel {cid} ({reason}, content={cf})"
                     )
             elif reason not in ("off", "clean", "baselined"):

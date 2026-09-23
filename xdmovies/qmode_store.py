@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Dict
 
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file, update_json
+
 STATE_DIR = Path(__file__).resolve().parent.parent / "xdmovies_state"
 _QMODE_PATH = STATE_DIR / "qmode.json"
 _SCHEMA = 1
@@ -25,8 +27,10 @@ _SCHEMA = 1
 def _load() -> Dict[int, bool]:
     """user_id -> True (ON). Never raises; anything unreadable is OFF."""
     try:
+        ensure_private_directory(STATE_DIR)
         if not _QMODE_PATH.exists():
             return {}
+        ensure_private_file(_QMODE_PATH)
         data = json.loads(_QMODE_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
             return {}
@@ -47,18 +51,13 @@ def _load() -> Dict[int, bool]:
 
 
 def _save(users: Dict[int, bool]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(STATE_DIR)
     payload = {
         "schema_version": _SCHEMA,
         "users": {str(uid): True for uid in sorted(users)},
         "updated_at": time.time(),
     }
-    tmp = _QMODE_PATH.with_suffix(_QMODE_PATH.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, _QMODE_PATH)
+    atomic_write_json(_QMODE_PATH, payload, sort_keys=True)
 
 
 def is_qmode_on(user_id: int) -> bool:
@@ -70,18 +69,23 @@ def is_qmode_on(user_id: int) -> bool:
 
 
 def set_qmode(user_id: int, on: bool) -> bool:
-    """Persist the choice. Returns the stored value. Never raises."""
-    try:
-        uid = int(user_id)
-    except (TypeError, ValueError):
-        return False
-    try:
-        users = _load()
+    """Persist the choice. Returns the stored value."""
+    uid = int(user_id)
+
+    def apply(data):
+        if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
+            data = {}
+        users = data.get("users")
+        if not isinstance(users, dict):
+            users = {}
         if on:
-            users[uid] = True
+            users[str(uid)] = True
         else:
-            users.pop(uid, None)
-        _save(users)
-        return bool(on)
-    except Exception:
-        return False
+            users.pop(str(uid), None)
+        data["schema_version"] = _SCHEMA
+        data["users"] = {str(key): True for key, value in users.items() if value is True}
+        data["updated_at"] = time.time()
+        return data
+
+    update_json(_QMODE_PATH, apply, {}, sort_keys=True)
+    return bool(on)

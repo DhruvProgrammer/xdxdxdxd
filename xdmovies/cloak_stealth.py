@@ -33,9 +33,12 @@ to keep the binary in a stable location across systemd unit restarts.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Dict, Optional
 
+from xdmovies.bot_config import ensure_private_directory
+from xdmovies.browser_runtime import close_browser_objects
 from xdmovies.logger_utils import logger
 
 
@@ -71,10 +74,8 @@ except Exception as exc:  # pragma: no cover - import-time guard
 def _std_args(useragent: Optional[str]) -> list[str]:
     args: list[str] = [
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
         "--disable-infobars",
         "--disable-dev-shm-usage",
-        "--no-sandbox",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-extensions",
@@ -117,84 +118,135 @@ def _translate_proxy(proxy: Optional[Dict[str, Any]]) -> Optional[str]:
 # Adapter so call sites can keep the `browser.new_context()` shape
 # ---------------------------------------------------------------------------
 
+
+def _configured_max_sessions() -> int:
+    try:
+        return max(1, int(os.getenv("XDMOVIES_MAX_SESSIONS", "8").strip() or "8"))
+    except ValueError:
+        return 8
+
+
+_MAX_SESSIONS = _configured_max_sessions()
+_SESSION_SEMAPHORE = asyncio.Semaphore(_MAX_SESSIONS)
+_ACTIVE_SESSIONS = 0
+
+
+def configure_session_limit(max_sessions: int) -> None:
+    global _MAX_SESSIONS, _SESSION_SEMAPHORE, _ACTIVE_SESSIONS
+    value = max(1, int(max_sessions))
+    if value == _MAX_SESSIONS:
+        return
+    if _ACTIVE_SESSIONS:
+        raise RuntimeError("cannot change XDMOVIES_MAX_SESSIONS while browser sessions are active")
+    _MAX_SESSIONS = value
+    _SESSION_SEMAPHORE = asyncio.Semaphore(value)
+
+
+async def _acquire_session_slot() -> None:
+    global _ACTIVE_SESSIONS
+    await _SESSION_SEMAPHORE.acquire()
+    _ACTIVE_SESSIONS += 1
+
+
+def _release_session_slot() -> None:
+    global _ACTIVE_SESSIONS
+    if _ACTIVE_SESSIONS <= 0:
+        return
+    _ACTIVE_SESSIONS -= 1
+    _SESSION_SEMAPHORE.release()
+
+
 class _CloakBrowserAdapter:
-    """Wraps a CloakBrowser Browser and re-exposes new_context()/close()
-    using CloakBrowser's launch_context_async for context creation.
-
-    CloakBrowser's Browser already has a default context, so we use the
-    simpler flow:
-      - browser.new_page()  → returns a Page from the default context
-      - browser.new_context(...) → calls launch_context_async() internally
-                                  (creates a new browser+context, then closes
-                                   the original browser to avoid leaks)
-      - browser.close()    → closes the underlying browser
-
-    Most of our call sites use new_page() directly on the default context,
-    which is exactly what CloakBrowser is designed for. The few that need
-    a custom context (UA, viewport) use new_context().
-    """
-
-    def __init__(self, browser: Any, proxy_url: Optional[str], headless: bool, useragent: Optional[str], humanize: bool, geoip: bool):
-        self._browser = browser
+    def __init__(self, launch_kwargs: Dict[str, Any], proxy_url: Optional[str], headless: bool, useragent: Optional[str], humanize: bool, geoip: bool):
+        self._browser = None
+        self._launch_kwargs = launch_kwargs
         self._proxy_url = proxy_url
         self._headless = headless
         self._useragent = useragent
         self._humanize = humanize
         self._geoip = geoip
-        self._extra_contexts: list = []  # additional contexts we created
+        self._released = False
+        self._proxy_checked = False
+
+    async def _probe_proxy(self) -> None:
+        if self._proxy_checked:
+            return
+        self._proxy_checked = True
+        if not self._proxy_url:
+            return
+        try:
+            import aiohttp
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("https://api.ipify.org", proxy=self._proxy_url) as response:
+                    exit_ip = (await response.text()).strip()
+                    logger.info(f"cloak_stealth: Chromium exit IP = {exit_ip} (via {self._proxy_url})")
+        except Exception as exc:
+            logger.debug(f"cloak_stealth: exit-IP probe failed ({exc!r})")
+
+    async def _ensure_browser(self) -> Any:
+        if self._browser is not None:
+            return self._browser
+        try:
+            self._browser = await cloakbrowser.launch_async(**self._launch_kwargs)
+            await self._probe_proxy()
+            return self._browser
+        except BaseException:
+            self._browser = None
+            if not self._released:
+                self._released = True
+                _release_session_slot()
+            raise
 
     async def new_context(self, **kwargs) -> Any:
-        """Create a new context. CloakBrowser's launch_context_async creates
-        a brand-new browser+context. We close our original browser first
-        to avoid two Chromium processes running simultaneously.
-        """
-        # Pull kwargs the wrapper already knows about; pass the rest through.
         from cloakbrowser import launch_context_async
-        # Strip non-Playwright kwargs that CloakBrowser doesn't accept.
-        # IMPORTANT: pop `viewport` exactly once and pass it explicitly.
-        # The previous code did `kwargs.pop('viewport', None)` then
-        # `kwargs.setdefault('viewport', viewport)`, which produced
-        # `TypeError: got multiple values for keyword argument 'viewport'`
-        # at launch_context_async time (audit finding C1).
         user_agent = kwargs.pop("user_agent", None) or self._useragent
         viewport = kwargs.pop("viewport", None)
-        # Build args list — merge our std args with any caller's.
-        std = _std_args(user_agent)
         extra_args = kwargs.pop("args", None) or []
-        # Use a fresh browser for the context (CloakBrowser's design).
-        # Close the current browser first to avoid resource bloat.
         try:
-            await self._browser.close()
-        except Exception:
-            pass
-        new_browser = await launch_context_async(
-            headless=self._headless,
-            proxy=self._proxy_url,
-            args=std + extra_args,
-            user_agent=user_agent,
-            viewport=viewport,
-            humanize=self._humanize,
-            geoip=self._geoip,
-            **kwargs,
-        )
-        # Replace the inner browser so subsequent new_page() / close() work.
-        self._browser = new_browser
-        return new_browser
+            if self._browser is not None:
+                await close_browser_objects([self._browser], timeout=10.0)
+                self._browser = None
+            self._browser = await launch_context_async(
+                headless=self._headless,
+                proxy=self._proxy_url,
+                args=_std_args(user_agent) + extra_args,
+                user_agent=user_agent,
+                viewport=viewport,
+                humanize=self._humanize,
+                geoip=self._geoip,
+                **kwargs,
+            )
+            await self._probe_proxy()
+            return self._browser
+        except BaseException:
+            self._browser = None
+            if not self._released:
+                self._released = True
+                _release_session_slot()
+            raise
 
     async def new_page(self, **kwargs) -> Any:
-        """Open a new page in the default context. Most call sites use this.
-        CloakBrowser's Browser has a default context with new_page() built in.
-        """
-        # Pass through any kwargs (e.g. viewport) to the underlying new_page.
-        return await self._browser.new_page(**kwargs)
+        browser = await self._ensure_browser()
+        try:
+            return await browser.new_page(**kwargs)
+        except BaseException:
+            self._browser = None
+            if not self._released:
+                self._released = True
+                _release_session_slot()
+            raise
 
     async def close(self) -> None:
         try:
-            await self._browser.close()
-        except Exception as e:
-            logger.debug(f"cloak_stealth: browser.close() raised: {e!r}")
+            if self._browser is not None:
+                await close_browser_objects([self._browser], timeout=10.0)
+        finally:
+            self._browser = None
+            if not self._released:
+                self._released = True
+                _release_session_slot()
 
-    # Some callers may iterate contexts (rare). Forward that too.
     @property
     def contexts(self):
         return getattr(self._browser, "contexts", [])
@@ -202,6 +254,24 @@ class _CloakBrowserAdapter:
     @property
     def pages(self):
         return getattr(self._browser, "pages", [])
+
+
+class _SessionContextProxy:
+    def __init__(self, context: Any):
+        self._context = context
+        self._released = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._context, name)
+
+    async def close(self) -> None:
+        try:
+            await close_browser_objects([self._context], timeout=10.0)
+        finally:
+            self._context = None
+            if not self._released:
+                self._released = True
+                _release_session_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -267,30 +337,10 @@ async def launch_chromium(
             "CloakBrowser only ships Chromium. Using chromium."
         )
 
-    # Direct IP launch (no VPN). The bot connects from the VPS IP
-    # directly; Cloudflare's datacenter-ASN fingerprinting will reduce
-    # success rate on /solve flows. Trade simplicity for reliability.
-
     proxy_url = _translate_proxy(proxy)
     args = _std_args(useragent)
-
-    logger.info(
-        f"cloak_stealth: launch (headless={headless}, ua={'set' if useragent else 'default'}, "
-        f"proxy={proxy_url or 'direct'}, humanize={humanize}, geoip={geoip})"
-    )
-
-    # CloakBrowser's launch_async is the async version that returns a Browser.
-    # We use this even for the default-context flow (no new_context) so the
-    # returned object has new_page() built in.
-    #
-    # Note: do NOT pass `user_agent` here. cloakbrowser 0.5.8's
-    # `launch_async` accepts the same kwargs as Playwright's
-    # `BrowserType.launch` (headless, proxy, args, channel, etc.) but
-    # not `user_agent` — that's a BrowserContext kwarg. The adapter's
-    # `new_context(**kwargs)` already routes `user_agent=...` to
-    # `cloakbrowser.launch_context_async`, which is the correct path.
-    # Setting a default UA via `--user-agent=...` Chromium arg is the
-    # fallback if callers don't pass one at the context level.
+    if useragent:
+        args = list(args) + [f"--user-agent={useragent}"]
     launch_kwargs = dict(
         headless=headless,
         proxy=proxy_url,
@@ -298,27 +348,15 @@ async def launch_chromium(
         humanize=humanize,
         geoip=geoip,
     )
-    if useragent:
-        # Inject the UA as a Chromium arg. CloakBrowser passes `args`
-        # through to Chromium's command line, where --user-agent=...
-        # sets the default UA for all contexts that don't override it.
-        launch_kwargs["args"] = list(args) + [f"--user-agent={useragent}"]
-    browser = await cloakbrowser.launch_async(**launch_kwargs)
 
-    # One-shot exit-IP check: prove in the logs that Chromium is actually
-    # going through the proxy. Best-effort, never blocks launch.
-    if proxy_url:
-        try:
-            import aiohttp  # already in requirements for solve_server
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get("https://api.ipify.org", proxy=proxy_url) as r:
-                    exit_ip = (await r.text()).strip()
-                    logger.info(f"cloak_stealth: Chromium exit IP = {exit_ip} (via {proxy_url})")
-        except Exception as e:
-            logger.debug(f"cloak_stealth: exit-IP probe failed ({e!r})")
+    await _acquire_session_slot()
+    logger.info(
+        f"cloak_stealth: launch (headless={headless}, ua={'set' if useragent else 'default'}, "
+        f"proxy={proxy_url or 'direct'}, humanize={humanize}, geoip={geoip}, "
+        f"active={_ACTIVE_SESSIONS}/{_MAX_SESSIONS})"
+    )
     return _CloakBrowserAdapter(
-        browser=browser,
+        launch_kwargs=launch_kwargs,
         proxy_url=proxy_url,
         headless=headless,
         useragent=useragent,
@@ -351,7 +389,7 @@ async def launch_persistent_chromium(
     proxy_url = _translate_proxy(proxy)
     args = _std_args(useragent)
     user_data_dir = os.path.expanduser(user_data_dir)
-    os.makedirs(user_data_dir, exist_ok=True)
+    ensure_private_directory(user_data_dir)
 
     logger.info(
         f"cloak_stealth: launch_persistent (user_data_dir={user_data_dir}, "
@@ -360,16 +398,21 @@ async def launch_persistent_chromium(
     )
 
     from cloakbrowser import launch_persistent_context_async
-    ctx = await launch_persistent_context_async(
-        user_data_dir=user_data_dir,
-        headless=headless,
-        proxy=proxy_url,
-        user_agent=useragent,
-        args=args,
-        humanize=humanize,
-        geoip=geoip,
-    )
-    return ctx
+    await _acquire_session_slot()
+    try:
+        ctx = await launch_persistent_context_async(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            proxy=proxy_url,
+            user_agent=useragent,
+            args=args,
+            humanize=humanize,
+            geoip=geoip,
+        )
+        return _SessionContextProxy(ctx)
+    except BaseException:
+        _release_session_slot()
+        raise
 
 
 __all__ = [
@@ -377,4 +420,5 @@ __all__ = [
     "launch_persistent_chromium",
     "cloak_available",
     "cloak_version",
+    "configure_session_limit",
 ]

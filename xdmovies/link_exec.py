@@ -11,13 +11,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
 import re
 import sys
 import time
 from typing import Dict, Optional, Tuple
 
 from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, _normalize_domain, set_cookies_for_domain
-from xdmovies.browser_stealth import is_chromium_family, stealth_plugin
+from xdmovies.browser_stealth import apply_gate_context_init_scripts
+from xdmovies.browser_runtime import (
+    GATE_HOST,
+    UnsafeDestinationError,
+    close_browser_objects,
+    is_ad_url,
+    is_cf_challenge_page,
+    is_destination_url,
+    is_gate_transit,
+    url_host,
+    validate_destination_url,
+)
 
 import os
 
@@ -31,19 +43,9 @@ import os
 INNER_TURNSTILE_NUDGE = os.environ.get("XDMOVIES_INNER_NUDGE", "1").lower() not in ("0", "false", "no")
 INNER_TURNSTILE_NUDGE_WAIT = float(os.environ.get("XDMOVIES_INNER_NUDGE_WAIT", "30") or "30")
 
-GATE_HOST = "latestnewsonline.sbs"
-
-DEST_HOST_HINTS = (
-    "hubcloud", "hubdrive", "gdflix", "gofile", "vcloud",
-    "drive.google", "fdrive", "ddl", "faststream", "gamerxyt",
-)
-
-# Hub details cache: url -> (final_url, title, size, timestamp).
-# The browser flows already load hub pages behind CF; parsing the loaded
-# DOM and sharing it here beats a separate HTTPS fetch that a datacenter
-# IP cannot complete. 1h TTL; best-effort, never raises.
-_HUB_DETAILS_CACHE: Dict[str, Tuple[str, str, str, float]] = {}
+_HUB_DETAILS_CACHE: "OrderedDict[str, Tuple[str, str, str, float]]" = OrderedDict()
 _HUB_CACHE_TTL = 3600.0
+_HUB_CACHE_MAX_ENTRIES = 256
 
 
 def note_hub_details(url: str, final_url: str = "", title: str = "", size: str = "") -> None:
@@ -53,12 +55,14 @@ def note_hub_details(url: str, final_url: str = "", title: str = "", size: str =
         if not final_url and not title:
             return
         _HUB_DETAILS_CACHE[url] = (final_url or "", title or "", size or "", time.time())
+        _HUB_DETAILS_CACHE.move_to_end(url)
+        while len(_HUB_DETAILS_CACHE) > _HUB_CACHE_MAX_ENTRIES:
+            _HUB_DETAILS_CACHE.popitem(last=False)
     except Exception:
         pass
 
 
 def get_hub_details(url: str):
-    """(final_url, title, size) or None. Fresh entries only."""
     try:
         e = _HUB_DETAILS_CACHE.get(url or "")
         if not e:
@@ -66,53 +70,16 @@ def get_hub_details(url: str):
         if time.time() - e[3] > _HUB_CACHE_TTL:
             _HUB_DETAILS_CACHE.pop(url, None)
             return None
+        _HUB_DETAILS_CACHE.move_to_end(url)
         return e[0], e[1], e[2]
     except Exception:
         return None
 
-# Hosts that are NEVER destinations (ad networks / CPA landers observed
-# in the wild). Checked first: a substring hit on a dest hint inside an
-# ad URL must never promote an ad tab/link (e.g. "pureddl" tripping the
-# "ddl" hint in a glovefork.info CPA URL sent users an ad instead of the
-# movie link).
-AD_HOST_HINTS = (
-    "glovefork.info",
-    "getsmartyapp.com",
-    "aichouphaugn.com",
-    "crn77.com",
-    "dd133.com",
-    "aqle3.com",
-    "d2n5v45616cm6u.cloudfront.net",
-    "sootoarathus.net",
-)
 
-def _url_host(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url or "").hostname or "").lower()
-    except Exception:
-        return ""
-
-def _is_ad_url(url: str) -> bool:
-    h = _url_host(url)
-    if not h:
-        return False
-    return any(h == a or h.endswith("." + a) for a in AD_HOST_HINTS)
-
-def _is_destination_url(url: str) -> bool:
-    """Host-based destination check -- never full-URL substring.
-
-    Matching the whole URL lets query junk promote ads (e.g. "pureddl"
-    in a CPA lander tripping the "ddl" hint). Host-only matching plus
-    the ad-host blocklist above keeps ad tabs/links out of results.
-    """
-    h = _url_host(url)
-    if not h:
-        return False
-    if _is_ad_url(url):
-        return False
-    return any(x in h for x in DEST_HOST_HINTS)
-
+_url_host = url_host
+_is_ad_url = is_ad_url
+_is_destination_url = is_destination_url
+_is_gate_transit = is_gate_transit
 
 async def fetch_hub_details(url: str, timeout: float = 12.0):
     """Cheap static read of a hub drive page (no browser).
@@ -125,7 +92,7 @@ async def fetch_hub_details(url: str, timeout: float = 12.0):
     """
     try:
         h = _url_host(url or "")
-        if not h or ("hubcloud" not in h and "hubdrive" not in h):
+        if not h or not (h == "hubcloud.one" or h.endswith(".hubcloud.one") or h == "hubdrive.click" or h.endswith(".hubdrive.click") or h == "hubdrive.pro" or h.endswith(".hubdrive.pro")):
             return None
         try:
             import httpx
@@ -164,6 +131,7 @@ async def fetch_hub_details(url: str, timeout: float = 12.0):
         d = extract_hub_details(html)
         if not d.final_url and not d.title:
             return None
+        note_hub_details(url, d.final_url, d.title, d.size)
         return d
     except Exception:
         return None
@@ -180,36 +148,14 @@ async def resolve_hub_details(url: str):
         d = await fetch_hub_details(url)
     except Exception:
         d = None
+    if not _is_destination_url(url):
+        return "", "", ""
     if not d:
         return url, "", ""
     final = (d.final_url or "").strip()
     if final and final != url and _is_destination_url(final) and not _is_ad_url(final):
         return final, d.title, d.size
     return url, d.title, d.size
-
-ANTI_AD_INIT_SCRIPT = r"""
-(() => {
-    if (window.__adNeutralized) return;
-    window.__adNeutralized = true;
-    const noop = function () { return null; };
-    try {
-        Object.defineProperty(window, 'open', { configurable: false, writable: false, value: noop });
-    } catch (e) { window.open = noop; }
-    try {
-        const realAssign = window.location.assign.bind(window.location);
-        const realReplace = window.location.replace.bind(window.location);
-        const isSafe = (url) => {
-            try { const u = new URL(url, window.location.href); return u.origin === window.location.origin; } catch (e) { return false; }
-        };
-        window.location.assign = function (url) { if (isSafe(url)) return realAssign(url); return null; };
-        window.location.replace = function (url) { if (isSafe(url)) return realReplace(url); return null; };
-    } catch (e) {}
-    window.addEventListener('beforeunload', function (e) {
-        try { Object.defineProperty(e, 'returnValue', { get: function () { return undefined; } }); } catch (_) {}
-        e.preventDefault();
-    }, true);
-})();
-"""
 
 async def _wait_for_ad_impressions(page, max_wait: float = 8.0) -> None:
     deadline = time.time() + max_wait + 3.0
@@ -335,7 +281,9 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
         session_body = None
         _posted = {}
         _clicked = False
-        # --- 1. Best-effort capture of the page's own session POST ---
+        _trusted_attempted = False
+        _response_observed = False
+        _resp = None
         try:
             def _is_session_create(r):
                 try:
@@ -348,27 +296,19 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
 
             try:
                 async with page.expect_response(_is_session_create, timeout=20000) as _resp_info:
-                    _clicked = await _synthetic_click(page, "#generateBtn")
+                    _clicked = bool(await _synthetic_click(page, "#generateBtn"))
                     if not _clicked:
-                        _clicked = await _real_click(page, "#generateBtn", max_wait=5.0)
-                    if not _clicked:
-                        print("[link_exec] rebind skip: Generate click failed (capture path)")
+                        _clicked = bool(await _real_click(page, "#generateBtn", max_wait=5.0))
+                        _trusted_attempted = True
+                _resp = await _resp_info.value
             except Exception as exc:
-                # expect_response itself unsupported/timed-out on this
-                # adapter -- fall through to plain click + dummy rebind.
-                print(f"[link_exec] rebind skip: capture wait miss ({exc!r}) -- will try dummy")
-            try:
-                _resp = await _resp_info.value  # type: ignore[possibly-unbound]
-            except Exception as exc:
-                _resp = None
-                print(f"[link_exec] rebind skip: session response unreadable ({exc!r})")
+                print(f"[link_exec] rebind skip: capture wait miss ({exc!r}) -- will try fallback")
             if _resp is not None:
+                _response_observed = True
                 try:
                     session_body = await _resp.json()
                 except Exception:
                     session_body = None
-                # post_data has 3 spellings across Playwright versions /
-                # CloakBrowser adapter -- try them all.
                 _post_raw = None
                 try:
                     _req = getattr(_resp, "request", None)
@@ -398,15 +338,21 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
         except Exception as exc:
             print(f"[link_exec] rebind skip: capture block miss ({exc!r}) -- will try dummy")
 
-        # Ensure at least one Generate click happened (creates the server
-        # session even if our capture missed it).
-        if not _clicked:
+        if not _response_observed and _clicked and not _trusted_attempted:
             try:
-                _clicked = await _synthetic_click(page, "#generateBtn")
-                if not _clicked:
-                    _clicked = await _real_click(page, "#generateBtn", max_wait=5.0)
+                _clicked = bool(await _real_click(page, "#generateBtn", max_wait=5.0)) or _clicked
             except Exception:
                 pass
+        if not _clicked:
+            try:
+                _clicked = bool(await _synthetic_click(page, "#generateBtn"))
+            except Exception:
+                pass
+        try:
+            await _close_ad_popups(ctx, page)
+        except Exception:
+            pass
+
         try:
             await _close_ad_popups(ctx, page)
         except Exception:
@@ -700,73 +646,67 @@ async def _wait_visible(page, selector: str, max_wait: float = 12.0) -> bool:
         await asyncio.sleep(0.4)
     return False
 
-async def _nuke_overlays_stacking_on(page, selector: str) -> None:
-    try:
-        killed = await page.evaluate(r"""(sel) => {
-                const b = document.querySelector(sel);
-                if (!b) return {error: 'not_found'};
-                const r = b.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return {error: 'no_box'};
-                const cx = r.x + r.width / 2; const cy = r.y + r.height / 2;
-                const els = (document.elementsFromPoint ? document.elementsFromPoint(cx, cy) : []);
-                let idx = -1;
-                for (let i = 0; i < els.length; i++) { if (els[i] === b || b.contains(els[i])) { idx = i; break; } }
-                if (idx <= 0) return {killed: 0, skipped: els.length};
-                let count = 0;
-                for (let i = 0; i < idx; i++) {
-                    const e = els[i];
-                    const tag = (e.tagName || '').toLowerCase();
-                    if (tag === 'html' || tag === 'body' || tag === 'head') continue;
-                    if (e.contains && e.contains(b)) continue;
-                    try { e.style.setProperty('pointer-events', 'none', 'important'); e.style.setProperty('display', 'none', 'important'); count++; } catch (_) {}
-                }
-                return {killed: count, total_above: idx};
-            }""", selector)
-    except Exception:
-        return
-    if not killed or killed.get("error") or killed.get("killed") == 0:
-        return
-    await asyncio.sleep(0.15)
-
-async def _real_click(page, selector: str, max_wait: float = 12.0) -> bool:
-    """Click a selector with overlay-nuking + synthetic-click fallback.
-
-    The latestnewsonline.sbs gate stacks ad iframes over the Generate /
-    Continue / Go buttons. A vanilla `page.mouse.click()` at the button's
-    bounding-box center can land on the iframe ad and miss the button
-    entirely -- the click is registered but the gate never sees it, so
-    the counter doesn't decrement and Continue never appears.
-
-    Two safeguards:
-      1. Nuke every element stacked above the target button at its
-         center point (set pointer-events:none + display:none) BEFORE
-         computing the click coordinates.
-      2. After the mouse click, dispatch a synthetic mousedown/mouseup/
-         click event sequence on the button as a fallback for the rare
-         case the mouse click still missed.
-    """
+async def _click_gate_button(
+    page,
+    ctx,
+    selector: str,
+    effect_js: str,
+    max_wait: float = 12.0,
+    effect_wait: float = 3.0,
+) -> tuple:
+    if not await _wait_visible(page, selector, max_wait=max_wait):
+        return False, None
+    await _synthetic_click(page, selector)
+    deadline = time.time() + max(0.0, effect_wait)
+    while True:
+        dest = await _close_ad_popups(ctx, page)
+        if dest:
+            return True, dest
+        try:
+            if await page.evaluate(effect_js):
+                return True, None
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            break
+        await asyncio.sleep(0.35)
     try:
         loc = page.locator(selector)
-        await loc.wait_for(state="visible", timeout=int(max_wait * 1000))
+        await loc.wait_for(state="visible", timeout=int(max(2.0, max_wait) * 1000))
         try:
             await page.bring_to_front()
         except Exception:
             pass
-        await _nuke_overlays_stacking_on(page, selector)
         box = await loc.bounding_box()
-        if not box:
-            return await _synthetic_click(page, selector)
-        cx = box["x"] + box["width"] / 2
-        cy = box["y"] + box["height"] / 2
+        if box:
+            await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
+            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=120)
+    except Exception:
+        pass
+    deadline = time.time() + max(0.0, effect_wait)
+    while True:
+        dest = await _close_ad_popups(ctx, page)
+        if dest:
+            return True, dest
         try:
-            await page.mouse.move(cx, cy, steps=4)
-            await page.mouse.click(cx, cy, delay=120)
+            if await page.evaluate(effect_js):
+                return True, None
         except Exception:
             pass
-        # Synthetic fallback: dispatches a click event the page's
-        # socket.io handler WILL see even if the mouse click was eaten
-        # by a residual overlay.
-        await _synthetic_click(page, selector)
+        if time.time() >= deadline:
+            break
+        await asyncio.sleep(0.35)
+    return False, None
+
+
+async def _real_click(page, selector: str, max_wait: float = 12.0) -> bool:
+    try:
+        loc = page.locator(selector)
+        await loc.wait_for(state="visible", timeout=int(max_wait * 1000))
+        box = await loc.bounding_box()
+        if not box:
+            return False
+        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=120)
         return True
     except Exception:
         return False
@@ -976,7 +916,13 @@ async def _solve_inner_turnstile_with_nudge(page, ctx, short_link_url: str, max_
                     print(f"[link_exec] inner-turnstile captured fresh cf_clearance ({len(v)} chars)")
                     try:
                         ua = get_user_agent_for_url(short_link_url)
-                        set_cookies_for_domain(GATE_HOST, f"cf_clearance={v}", user_agent=ua)
+                        await asyncio.to_thread(
+                            set_cookies_for_domain,
+                            GATE_HOST,
+                            f"cf_clearance={v}",
+                            user_agent=ua,
+                        )
+
                         print(f"[link_exec] saved cf_clearance for host={GATE_HOST}")
                     except Exception as exc:
                         print(f"[link_exec] cookie_store save failed (non-fatal): {exc!r}")
@@ -1038,12 +984,6 @@ async def _extract_destination(page, ctx=None) -> Optional[str]:
         href = (item.get("href") or "")
         if _is_destination_url(href):
             return href
-    for item in hrefs:
-        href = (item.get("href") or "")
-        text = (item.get("text") or "").lower().strip()
-        if text in ("go to download", "continue to download", "go to link", "open link", "click here"):
-            if href and not href.startswith("#"):
-                return href
     return None
 
 async def _wait_for_hubcloud_deep_link(page, max_wait: float = 30.0, ctx=None) -> Optional[str]:
@@ -1091,55 +1031,35 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
     browser = await launch_chromium(
         browser_type="chromium", headless=False, useragent=ua,
     )
-    ctx_kwargs = {}
-    if ua: ctx_kwargs["user_agent"] = ua
-    ctx = await browser.new_context(**ctx_kwargs)
+    ctx = None
+    page = None
     try:
-        if is_chromium_family("chromium"):
-            plugin = stealth_plugin()
-            if plugin is not None:
-                try:
-                    init = getattr(plugin, "init_script", None) or getattr(plugin, "init_scripts", None)
-                    if isinstance(init, list):
-                        for s in init: await ctx.add_init_script(s)
-                    elif init: await ctx.add_init_script(init)
-                except: pass
-    except: pass
-    await ctx.add_init_script(ANTI_AD_INIT_SCRIPT)
-    if cookies:
-        try: await ctx.add_cookies(cookies)
-        except Exception:
-            try: await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
-            except: pass
-    page = await ctx.new_page()
-    try:
-        await page.goto(short_link_url, wait_until="load", timeout=120000)
-        print("[link_exec] navigated (cookie mode)")
-        # CF wait: be generous (was 5s raise; now up to 60s) so a slow
-        # edge check or auto-verify doesn't immediately fail the call.
-        for i in range(120):
+        ctx_kwargs = {}
+        if ua:
+            ctx_kwargs["user_agent"] = ua
+        ctx = await browser.new_context(**ctx_kwargs)
+        await apply_gate_context_init_scripts(ctx)
+        if cookies:
             try:
-                title = await page.title()
-                html = await page.content()
-                is_chal = "Just a moment" in title or "Checking your browser" in title or "cf-mitigated" in html
-                if is_chal:
-                    if i % 10 == 0: print(f"[link_exec] still on CF challenge (t={i*0.5}s) title={title!r}")
-                    if i > 120: raise CFChallengeError(short_link_url, reason="still_challenge_after_cookie", host=_normalize_domain(short_link_url))
-                else:
-                    if title and "Just a moment" not in title and "Checking your browser" not in title:
-                        print(f"[link_exec] title ready after {i*0.5}s -> {title!r}")
-                        break
-            except CFChallengeError: raise
-            except: pass
-            await asyncio.sleep(0.5)
+                await ctx.add_cookies(cookies)
+            except Exception:
+                await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
+        page = await ctx.new_page()
+        response = await page.goto(short_link_url, wait_until="domcontentloaded", timeout=120000)
+        print("[link_exec] navigated (cookie mode)")
+        for i in range(120):
+            if await is_cf_challenge_page(page, response=response):
+                if i % 10 == 0:
+                    print(f"[link_exec] still on CF challenge (t={i*0.5}s)")
+                if i >= 119:
+                    raise CFChallengeError(short_link_url, reason="still_challenge_after_cookie", host=_normalize_domain(short_link_url))
+                await asyncio.sleep(0.5)
+                continue
+            print(f"[link_exec] title ready after {i*0.5}s")
+            break
         await asyncio.sleep(2)
-        try:
-            title = await page.title()
-            html = await page.content()
-            if "Just a moment" in title or "Checking your browser" in title or "cf-mitigated" in html:
-                raise CFChallengeError(short_link_url, reason="cf_still_present", host=_normalize_domain(short_link_url))
-        except CFChallengeError: raise
-        except: pass
+        if await is_cf_challenge_page(page):
+            raise CFChallengeError(short_link_url, reason="cf_still_present", host=_normalize_domain(short_link_url))
 
         # Wait for the gate UI to settle. After CF clears, the title
         # briefly says 'Loading <url>' while the socket.io connection
@@ -1211,15 +1131,24 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
                 if generate_attempt < max_generate_attempts: continue
                 return await _extract_destination(page, ctx)
             print(f"[link_exec] #generateBtn visible -> clicking (attempt {generate_attempt})")
-            if not await _real_click(page, "#generateBtn"):
-                print(f"[link_exec] click generate failed (attempt {generate_attempt})")
-                if generate_attempt < max_generate_attempts: continue
-                return None
-            await _close_ad_popups(ctx, page)
-            _pop_dest = await _close_ad_popups(ctx, page)
+            _generate_effect = """() => {
+                const c = document.getElementById('continueBtn');
+                if (c && !c.classList.contains('hidden')) return true;
+                const w = document.getElementById('counterWrapper');
+                if (w && !w.classList.contains('hidden')) return true;
+                const g = document.getElementById('generateBtn');
+                return !!(g && g.classList.contains('hidden'));
+            }"""
+            clicked, _pop_dest = await _click_gate_button(
+                page, ctx, "#generateBtn", _generate_effect, effect_wait=4.0,
+            )
             if _pop_dest:
                 print(f"[link_exec] destination opened in popup tab after generate: {_pop_dest[:100]}")
                 return _pop_dest
+            if not clicked:
+                print(f"[link_exec] click generate failed (attempt {generate_attempt})")
+                if generate_attempt < max_generate_attempts: continue
+                return None
             if ad_impression_wait > 0:
                 await _wait_for_ad_impressions(page, max_wait=ad_impression_wait)
 
@@ -1264,13 +1193,20 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         # the rebind fast-path already performed the step-1→2 transition
         # server-side (we are ON step 2; there is no Continue to click).
         if not rebind_skipped:
-            if not await _real_click(page, "#continueBtn"):
-                return None
-            await _close_ad_popups(ctx, page)
-            _pop_dest = await _close_ad_popups(ctx, page)
+            _continue_effect = """() => {
+                if ((window.location.href || '').indexOf('step=2') !== -1) return true;
+                const t = document.getElementById('turnstileContainer');
+                if (t && !t.classList.contains('hidden')) return true;
+                return ((document.title || '').toLowerCase().indexOf('almost there') !== -1);
+            }"""
+            clicked, _pop_dest = await _click_gate_button(
+                page, ctx, "#continueBtn", _continue_effect, effect_wait=4.0,
+            )
             if _pop_dest:
                 print(f"[link_exec] destination opened in popup tab after continue: {_pop_dest[:100]}")
                 return _pop_dest
+            if not clicked:
+                return None
             try:
                 await page.wait_for_load_state("load", timeout=30000)
             except Exception:
@@ -1304,10 +1240,10 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         try:
             print(f"[link_exec] trying snippet widget complete (forced show + widget click)...")
             _snippet_dest = await _try_snippet_widget_complete(page, ctx)
-            if _snippet_dest and not _is_ad_url(_snippet_dest) and (_is_destination_url(_snippet_dest) or "/go/" in _snippet_dest):
+            if _snippet_dest and not _is_ad_url(_snippet_dest) and (_is_destination_url(_snippet_dest) or _is_gate_transit(_snippet_dest)):
                 print(f"[link_exec] snippet widget complete ok: {_snippet_dest[:100]}")
                 # If it's a /go/ transit URL, follow it to the hub destination before returning
-                if "/go/" in _snippet_dest and not _is_destination_url(_snippet_dest):
+                if _is_gate_transit(_snippet_dest) and not _is_destination_url(_snippet_dest):
                     try:
                         # Follow the go URL to final hub (hubcloud etc) - quick static check first
                         _rf, _rt, _rs = await resolve_hub_details(_snippet_dest)
@@ -1324,8 +1260,8 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
                                 if _d2 and _is_destination_url(_d2):
                                     _snippet_dest = _d2
                     except Exception:
-                        pass
-                return _snippet_dest
+                        return None
+                return _snippet_dest if _is_destination_url(_snippet_dest) else None
             else:
                 print(f"[link_exec] snippet widget complete missed (dest={str(_snippet_dest)[:80] if _snippet_dest else 'None'}), falling back to nudge")
         except Exception as _e:
@@ -1366,20 +1302,16 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
                     except Exception:
                         pass
                     await asyncio.sleep(0.4)
-                await _nuke_overlays_stacking_on(page, "#goToLinkBtn")
-                async def _nav_now():
-                    async with page.expect_navigation(wait_until="load", timeout=30000): pass
-                nav_task = asyncio.create_task(_nav_now())
-                clicked = await _real_click(page, "#goToLinkBtn", max_wait=10.0)
-                if not clicked:
-                    try:
-                        await page.evaluate("() => { const b=document.getElementById('goToLinkBtn'); if (b) b.click(); }")
-                    except Exception:
-                        pass
-                try:
-                    await nav_task
-                except Exception:
-                    pass
+                _go_effect = """() => {
+                    const href = window.location.href || '';
+                    return href.indexOf('/go/') !== -1 || window.location.hostname !== 'latestnewsonline.sbs';
+                }"""
+                clicked, _pop_dest = await _click_gate_button(
+                    page, ctx, "#goToLinkBtn", _go_effect, max_wait=10.0, effect_wait=30.0,
+                )
+                if _pop_dest:
+                    print(f"[link_exec] final destination in popup tab: {_pop_dest[:100]}")
+                    return _pop_dest
             except Exception as exc:
                 print(f"[link_exec] goToLink click/nav failed: {exc}")
 
@@ -1395,10 +1327,10 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
         dest = await _wait_for_hubcloud_deep_link(page, max_wait=final_wait, ctx=ctx)
         if not dest:
             dest = await _extract_destination(page, ctx)
-        if dest:
+        if dest and _is_destination_url(dest):
             print(f"[link_exec] hub page: {dest}")
-            hub_hints = ("hubcloud", "hubdrive", "gdflix", "fdrive", "gamerxyt")
-            if _is_ad_url(dest) or not any(h in _url_host(dest) for h in hub_hints):
+            hub_hints = ("hubcloud.one", "hubdrive.click", "hubdrive.pro", "gdflix.to", "gdflix.net", "fdrive.link", "fdrive.icu", "gamerxyt.com", "gamerxyt.net")
+            if not any(_url_host(dest) == h or _url_host(dest).endswith("." + h) for h in hub_hints):
                 return dest
             else:
                 # Metadata-only: cache title/size for card enrichment, but
@@ -1416,12 +1348,7 @@ async def _gate_via_manual(short_link_url: str, session_id: str, step1_wait: flo
             return dest
         return await _extract_destination(page, ctx)
     finally:
-        try: await page.close()
-        except: pass
-        try: await ctx.close()
-        except: pass
-        try: await browser.close()
-        except: pass
+        await close_browser_objects([page, ctx, browser], timeout=10.0)
 
 async def execute_button_flow(
     short_link_url: str,
@@ -1433,7 +1360,11 @@ async def execute_button_flow(
     ad_impression_wait: float = 1.5,
 ) -> Optional[str]:
     """Manual cookie only -- bullet proof, no auto solver. Speed-tuned."""
-    return await _gate_via_manual(short_link_url, session_id, step1_wait, step2_wait, final_wait, ad_impression_wait)
+    dest = await _gate_via_manual(short_link_url, session_id, step1_wait, step2_wait, final_wait, ad_impression_wait)
+    try:
+        return validate_destination_url(dest or "")
+    except UnsafeDestinationError:
+        return None
 
 
 def execute_button_flow_sync(short_link_url: str, headless: bool = False, ad_impression_wait: float = 5.0) -> Optional[str]:

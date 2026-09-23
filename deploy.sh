@@ -12,10 +12,8 @@ SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
 # Override per machine without editing: VPS_IP=1.2.3.4 bash deploy.sh
 VPS_IP="${VPS_IP:-}"
 SOLVE_PORT="8080"
-
 log() { printf "\033[1;34m[deploy]\033[0m %s\n" "$*"; }
 err() { printf "\033[1;31m[err]\033[0m %s\n" "$*" >&2; }
-
 if [ -z "${VPS_IP:-}" ]; then
     VPS_IP="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || wget -qO- --timeout=8 https://api.ipify.org 2>/dev/null || true)"
 fi
@@ -25,7 +23,48 @@ if [ -z "${VPS_IP:-}" ] || [[ ! "$VPS_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
     exit 1
 fi
 
-log "VPS: $VPS_IP  solve link: http://$VPS_IP:$SOLVE_PORT/solve/<token>"
+SOLVE_SERVER_PUBLIC_BASE_OVERRIDE="${SOLVE_SERVER_PUBLIC_BASE:-}"
+SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE:-}"
+SOLVE_SERVER_ALLOW_INSECURE_HTTP="${SOLVE_SERVER_ALLOW_INSECURE_HTTP:-}"
+CONFIG_ENV="${REPO_DIR}/xdmovies/.env"
+if [[ -f "$CONFIG_ENV" ]]; then
+    if [[ -z "$SOLVE_SERVER_PUBLIC_BASE" ]]; then
+        SOLVE_SERVER_PUBLIC_BASE="$(sed -n 's/^SOLVE_SERVER_PUBLIC_BASE=//p' "$CONFIG_ENV" | tail -n 1)"
+        SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE%\"}"; SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE#\"}"
+        SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE%\'}"; SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE#\'}"
+    fi
+    if [[ -z "$SOLVE_SERVER_ALLOW_INSECURE_HTTP" ]]; then
+        SOLVE_SERVER_ALLOW_INSECURE_HTTP="$(sed -n 's/^SOLVE_SERVER_ALLOW_INSECURE_HTTP=//p' "$CONFIG_ENV" | tail -n 1)"
+    fi
+fi
+case "${SOLVE_SERVER_ALLOW_INSECURE_HTTP,,}" in
+    1|true|yes|on) SOLVE_SERVER_ALLOW_INSECURE_HTTP=1 ;;
+    *) SOLVE_SERVER_ALLOW_INSECURE_HTTP=0 ;;
+esac
+if [[ "$SOLVE_SERVER_PUBLIC_BASE" == http://* && "$SOLVE_SERVER_ALLOW_INSECURE_HTTP" == "1" && -z "$SOLVE_SERVER_PUBLIC_BASE_OVERRIDE" ]]; then
+    SOLVE_SERVER_PUBLIC_BASE="http://$VPS_IP:$SOLVE_PORT"
+fi
+if [[ -z "$SOLVE_SERVER_PUBLIC_BASE" && "$SOLVE_SERVER_ALLOW_INSECURE_HTTP" == "1" ]]; then
+    SOLVE_SERVER_PUBLIC_BASE="http://$VPS_IP:$SOLVE_PORT"
+fi
+if [[ -z "$SOLVE_SERVER_PUBLIC_BASE" ]]; then
+    err "SOLVE_SERVER_PUBLIC_BASE is required. Set an HTTPS base, or explicitly set SOLVE_SERVER_ALLOW_INSECURE_HTTP=1 for a legacy HTTP deployment."
+    exit 1
+fi
+if [[ "$SOLVE_SERVER_PUBLIC_BASE" == http://* && "$SOLVE_SERVER_ALLOW_INSECURE_HTTP" != "1" ]]; then
+    err "Legacy HTTP SOLVE_SERVER_PUBLIC_BASE is blocked. Migrate to HTTPS, or rerun with SOLVE_SERVER_ALLOW_INSECURE_HTTP=1 to replace the stored base explicitly."
+    exit 1
+fi
+if [[ "$SOLVE_SERVER_PUBLIC_BASE" != https://* && "$SOLVE_SERVER_PUBLIC_BASE" != http://* ]]; then
+    err "SOLVE_SERVER_PUBLIC_BASE must use HTTPS; HTTP is accepted only when SOLVE_SERVER_ALLOW_INSECURE_HTTP=1."
+    exit 1
+fi
+if [[ "$SOLVE_SERVER_PUBLIC_BASE" =~ [[:space:]] || "$SOLVE_SERVER_PUBLIC_BASE" == *"@"* || "$SOLVE_SERVER_PUBLIC_BASE" == *"?"* || "$SOLVE_SERVER_PUBLIC_BASE" == *"#"* || "$SOLVE_SERVER_PUBLIC_BASE" == *"\\"* || "$SOLVE_SERVER_PUBLIC_BASE" == *'"'* || "$SOLVE_SERVER_PUBLIC_BASE" == *"'"* || "$SOLVE_SERVER_PUBLIC_BASE" == *"<"* || "$SOLVE_SERVER_PUBLIC_BASE" == *">"* ]]; then
+    err "SOLVE_SERVER_PUBLIC_BASE contains invalid URL characters."
+    exit 1
+fi
+
+log "VPS: $VPS_IP  solve link: $SOLVE_SERVER_PUBLIC_BASE/solve/<token>"
 
 log "Installing system packages..."
 sudo apt-get update -qq
@@ -125,6 +164,7 @@ if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then err "no such user $SERVICE_US
 if [ ! -f "${REPO_DIR}/xdmovies/__main__.py" ]; then err "repo not at $REPO_DIR"; exit 1; fi
 log "Repo: $REPO_DIR  user: $SERVICE_USER"
 SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
+sudo install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" /opt/cloakbrowser
 chmod +x "${REPO_DIR}/start.sh"
 
 cd "${REPO_DIR}"
@@ -134,14 +174,29 @@ if [ ! -d venv ]; then
 fi
 log "Installing Python deps..."
 sudo -u "${SERVICE_USER}" ./venv/bin/pip install --upgrade pip setuptools wheel
-sudo -u "${SERVICE_USER}" ./venv/bin/pip install -r requirements.txt
-sudo -u "${SERVICE_USER}" ./venv/bin/pip install -r xdmovies/requirements.txt 2>/dev/null || true
+sudo -u "${SERVICE_USER}" ./venv/bin/pip install -c constraints.txt -r requirements.txt
+sudo -u "${SERVICE_USER}" ./venv/bin/pip install -c constraints.txt -r xdmovies/requirements.txt
 
 log "Installing Playwright Chromium..."
 sudo -u "${SERVICE_USER}" ./venv/bin/playwright install chromium
-sudo ./venv/bin/playwright install-deps chromium 2>/dev/null || log "WARN: playwright install-deps failed"
+sudo ./venv/bin/playwright install-deps chromium
 
 # .env with VPS IP
+replace_env_value() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp)"
+    SOLVE_ENV_KEY="$key" SOLVE_ENV_VALUE="$value" awk '
+        BEGIN { key = ENVIRON["SOLVE_ENV_KEY"]; value = ENVIRON["SOLVE_ENV_VALUE"]; written = 0 }
+        index($0, key "=") == 1 {
+            if (!written) { print key "=" value; written = 1 }
+            next
+        }
+        { print }
+        END { if (!written) print key "=" value }
+    ' "$CONFIG_ENV" > "$tmp"
+    sudo -u "${SERVICE_USER}" tee "$CONFIG_ENV" < "$tmp" >/dev/null
+    rm -f "$tmp"
+}
 if [ ! -f "${REPO_DIR}/xdmovies/.env" ]; then
     log "Creating xdmovies/.env with VPS IP $VPS_IP..."
     cat > "${REPO_DIR}/xdmovies/.env" <<EOF
@@ -150,20 +205,21 @@ TELEGRAM_OWNER_ID=__REPLACE_ME__
 TELEGRAM_ADMIN_IDS=
 SOLVE_SERVER_HOST=0.0.0.0
 SOLVE_SERVER_PORT=$SOLVE_PORT
-SOLVE_SERVER_PUBLIC_BASE=http://$VPS_IP:$SOLVE_PORT
+SOLVE_SERVER_PUBLIC_BASE=$SOLVE_SERVER_PUBLIC_BASE
+SOLVE_SERVER_ALLOW_INSECURE_HTTP=$SOLVE_SERVER_ALLOW_INSECURE_HTTP
 EOF
     chmod 600 "${REPO_DIR}/xdmovies/.env"
-    log "*** EDIT ${REPO_DIR}/xdmovies/.env — set TELEGRAM_BOT_TOKEN / OWNER_ID (SOLVE link already set to http://$VPS_IP:$SOLVE_PORT) ***"
+    log "*** EDIT ${REPO_DIR}/xdmovies/.env — set TELEGRAM_BOT_TOKEN / OWNER_ID (SOLVE_SERVER_PUBLIC_BASE already set) ***"
 else
-    # ensure solve link is correct even if .env existed
-    if ! grep -q "SOLVE_SERVER_PUBLIC_BASE" "${REPO_DIR}/xdmovies/.env"; then
-        echo "SOLVE_SERVER_HOST=0.0.0.0" | sudo -u "${SERVICE_USER}" tee -a "${REPO_DIR}/xdmovies/.env" >/dev/null
-        echo "SOLVE_SERVER_PORT=$SOLVE_PORT" | sudo -u "${SERVICE_USER}" tee -a "${REPO_DIR}/xdmovies/.env" >/dev/null
-        echo "SOLVE_SERVER_PUBLIC_BASE=http://$VPS_IP:$SOLVE_PORT" | sudo -u "${SERVICE_USER}" tee -a "${REPO_DIR}/xdmovies/.env" >/dev/null
-    else
-        sudo sed -i "s|SOLVE_SERVER_PUBLIC_BASE=.*|SOLVE_SERVER_PUBLIC_BASE=http://$VPS_IP:$SOLVE_PORT|" "${REPO_DIR}/xdmovies/.env"
+    if ! grep -q "^SOLVE_SERVER_HOST=" "${CONFIG_ENV}"; then
+        echo "SOLVE_SERVER_HOST=0.0.0.0" | sudo -u "${SERVICE_USER}" tee -a "$CONFIG_ENV" >/dev/null
     fi
-    chmod 600 "${REPO_DIR}/xdmovies/.env" 2>/dev/null || true
+    if ! grep -q "^SOLVE_SERVER_PORT=" "${CONFIG_ENV}"; then
+        echo "SOLVE_SERVER_PORT=$SOLVE_PORT" | sudo -u "${SERVICE_USER}" tee -a "$CONFIG_ENV" >/dev/null
+    fi
+    replace_env_value "SOLVE_SERVER_PUBLIC_BASE" "$SOLVE_SERVER_PUBLIC_BASE"
+    replace_env_value "SOLVE_SERVER_ALLOW_INSECURE_HTTP" "$SOLVE_SERVER_ALLOW_INSECURE_HTTP"
+    sudo chmod 600 "$CONFIG_ENV"
 fi
 if [ ! -f "${REPO_DIR}/.env" ]; then
     sudo -u "${SERVICE_USER}" cp "${REPO_DIR}/xdmovies/.env" "${REPO_DIR}/.env" 2>/dev/null || true
@@ -187,9 +243,22 @@ log "Installing systemd unit $SERVICE_FILE..."
 # `systemctl start` will fail with "address already in use" or
 # "terminated by other getUpdates" (Telegram 409 Conflict) because the
 # old process is still bound to 8080 + still polling.
-log "Killing any stale xdmovies / xvfb-run / chromium / port-$SOLVE_PORT holders..."
-for pat in "xvfb-run.*xdmovies" "python.*-m xdmovies" "chrome.*--type" "chromium.*--type"; do
-    pkill -9 -f "$pat" 2>/dev/null || true
+log "Stopping stale xdmovies service processes..."
+sudo systemctl stop xdmovies-bot 2>/dev/null || true
+cleanup_tree() {
+    local pid="$1" child
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        cleanup_tree "$child"
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+}
+for pid in $(pgrep -f 'xvfb-run|python.*-m xdmovies' 2>/dev/null || true); do
+    [[ "$pid" == "$$" ]] && continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    if [[ "$cmd" == *"${REPO_DIR}"* || "$cwd" == "${REPO_DIR}" ]]; then
+        cleanup_tree "$pid"
+    fi
 done
 if command -v fuser >/dev/null 2>&1; then
     fuser -k "${SOLVE_PORT}/tcp" 2>/dev/null || true
@@ -199,6 +268,7 @@ if command -v ss >/dev/null 2>&1; then
     if ss -tlnp 2>/dev/null | grep -q ":${SOLVE_PORT} "; then
         err "port $SOLVE_PORT is STILL held after cleanup; check 'ss -tlnp | grep $SOLVE_PORT'"
         err "try: sudo lsof -i :$SOLVE_PORT   and kill the PID by hand"
+        exit 1
     else
         log "port $SOLVE_PORT is free"
     fi
@@ -222,7 +292,8 @@ Environment="PATH=${REPO_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="SOLVE_SERVER_HOST=0.0.0.0"
 Environment="SOLVE_SERVER_PORT=$SOLVE_PORT"
-Environment="SOLVE_SERVER_PUBLIC_BASE=http://$VPS_IP:$SOLVE_PORT"
+Environment="SOLVE_SERVER_PUBLIC_BASE=$SOLVE_SERVER_PUBLIC_BASE"
+Environment="SOLVE_SERVER_ALLOW_INSECURE_HTTP=$SOLVE_SERVER_ALLOW_INSECURE_HTTP"
 # CloakBrowser binary cache (200MB Chromium). Set to /opt so the
 # systemd unit survives container rebuilds without re-downloading.
 Environment="CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser"
@@ -269,7 +340,7 @@ log "  ${SERVICE_USER} can now restart xdmovies-bot without a password"
 
 log "Installed. Enable+start:"
 log "  sudo systemctl enable --now xdmovies-bot"
-log "Solve link base: http://$VPS_IP:$SOLVE_PORT/solve/<token> (ensure $VPS_IP:$SOLVE_PORT is reachable, message auto-deleted after capture)"
+log "Solve link base: $SOLVE_SERVER_PUBLIC_BASE/solve/<token> (message auto-deleted after capture)"
 
 # ---------------------------------------------------------------------------
 # Real desktop + VNC (optional, env-gated)
@@ -283,11 +354,14 @@ if [[ "${XDMOVIES_ENABLE_VNC:-0}" == "1" ]]; then
     log "Setting up XFCE + x11vnc + noVNC (XDMOVIES_ENABLE_VNC=1)"
     # Pick the existing non-root user (defaults to dhruv).
     VNC_USER="${SERVICE_USER:-dhruv}"
-    sudo install -d -m 0755 -o "${VNC_USER}" -g "${VNC_USER}" /home/${VNC_USER}/.vnc 2>/dev/null || true
+    VNC_GROUP="$(id -gn "${VNC_USER}")"
+    sudo install -d -m 0700 -o "${VNC_USER}" -g "${VNC_GROUP}" /home/${VNC_USER}/.vnc
     if [[ ! -f /home/${VNC_USER}/.vnc/passwd ]]; then
         VNC_PASS="$(head -c 16 /dev/urandom | xxd -p)"
         sudo -u "${VNC_USER}" bash -c "x11vnc -storepasswd '$VNC_PASS' /home/${VNC_USER}/.vnc/passwd"
-        log "  noVNC password: $VNC_PASS (saved to /home/${VNC_USER}/.vnc/passwd)"
+        sudo chown "${VNC_USER}:${VNC_GROUP}" /home/${VNC_USER}/.vnc/passwd
+        sudo chmod 0600 /home/${VNC_USER}/.vnc/passwd
+        log "  noVNC password saved to /home/${VNC_USER}/.vnc/passwd"
     fi
     # systemd units for Xvfb, XFCE, x11vnc, noVNC.
     sudo install -d /etc/systemd/system
@@ -319,7 +393,7 @@ After=xdmovies-xfce.service
 [Service]
 User=${VNC_USER}
 Environment=DISPLAY=:0
-ExecStart=/usr/bin/x11vnc -display :0 -forever -shared -rfbauth /home/${VNC_USER}/.vnc/passwd
+ExecStart=/usr/bin/x11vnc -display :0 -forever -shared -localhost -rfbauth /home/${VNC_USER}/.vnc/passwd
 Restart=always
 [Install]
 WantedBy=multi-user.target
@@ -329,19 +403,19 @@ XVNC
 Description=xdmovies noVNC (browser-based)
 After=xdmovies-vnc.service
 [Service]
-ExecStart=/usr/share/novnc/utils/launch.sh --listen 6080 --vnc localhost:5900
+ExecStart=/usr/share/novnc/utils/launch.sh --listen 127.0.0.1:6080 --vnc localhost:5900
 Restart=always
 [Install]
 WantedBy=multi-user.target
 NOVNC
     sudo systemctl daemon-reload
     sudo systemctl enable --now xdmovies-xvfb xdmovies-xfce xdmovies-vnc xdmovies-novnc
-    log "  XFCE desktop up; noVNC at http://$VPS_IP:6080/vnc.html"
-    log "  (set up an SSH tunnel for security: ssh -L 6080:127.0.0.1:6080 dhruv@$VPS_IP)"
+    log "  XFCE desktop up; noVNC at http://127.0.0.1:6080/vnc.html"
+    log "  (set up an SSH tunnel: ssh -L 6080:127.0.0.1:6080 ${VNC_USER}@$VPS_IP)"
 fi
 
 log "Running --check..."
-sudo -u "${SERVICE_USER}" ./venv/bin/python -m xdmovies --check || log "WARN: --check failed"
+sudo -u "${SERVICE_USER}" ./venv/bin/python -m xdmovies --check
 
 log ""
 log "DONE — VPS token solve-server + CloakBrowser stealth (no VPN layer)."

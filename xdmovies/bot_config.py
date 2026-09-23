@@ -23,27 +23,231 @@ Anything else is silently ignored.
 """
 from __future__ import annotations
 
+import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from pathlib import Path
+from typing import IO, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 
 _LOG = logging.getLogger("xdmovies.bot.config")
 
+_TELEGRAM_TOKEN_URL = re.compile(r"(/bot)[^/\s]+(/)")
+_SOLVE_TOKEN_URL = re.compile(r"(/solve/)[A-Za-z0-9_-]{16,}(?=([/?#'\"]|$))")
+_PROXY_USERINFO = re.compile(r"((?:https?|socks5h?|socks4)://)[^/\s@]+@", re.IGNORECASE)
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
-class _RedactTelegramToken(logging.Filter):
-    _token_url = re.compile(r"(/bot)[^/\s]+(/)")
 
+def redact_sensitive(value: object) -> str:
+    message = str(value)
+    message = _TELEGRAM_TOKEN_URL.sub(r"\1<redacted>\2", message)
+    message = _SOLVE_TOKEN_URL.sub(r"\1<redacted>", message)
+    return _PROXY_USERINFO.sub(r"\1<redacted>@", message)
+
+
+class _RedactSensitive(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        redacted = self._token_url.sub(r"\1<redacted>\2", message)
+        redacted = redact_sensitive(message)
         if redacted != message:
             record.msg = redacted
             record.args = ()
         return True
+
+
+def validate_solve_public_base(value: Optional[str] = None) -> str:
+    configured = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "") if value is None else value
+    raw = (configured or "").strip()
+    allow_insecure = os.environ.get("SOLVE_SERVER_ALLOW_INSECURE_HTTP", "").strip().lower() in _TRUE_VALUES
+    if not raw:
+        raise RuntimeError("missing required env var SOLVE_SERVER_PUBLIC_BASE")
+    if configured != raw or any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE contains invalid whitespace or control characters")
+    if any(ch in raw for ch in "\\?#<>\"'"):
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE contains invalid URL characters")
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(f"SOLVE_SERVER_PUBLIC_BASE is malformed: {exc}") from exc
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and allow_insecure):
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE must use HTTPS")
+    if not parsed.hostname:
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE must not include a query or fragment")
+    if port is not None and not (1 <= port <= 65535):
+        raise RuntimeError("SOLVE_SERVER_PUBLIC_BASE has an invalid port")
+    return raw.rstrip("/")
+
+
+def ensure_private_directory(path: Union[str, os.PathLike]) -> None:
+    target = os.fspath(path)
+    os.makedirs(target, exist_ok=True)
+    if os.name == "posix":
+        os.chmod(target, 0o700)
+
+
+def _ensure_private_parent_directory(path: Union[str, os.PathLike]) -> None:
+    target = os.fspath(path)
+    try:
+        os.makedirs(target, mode=0o700)
+    except FileExistsError:
+        pass
+
+
+def ensure_private_file(path: Union[str, os.PathLike]) -> None:
+    if os.name == "posix" and os.path.exists(path):
+        os.chmod(path, 0o600)
+
+
+def open_private_text(
+    path: Union[str, os.PathLike],
+    mode: str = "r",
+    *,
+    encoding: str = "utf-8",
+    errors: Optional[str] = None,
+) -> IO[str]:
+    target = os.fspath(path)
+    if any(flag in mode for flag in ("w", "a", "x", "+")):
+        ensure_private_directory(Path(target).parent)
+    flags = os.O_RDONLY
+    if "+" in mode:
+        flags = os.O_RDWR
+    if "w" in mode:
+        flags |= os.O_CREAT | os.O_TRUNC
+    elif "a" in mode:
+        flags |= os.O_CREAT | os.O_APPEND
+    elif "x" in mode:
+        flags |= os.O_CREAT | os.O_EXCL
+    fd = os.open(target, flags, 0o600)
+    ensure_private_file(target)
+    kwargs = {"encoding": encoding}
+    if errors is not None:
+        kwargs["errors"] = errors
+    return os.fdopen(fd, mode, **kwargs)
+
+
+@contextmanager
+def _state_file_lock(path: Union[str, os.PathLike]):
+    target = os.path.abspath(os.fspath(path))
+    lock_path = target + ".lock"
+    ensure_private_directory(Path(lock_path).parent)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size < 1:
+                os.write(fd, b" ")
+                os.ftruncate(fd, 1)
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _read_json_unlocked(path: str, default):
+    if not os.path.isfile(path):
+        return default
+    try:
+        ensure_private_file(path)
+        with open_private_text(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _write_json_unlocked(path: str, payload, *, sort_keys: bool = False, indent: int = 2) -> None:
+    target = os.path.abspath(os.fspath(path))
+    ensure_private_directory(Path(target).parent)
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=indent, sort_keys=sort_keys)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        if os.name == "posix":
+            try:
+                dir_fd = os.open(os.path.dirname(target), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def atomic_write_json(
+    path: Union[str, os.PathLike],
+    payload,
+    *,
+    sort_keys: bool = False,
+    indent: int = 2,
+) -> None:
+    target = os.path.abspath(os.fspath(path))
+    with _state_file_lock(target):
+        _write_json_unlocked(target, payload, sort_keys=sort_keys, indent=indent)
+
+
+def update_json(
+    path: Union[str, os.PathLike],
+    update,
+    default,
+    *,
+    sort_keys: bool = False,
+    indent: int = 2,
+):
+    target = os.path.abspath(os.fspath(path))
+    with _state_file_lock(target):
+        data = _read_json_unlocked(target, default)
+        result = update(data)
+        payload = data if result is None else result
+        _write_json_unlocked(target, payload, sort_keys=sort_keys, indent=indent)
+        return result
+
+
+def read_json(path: Union[str, os.PathLike], default=None):
+    return _read_json_unlocked(os.path.abspath(os.fspath(path)), default)
+
+
+def _prepare_private_file(path: str) -> None:
+    _ensure_private_parent_directory(Path(path).parent)
+    fd = os.open(path, os.O_CREAT | os.O_APPEND, 0o600)
+    os.close(fd)
+    ensure_private_file(path)
 
 
 def _load_dotenv(path: str = ".env", override: bool = False) -> None:
@@ -176,6 +380,9 @@ def load_config() -> BotConfig:
         or "xdmovies_bot_errors.log"
     )
 
+    solve_public_base = validate_solve_public_base()
+    os.environ["SOLVE_SERVER_PUBLIC_BASE"] = solve_public_base
+
     # Optional: cap concurrent BrowserSessions. Default 8 — enough for one
     # busy job + 7 queued without OOM'ing a 4GB VPS.
     try:
@@ -212,19 +419,35 @@ def configure_logging(cfg: BotConfig) -> None:
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    redact = _RedactSensitive()
 
-    fh = logging.FileHandler(cfg.log_path, encoding="utf-8")
+    for path in (cfg.log_path, cfg.error_log_path):
+        _prepare_private_file(path)
+
+    fh = RotatingFileHandler(
+        cfg.log_path,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
+    fh.addFilter(redact)
     root.addHandler(fh)
 
-    eh = logging.FileHandler(cfg.error_log_path, encoding="utf-8")
+    eh = RotatingFileHandler(
+        cfg.error_log_path,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
     eh.setLevel(logging.ERROR)
     eh.setFormatter(fmt)
+    eh.addFilter(redact)
     root.addHandler(eh)
 
     sh = logging.StreamHandler(stream=sys.stderr)
     sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
-    sh.addFilter(_RedactTelegramToken())
+    sh.addFilter(redact)
     root.addHandler(sh)

@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file, update_json
+
 STATE_DIR = Path(__file__).resolve().parent.parent / "xdmovies_state"
 _STATE_PATH = STATE_DIR / "autodetect.json"
 _SCHEMA = 1
@@ -36,8 +38,10 @@ def _load() -> Dict:
         "updated_at": 0,
     }
     try:
+        ensure_private_directory(STATE_DIR)
         if not _STATE_PATH.exists():
             return defaults
+        ensure_private_file(_STATE_PATH)
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
             return defaults
@@ -72,7 +76,7 @@ def _safe_float(v) -> float:
 def _save(state: Dict) -> None:
     """Atomic persist. Never raises (caller already has the intent)."""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(STATE_DIR)
         payload = {
             "schema_version": _SCHEMA,
             "enabled": bool(state.get("enabled", False)),
@@ -85,14 +89,35 @@ def _save(state: Dict) -> None:
             "last_check_ts": _safe_float(state.get("last_check_ts")),
             "updated_at": time.time(),
         }
-        tmp = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, _STATE_PATH)
+        atomic_write_json(_STATE_PATH, payload, sort_keys=True)
     except Exception:
-        pass
+        raise
+
+
+def _update(mutator) -> None:
+    def apply(data):
+        if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
+            data = {
+                "schema_version": _SCHEMA,
+                "enabled": False,
+                "feed": "all",
+                "card_filter": "all",
+                "seen_urls": [],
+                "last_check_ts": 0,
+            }
+        if data.get("feed") not in _VALID_FEEDS:
+            data["feed"] = "all"
+        if data.get("card_filter") not in _VALID_CONTENT:
+            data["card_filter"] = "all"
+        if not isinstance(data.get("seen_urls"), list):
+            data["seen_urls"] = []
+        mutator(data)
+        data["schema_version"] = _SCHEMA
+        data["seen_urls"] = list(data["seen_urls"])[-_SEEN_CAP:]
+        data["updated_at"] = time.time()
+        return data
+
+    update_json(_STATE_PATH, apply, {}, sort_keys=True)
 
 
 # ---- public API ----------------------------------------------------------
@@ -106,14 +131,9 @@ def is_on() -> bool:
 
 
 def set_on(on: bool) -> bool:
-    """Persist the ON/OFF choice. Returns stored value. Never raises."""
-    try:
-        st = _load()
-        st["enabled"] = bool(on)
-        _save(st)
-        return bool(on)
-    except Exception:
-        return False
+    """Persist the ON/OFF choice. Returns stored value."""
+    _update(lambda data: data.__setitem__("enabled", bool(on)))
+    return bool(on)
 
 
 def get_feed() -> str:
@@ -127,13 +147,9 @@ def get_feed() -> str:
 
 def set_feed(feed: str) -> str:
     """Persist the chosen feed (replaces previous). Returns stored value."""
-    try:
-        st = _load()
-        st["feed"] = feed if feed in _VALID_FEEDS else "all"
-        _save(st)
-        return st["feed"]
-    except Exception:
-        return "all"
+    value = feed if feed in _VALID_FEEDS else "all"
+    _update(lambda data: data.__setitem__("feed", value))
+    return value
 
 
 def get_card_filter() -> str:
@@ -147,13 +163,9 @@ def get_card_filter() -> str:
 
 def set_card_filter(card_filter: str) -> str:
     """Persist the series content filter. Returns stored value."""
-    try:
-        st = _load()
-        st["card_filter"] = card_filter if card_filter in _VALID_CONTENT else "all"
-        _save(st)
-        return st["card_filter"]
-    except Exception:
-        return "all"
+    value = card_filter if card_filter in _VALID_CONTENT else "all"
+    _update(lambda data: data.__setitem__("card_filter", value))
+    return value
 
 
 def load_seen() -> List[str]:
@@ -168,13 +180,16 @@ def load_seen() -> List[str]:
 def add_seen(urls: List[str]) -> None:
     """Append URLs to the seen set (dedup, cap, atomic). Never raises."""
     try:
-        st = _load()
-        cur = st.get("seen_urls", [])
-        for u in urls:
-            if isinstance(u, str) and u and u not in cur:
-                cur.append(u)
-        st["seen_urls"] = cur[-_SEEN_CAP:]
-        _save(st)
+        values = list(urls or [])
+
+        def apply(data):
+            current = list(data.get("seen_urls", []))
+            for value in values:
+                if isinstance(value, str) and value and value not in current:
+                    current.append(value)
+            data["seen_urls"] = current[-_SEEN_CAP:]
+
+        _update(apply)
     except Exception:
         pass
 
@@ -182,9 +197,7 @@ def add_seen(urls: List[str]) -> None:
 def touch_check(new_count: int = 0) -> None:
     """Record a poll tick + how many new URLs it produced. Never raises."""
     try:
-        st = _load()
-        st["last_check_ts"] = time.time()
-        _save(st)
+        _update(lambda data: data.__setitem__("last_check_ts", time.time()))
     except Exception:
         pass
 

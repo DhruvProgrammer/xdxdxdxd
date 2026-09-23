@@ -43,32 +43,28 @@ ok "unit stopped"
 # 2. Kill every process that could be holding the bot, port 8080, the
 #    Playwright driver, or the chromium children.
 # ---------------------------------------------------------------------------
-KILL_PATTERNS=(
-    "xvfb-run"
-    "Xvfb"
-    "python.*-m xdmovies"
-    "python.*xdmovies_bot"
-    "python.*playwright"
-    "chrome.*--type"
-    "chromium.*--type"
-    "headless_shell"
-)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SERVICE_USER="${SERVICE_USER:-$($SUDO systemctl show xdmovies-bot -p User --value 2>/dev/null || true)}"
+cleanup_tree() {
+    local pid="$1" child
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        cleanup_tree "$child"
+    done
+    $SUDO kill -TERM "$pid" 2>/dev/null || true
+}
 
 log "killing related processes..."
-for pat in "${KILL_PATTERNS[@]}"; do
-    pids=$(pgrep -af "$pat" 2>/dev/null | awk '{print $1}' | xargs)
-    if [[ -n "$pids" ]]; then
-        warn "  matching '$pat' -> pids: $pids"
-        $SUDO kill -9 $pids 2>/dev/null || true
+for pid in $(pgrep -f 'xvfb-run|python.*-m xdmovies' 2>/dev/null || true); do
+    [[ "$pid" == "$$" ]] && continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    cwd="$($SUDO readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    owner="$($SUDO stat -c %U "/proc/$pid" 2>/dev/null || true)"
+    if [[ "$cmd" == *"${SCRIPT_DIR}"* || "$cwd" == "${SCRIPT_DIR}" || ( -n "$SERVICE_USER" && "$owner" == "$SERVICE_USER" ) ]]; then
+        warn "  matching xdmovies process -> pid: $pid"
+        cleanup_tree "$pid"
     fi
 done
-
-# Belt-and-suspenders: pkill for the obvious names
-$SUDO pkill -9 -f "xvfb-run" 2>/dev/null || true
-$SUDO pkill -9 -f "xdmovies" 2>/dev/null || true
-$SUDO pkill -9 -f "playwright" 2>/dev/null || true
-$SUDO pkill -9 -f "chrome" 2>/dev/null || true
-$SUDO pkill -9 -f "chromium" 2>/dev/null || true
+sleep 1
 ok "killed related processes"
 
 # (No VPN layer to tear down — the bot runs direct from the VPS IP.)

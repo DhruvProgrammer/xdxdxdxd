@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file, update_json
+
 STATE_DIR = Path(__file__).resolve().parent.parent / "xdmovies_state"
 _SETTINGS_PATH = STATE_DIR / "settings.json"
 _SCHEMA = 1
@@ -51,8 +53,10 @@ DEFAULTS: Dict[str, bool] = {
 def _load() -> Dict[int, Dict[str, bool]]:
     """user_id -> {key: bool}. Never raises; anything unreadable is {}."""
     try:
+        ensure_private_directory(STATE_DIR)
         if not _SETTINGS_PATH.exists():
             return {}
+        ensure_private_file(_SETTINGS_PATH)
         data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
             return {}
@@ -73,18 +77,13 @@ def _load() -> Dict[int, Dict[str, bool]]:
 
 
 def _save(users: Dict[int, Dict[str, bool]]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(STATE_DIR)
     payload = {
         "schema_version": _SCHEMA,
         "users": {str(uid): prefs for uid, prefs in sorted(users.items())},
         "updated_at": time.time(),
     }
-    tmp = _SETTINGS_PATH.with_suffix(_SETTINGS_PATH.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, _SETTINGS_PATH)
+    atomic_write_json(_SETTINGS_PATH, payload, sort_keys=True)
 
 
 def get_settings(user_id: int) -> Dict[str, bool]:
@@ -108,31 +107,40 @@ def enabled_fields(user_id: int) -> List[str]:
 
 
 def set_field(user_id: int, key: str, on: bool) -> Dict[str, bool]:
-    """Persist one field. Returns the full map. Never raises."""
-    try:
-        if key not in _KEYS:
-            return get_settings(user_id)
-        uid = int(user_id)
-        users = _load()
-        prefs = users.get(uid, dict(DEFAULTS))
-        prefs = {k: bool(prefs.get(k, DEFAULTS[k])) for k in _KEYS}
+    """Persist one field. Returns the full map."""
+    if key not in _KEYS:
+        return get_settings(user_id)
+    uid = int(user_id)
+    result: Dict[str, bool] = {}
+
+    def apply(data):
+        if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA:
+            data = {}
+        users = data.get("users")
+        if not isinstance(users, dict):
+            users = {}
+        raw = users.get(str(uid), {})
+        if not isinstance(raw, dict):
+            raw = {}
+        prefs = {k: bool(raw.get(k, DEFAULTS[k])) for k in _KEYS}
         prefs[key] = bool(on)
-        users[uid] = prefs
-        _save(users)
-        return prefs
-    except Exception:
-        return dict(DEFAULTS)
+        users[str(uid)] = prefs
+        data["schema_version"] = _SCHEMA
+        data["users"] = users
+        data["updated_at"] = time.time()
+        result.update(prefs)
+        return data
+
+    update_json(_SETTINGS_PATH, apply, {}, sort_keys=True)
+    return result
 
 
 def toggle_field(user_id: int, key: str) -> Dict[str, bool]:
-    """Flip one field. Returns the full map. Never raises."""
-    try:
-        if key not in _KEYS:
-            return get_settings(user_id)
-        cur = get_settings(user_id)
-        return set_field(user_id, key, not cur.get(key, False))
-    except Exception:
-        return dict(DEFAULTS)
+    """Flip one field. Returns the full map."""
+    if key not in _KEYS:
+        return get_settings(user_id)
+    cur = get_settings(user_id)
+    return set_field(user_id, key, not cur.get(key, False))
 
 
 def field_label(key: str) -> str:

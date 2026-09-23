@@ -11,6 +11,8 @@ import logging
 import sys
 import time
 
+from xdmovies.bot_config import _RedactSensitive
+
 
 _COLORS = {
     "DEBUG": "\033[35m",
@@ -53,6 +55,7 @@ def build_logger(name: str) -> logging.Logger:
         log.setLevel(logging.INFO)
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.addFilter(_RedactSensitive())
         log.addHandler(handler)
         # Audit finding M9: remove `propagate = False` so the bot's
         # solve_server / keep_alive / cloak_stealth messages propagate

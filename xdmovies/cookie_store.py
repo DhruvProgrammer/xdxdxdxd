@@ -23,6 +23,8 @@ import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from xdmovies.bot_config import atomic_write_json, ensure_private_directory, ensure_private_file, open_private_text, update_json
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATES = [
     os.path.join(_HERE, "..", "xdmovies_state", "cf_cookies.json"),
@@ -35,7 +37,7 @@ def _store_path() -> str:
     for p in _CANDIDATES:
         d = os.path.dirname(os.path.abspath(p))
         try:
-            os.makedirs(d, exist_ok=True)
+            ensure_private_directory(d)
         except Exception:
             continue
         return os.path.abspath(p)
@@ -83,33 +85,30 @@ def _load_raw() -> Dict:
     if not os.path.isfile(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        ensure_private_file(path)
+        with open_private_text(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 def _save_raw(data: Dict) -> None:
-    path = STORE_PATH
-    d = os.path.dirname(path)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    try:
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-        try:
-            os.replace(tmp, path)
-        except Exception:
-            pass
+    for entry in data.values():
+        if isinstance(entry, dict):
+            entry.pop("_raw_input", None)
+    atomic_write_json(STORE_PATH, data)
+
+
+def _update_raw(mutator) -> None:
+    def apply(data):
+        if not isinstance(data, dict):
+            data = {}
+        mutator(data)
+        for entry in data.values():
+            if isinstance(entry, dict):
+                entry.pop("_raw_input", None)
+        return data
+    update_json(STORE_PATH, apply, {})
 
 # ---------------------------------------------------------------------------
 # Parsing — hardened
@@ -291,31 +290,58 @@ def set_cookies_for_domain(domain_or_url: str, cookie_text: str, user_agent: Opt
         # still allow (test tokens), but don't warn hard
         pass
 
-    data = _load_raw()
-    entry = data.get(key, {})
-    # merge: new values overwrite; keep old if not provided (so __cf_bm persists when user only sends cf_clearance)
-    for k, v in parsed.items():
-        # normalize key to canonical case: keep first seen case but ensure cf_clearance exact
-        # use as provided but ensure lower comparison doesn't duplicate
-        # remove any existing lower-duplicate
-        to_remove = [ek for ek in list(entry.keys()) if ek.lower() == k.lower() and ek != k and not ek.startswith("_")]
-        for rk in to_remove:
-            entry.pop(rk, None)
-        entry[k] = v
-
     now = time.time()
-    entry["_updated_at"] = now
-    entry["_updated_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    entry["_store_key"] = key
-    entry["_raw_input"] = (cookie_text or "")[:800]
-    entry["_expires_at"] = now + DEFAULT_TTL_SECONDS
-    entry["_expires_human"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now + DEFAULT_TTL_SECONDS))
-    if user_agent:
-        entry["_user_agent"] = user_agent.strip()[:600]
-    # if we have no UA yet, keep previous one if any
-    data[key] = entry
-    _save_raw(data)
+
+    def apply(data: Dict) -> None:
+        entry = data.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
+        for k, v in parsed.items():
+            to_remove = [
+                ek for ek in list(entry.keys())
+                if ek.lower() == k.lower() and ek != k and not ek.startswith("_")
+            ]
+            for rk in to_remove:
+                entry.pop(rk, None)
+            entry[k] = v
+        entry["_updated_at"] = now
+        entry["_updated_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry["_store_key"] = key
+        entry.pop("_raw_input", None)
+        entry["_expires_at"] = now + DEFAULT_TTL_SECONDS
+        entry["_expires_human"] = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(now + DEFAULT_TTL_SECONDS)
+        )
+        if user_agent:
+            entry["_user_agent"] = user_agent.strip()[:600]
+        data[key] = entry
+
+    _update_raw(apply)
     return key, parsed
+
+def mark_successful_use(domain_or_url: str) -> bool:
+    key = _normalize_domain(domain_or_url)
+    now = time.time()
+    result = False
+
+    def apply(data: Dict) -> None:
+        nonlocal result
+        entry = data.get(key)
+        if not isinstance(entry, dict) or not any(
+            str(name).lower() == "cf_clearance" and value
+            for name, value in entry.items()
+            if not str(name).startswith("_")
+        ):
+            return
+        entry["_updated_at"] = now
+        entry["_last_used_at"] = now
+        entry["_updated_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        data[key] = entry
+        result = True
+
+    _update_raw(apply)
+    return result
+
 
 def set_cookie(domain_or_url: str, cookie_text: str, user_agent: Optional[str] = None) -> Tuple[str, Dict[str, str]]:
     return set_cookies_for_domain(domain_or_url, cookie_text, user_agent)
@@ -380,21 +406,30 @@ def get_user_agent_for_url(url: str) -> Optional[str]:
 
 def get_all() -> Dict:
     return _load_raw()
-
 def clear_domain(domain_or_url: str) -> bool:
     key = _normalize_domain(domain_or_url)
-    data = _load_raw()
-    if key in data:
-        data.pop(key, None)
-        _save_raw(data)
-        return True
-    return False
+    result = False
+
+    def apply(data: Dict) -> None:
+        nonlocal result
+        if key in data:
+            data.pop(key, None)
+            result = True
+
+    _update_raw(apply)
+    return result
+
 
 def clear_all() -> int:
-    data = _load_raw()
-    n = len(data)
-    _save_raw({})
-    return n
+    result = 0
+
+    def apply(data: Dict) -> None:
+        nonlocal result
+        result = len(data)
+        data.clear()
+
+    _update_raw(apply)
+    return result
 
 def _age_human(seconds: float) -> str:
     if seconds < 60:
@@ -408,8 +443,9 @@ def _age_human(seconds: float) -> str:
 def status_text() -> str:
     data = _load_raw()
     if not data:
-        base = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
-        return f"No cf_clearance stored yet. Send a movie link — if CF on post blocks, I'll send a solve link {base}/solve/... (tap checkbox) + auto keep-alive every 25m."
+        base = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "").rstrip("/")
+        suffix = f" {base}/solve/... (tap checkbox)" if base else " using the configured solve server"
+        return f"No cf_clearance stored yet. Send a movie link — if CF on post blocks, I'll send a solve link{suffix} + auto keep-alive every 25m."
     lines: List[str] = []
     now = time.time()
     for k, v in sorted(data.items()):
@@ -417,7 +453,7 @@ def status_text() -> str:
         age = _age_human(now - upd) if upd else "?"
         exp = v.get("_expires_at", 0)
         ttl = f"expires in {_age_human(exp - now)}" if exp and exp > now else "expired" if exp else "no expiry"
-        stale = " ⚠️ STALE (>20h) — may need refresh" if upd and (now - upd) > STALE_AFTER_SECONDS else ""
+        stale = " ⚠️ STALE (>30m) — may need refresh" if upd and (now - upd) > STALE_AFTER_SECONDS else ""
         has_cf = "yes" if any(x.lower()=="cf_clearance" for x in v.keys()) else "no"
         has_bm = "yes" if any(x.lower()=="__cf_bm" for x in v.keys()) else "no"
         keys = [x for x in v.keys() if not x.startswith("_")]
@@ -425,10 +461,9 @@ def status_text() -> str:
         if v.get("_user_agent"):
             ua = v["_user_agent"]
             lines.append(f"  UA: {ua[:90]}{'…' if len(ua)>90 else ''}")
-        # show value preview (first 12 chars) so user can tell which cookie without leaking full
         cfv = next((str(val) for kk,val in v.items() if kk.lower()=="cf_clearance"), "")
         if cfv:
-            lines.append(f"  cf_clearance: {cfv[:12]}… ({len(cfv)} chars)")
+            lines.append(f"  cf_clearance: present ({len(cfv)} chars)")
     return "\n".join(lines)
 
 class CFChallengeError(RuntimeError):

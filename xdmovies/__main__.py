@@ -22,36 +22,69 @@ os.chdir(_HERE)
 
 
 def _check() -> int:
-    import importlib.util as ilu
+    import importlib
 
-    here = os.path.dirname(os.path.abspath(__file__))
     failures = []
-
-    for name in ("bot_config", "extractor", "cookie_store", "pipeline", "channel_post", "bot"):
-        path = os.path.join(here, f"{name}.py")
-        spec = ilu.spec_from_file_location(f"xdmovies_smoke_{name}", path)
-        if spec is None or spec.loader is None:
-            failures.append(f"spec missing for {name}")
-            continue
-        mod = ilu.module_from_spec(spec)
-        sys.modules.setdefault(spec.name, mod)
+    critical = (
+        "bot_config",
+        "extractor",
+        "cookie_store",
+        "pipeline",
+        "channel_post",
+        "search",
+        "scrape_all",
+        "autodetect",
+        "autodetect_store",
+        "qmode_store",
+        "dmode_store",
+        "settings_store",
+        "link_follower",
+        "link_exec",
+        "keep_alive",
+        "solve_server",
+        "browser_runtime",
+        "browser_stealth",
+        "bot",
+        "eternal_bypass",
+        "cloak_stealth",
+    )
+    for name in critical:
         try:
-            spec.loader.exec_module(mod)
+            importlib.import_module(f"xdmovies.{name}")
             print(f"OK: loaded xdmovies.{name}")
         except Exception as exc:
             failures.append(f"{name}: {exc.__class__.__name__}: {exc}")
             print(f"FAIL: {name}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
 
     try:
+        from xdmovies.cloak_stealth import (
+            cloak_available,
+            cloak_version,
+            launch_chromium,
+            launch_persistent_chromium,
+        )
+        if not cloak_available():
+            failures.append("cloakbrowser dependency is not available")
+        elif not callable(launch_chromium) or not callable(launch_persistent_chromium):
+            failures.append("CloakBrowser launcher surface is incomplete")
+        else:
+            print(f"OK: CloakBrowser launcher v{cloak_version() or 'unknown'} (launch deferred)")
+    except Exception as exc:
+        failures.append(f"browser launcher: {exc.__class__.__name__}: {exc}")
+
+    try:
         from xdmovies.bot_config import load_config
         cfg = load_config()
         print(f"OK: bot_config load: owner={cfg.owner_id} admin_ids={list(cfg.admin_ids) or '[]'}")
     except Exception as exc:
-        print(f"WARN: config not loadable ({exc.__class__.__name__}: {exc}). Expected until TELEGRAM_* in .env.", file=sys.stderr)
+        print(f"WARN: config not loadable ({exc.__class__.__name__}: {exc}); runtime credentials are optional for offline checks.", file=sys.stderr)
 
     try:
         from xdmovies.cookie_store import status_text
-        print(f"Cookies: {status_text()}")
+        cookie_status = status_text()
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        cookie_status = cookie_status.encode(encoding, errors="replace").decode(encoding)
+        print(f"Cookies: {cookie_status}")
     except Exception as exc:
         print(f"WARN: cookie_store: {exc}", file=sys.stderr)
 

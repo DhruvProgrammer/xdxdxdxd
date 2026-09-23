@@ -11,29 +11,156 @@ No manual paste — only auto-capture.
 from __future__ import annotations
 
 import asyncio
+import html
 import os
+import re
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+from urllib.parse import urlsplit
 
 try:
     from aiohttp import web
 except ImportError:
     web = None  # type: ignore
 
+from xdmovies.bot_config import validate_solve_public_base
+from xdmovies.browser_stealth import apply_gate_context_init_scripts
+from xdmovies.browser_runtime import (
+    UnsafeDestinationError,
+    cancel_tasks,
+    close_browser_objects,
+    is_cf_challenge_page,
+    is_gate_transit,
+    validate_destination_url,
+)
 from xdmovies.cookie_store import _normalize_domain, set_cookies_for_domain
 from xdmovies.logger_utils import logger
 
 SOLVE_HOST = os.getenv("SOLVE_SERVER_HOST", "0.0.0.0")
 SOLVE_PORT = int(os.getenv("SOLVE_SERVER_PORT", "8080"))
-SOLVE_PUBLIC_BASE = os.getenv("SOLVE_SERVER_PUBLIC_BASE", "")
-if not SOLVE_PUBLIC_BASE:
-    public_host = os.getenv("SOLVE_SERVER_PUBLIC_HOST", "")
-    if public_host:
-        SOLVE_PUBLIC_BASE = f"http://{public_host}:{SOLVE_PORT}"
-    else:
-        SOLVE_PUBLIC_BASE = f"http://localhost:{SOLVE_PORT}"
+SOLVE_PUBLIC_BASE = os.getenv("SOLVE_SERVER_PUBLIC_BASE", "").strip().rstrip("/")
+try:
+    MAX_ACTIVE_SESSIONS = max(1, int(os.getenv("SOLVE_SERVER_MAX_SESSIONS", "4") or "4"))
+except ValueError:
+    MAX_ACTIVE_SESSIONS = 4
+BROWSER_OP_TIMEOUT = 8.0
+CLEANUP_TIMEOUT = 10.0
+_SOLVE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+
+
+def _related_domain(cookie_domain: str, target_host: str) -> bool:
+    candidate = (cookie_domain or "").strip().lower().lstrip(".")
+    target = (target_host or "").strip().lower().lstrip(".")
+    if not candidate or not target:
+        return False
+    return (
+        candidate == target
+        or candidate.endswith("." + target)
+        or target.endswith("." + candidate)
+    )
+
+
+def _validated_target_url(url: str, host: str) -> tuple[str, str]:
+    try:
+        parsed = urlsplit((url or "").strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid solve target URL") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("solve target URL must use HTTP or HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("solve target URL must not include credentials")
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError("solve target URL has an invalid port")
+    actual_host = parsed.hostname.lower().rstrip(".")
+    expected_host = _normalize_domain(host or actual_host)
+    if not _related_domain(actual_host, expected_host):
+        raise ValueError("solve target host does not match the challenge host")
+    return (url or "").strip(), expected_host
+
+
+def _safe_destination_url(url: str) -> str:
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        parsed.port
+    except ValueError:
+        return ""
+    try:
+        return validate_destination_url(url)
+    except UnsafeDestinationError:
+        return ""
+    except Exception:
+        return ""
+
+
+async def _follow_gate_transit(page, ctx, transit_url: str) -> str:
+    if not is_gate_transit(transit_url):
+        return ""
+    target = page
+    pages = []
+    try:
+        pages = list(getattr(ctx, "pages", []) or [])
+    except Exception:
+        pass
+    for candidate in pages:
+        try:
+            candidate_url = candidate.url or ""
+        except Exception:
+            continue
+        if is_gate_transit(candidate_url):
+            target = candidate
+            transit_url = candidate_url
+            break
+    try:
+        await target.goto(
+            transit_url,
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+    except Exception as exc:
+        logger.debug(f"[solve_server] gate transit navigation failed: {type(exc).__name__}")
+    try:
+        safe = _safe_destination_url(target.url or "")
+    except Exception:
+        safe = ""
+    if safe:
+        return safe
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            current_pages = list(getattr(ctx, "pages", []) or [])
+        except Exception:
+            current_pages = []
+        candidates = [target, *current_pages]
+        for candidate in candidates:
+            try:
+                current = candidate.url or ""
+            except Exception:
+                continue
+            safe = _safe_destination_url(current)
+            if safe:
+                return safe
+        await asyncio.sleep(0.5)
+    try:
+        from xdmovies.link_exec import _extract_destination
+        extracted = await _extract_destination(target, ctx)
+    except Exception:
+        extracted = ""
+    return _safe_destination_url(extracted or "")
+
+
+class SolveBusyError(RuntimeError):
+    def __init__(self, active: int, maximum: int):
+        self.active = active
+        self.maximum = maximum
+        super().__init__(f"solve server is busy: {active} active sessions (maximum {maximum})")
+
 
 @dataclass
 class SolveSession:
@@ -66,6 +193,11 @@ class SolveSession:
     # Background tasks owned by this session (cancelled in destroy).
     launch_task: Optional[asyncio.Task] = None
     auto_nudge_task: Optional[asyncio.Task] = None
+    expire_task: Optional[asyncio.Task] = None
+    pre_injected_cf: set[str] = field(default_factory=set, repr=False)
+    capture_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    closing: bool = False
+    expired: bool = False
 
 
 # Audit finding H6: align poller / session-expiry / bot-wait deadlines
@@ -80,6 +212,8 @@ _APP: Optional[object] = None
 _RUNNER: Optional[object] = None
 _SITE: Optional[object] = None
 _LOCK = asyncio.Lock()
+_START_LOCK = asyncio.Lock()
+_BROWSER_OP_LOCK = asyncio.Lock()
 
 # Solved-result stash, keyed by token. wait_for_solve destroys the
 # session ~25s after capture (Fix A), so by the time the bot's
@@ -94,9 +228,9 @@ _SOLVED_RESULT_TTL = 600
 def _stash_solved_result(token: str, final_url: Optional[str] = None,
                          cf_value: Optional[str] = None) -> None:
     try:
+        safe_final = _safe_destination_url(final_url or "")
         _SOLVED_RESULTS[token] = {
-            "final_url": final_url or "",
-            "cf_value": cf_value or "",
+            "final_url": safe_final,
             "at": time.time(),
         }
     except Exception:
@@ -109,7 +243,11 @@ def get_solved_result(token: str) -> Optional[dict]:
         for tok in [t for t, r in _SOLVED_RESULTS.items()
                     if now - float(r.get("at", 0)) > _SOLVED_RESULT_TTL]:
             _SOLVED_RESULTS.pop(tok, None)
-        return _SOLVED_RESULTS.get(token)
+        result = _SOLVED_RESULTS.get(token)
+        if not result:
+            return None
+        safe_final = _safe_destination_url(str(result.get("final_url") or ""))
+        return {"final_url": safe_final, "at": float(result.get("at", 0))}
     except Exception:
         return None
 
@@ -181,12 +319,14 @@ const statusTimer=setInterval(async ()=>{
         msg += ' (auto-capturing — tap the checkbox below if it appears)';
       }
     }
-    if(j.auto_nudge_failed && !j.has_cookie){
+    if(j.auto_nudge_failed && !j.has_fresh_cookie){
       msg += ' • bot could not bypass — please tap the checkbox';
-    } else if(j.has_cookie){
-      msg += ' • cookie present';
+    } else if(j.cookie_state==='fresh'){
+      msg += ' • fresh cookie captured';
+    } else if(j.cookie_state==='injected'){
+      msg += ' • injected cookie is not a solve — waiting for a fresh cookie';
     } else {
-      msg += ' • waiting for cookie';
+      msg += ' • waiting for fresh cookie';
     }
     setStatus(msg, 'info');
   }catch(e){}
@@ -212,130 +352,99 @@ document.getElementById('shot').addEventListener('click', async (e)=>{
 </script></body></html>
 """
 
+
+def _session_active(sess: SolveSession) -> bool:
+    return _SESSIONS.get(sess.token) is sess and not sess.closing and not sess.expired
+
+
+def _cookie_state(sess: SolveSession, cookies) -> dict:
+    state = {
+        "has_cookie": False,
+        "has_fresh_cookie": False,
+        "has_injected_cookie": False,
+        "cookie_state": "none",
+    }
+    for cookie in cookies or ():
+        if str(cookie.get("name") or "").lower() != "cf_clearance":
+            continue
+        value = str(cookie.get("value") or "")
+        if not value or len(value) <= 20:
+            continue
+        if value in sess.pre_injected_cf:
+            state["has_cookie"] = True
+            state["has_injected_cookie"] = True
+            state["cookie_state"] = "injected"
+            continue
+        if _related_domain(str(cookie.get("domain") or ""), sess.host):
+            state["has_cookie"] = True
+            state["has_fresh_cookie"] = True
+            state["cookie_state"] = "fresh"
+    return state
+
+
+async def _capture_cf_cookie(sess: SolveSession, cookie: dict) -> bool:
+    value = str(cookie.get("value") or "")
+    if not value or len(value) <= 20 or value in sess.pre_injected_cf:
+        return False
+    if not _related_domain(str(cookie.get("domain") or ""), sess.host):
+        return False
+    user_agent = ""
+    try:
+        if sess.page is not None:
+            user_agent = str(await sess.page.evaluate("navigator.userAgent") or "")
+    except Exception as exc:
+        logger.debug(f"[solve_server] user-agent capture failed: {type(exc).__name__}")
+    async with sess.capture_lock:
+        if not _session_active(sess) or time.time() - sess.created_at >= SESSION_TTL:
+            return False
+        try:
+            await asyncio.to_thread(
+                set_cookies_for_domain,
+                sess.host,
+                f"cf_clearance={value}",
+                user_agent=user_agent,
+            )
+        except Exception as exc:
+            logger.warning(f"[solve_server] auto-save failed: {type(exc).__name__}")
+            return False
+        sess.cf_value = value
+        sess.solved = True
+        sess.event.set()
+        _stash_solved_result(sess.token, cf_value=value)
+    logger.info(f"[solve_server] captured fresh cf_clearance for {sess.host}")
+    return True
+
+
 async def _poll_for_cookie(sess: SolveSession):
     try:
-        # Domain match: accept cookies whose domain is the host itself,
-        # a parent of the host, or any subdomain under xdmovies.wtf.
-        # CF often sets domain=".top.xdmovies.wtf" not ".xdmovies.wtf",
-        # which the old check missed.
-        def _domain_ok(cookie_domain: str, target_host: str) -> bool:
-            d = (cookie_domain or "").lstrip(".").lower()
-            h = (target_host or "").lower()
-            if not d or not h:
-                return False
-            if d == h:
-                return True
-            if h.endswith("." + d):
-                return True
-            if d.endswith("." + h):
-                return True
-            # Treat any *.xdmovies.wtf as matching xdmovies.wtf and vice versa
-            xd = "xdmovies.wtf"
-            if d == xd or h == xd or d.endswith("." + xd) or h.endswith("." + xd):
-                return True
-            return False
-
-        # Snapshot the cf_clearance value(s) we PRE-INJECTED into the
-        # browser context at launch time. Without this, the very first
-        # poll tick would mark the session "solved" by reading back the
-        # stale stored cookie — the user never gets a chance to click
-        # and the bot then retries the same blocked page.
-        pre_injected: set[str] = set()
         try:
             if sess.context is not None:
-                for c in await sess.context.cookies():
-                    if c.get("name") == "cf_clearance":
-                        v = c.get("value") or ""
-                        if v:
-                            pre_injected.add(v)
+                for cookie in await sess.context.cookies():
+                    if str(cookie.get("name") or "").lower() == "cf_clearance":
+                        value = str(cookie.get("value") or "")
+                        if value:
+                            sess.pre_injected_cf.add(value)
         except Exception:
             pass
-        logger.debug(f"[solve_server] pre-injected cf_clearance values: {len(pre_injected)}")
-
-        while not sess.solved and (time.time() - sess.created_at) < SESSION_TTL:
+        while _session_active(sess) and not sess.solved and (time.time() - sess.created_at) < SESSION_TTL:
             try:
                 if sess.context is None:
                     await asyncio.sleep(1.2)
                     continue
                 cookies = await sess.context.cookies()
-                for c in cookies:
-                    if c.get("name") != "cf_clearance":
+                for cookie in cookies:
+                    if str(cookie.get("name") or "").lower() != "cf_clearance":
                         continue
-                    val = c.get("value")
-                    if not val or len(val) <= 20:
-                        continue
-                    # Audit finding H3: the previous code had
-                    # a 33s window where a pre-injected (stale)
-                    # cookie was treated as a fresh solve if the
-                    # user took >33s to open the link — they'd
-                    # get a false "solved" with the same stale
-                    # cookie and the bot would retry against it
-                    # indefinitely. Pre-injected values are NEVER
-                    # accepted as solved.
-                    if val in pre_injected:
-                        # Same value as what we injected. The
-                        # user hasn't solved anything new.
-                        continue
-                    # NOTE (latestnewsonline.sbs gate fix): CF
-                    # sometimes issues cf_clearance on domain
-                    # ".cloudflare.com" instead of the site
-                    # domain (documented in CONTEXT_stealth.md).
-                    # The old _domain_ok() gate rejected those,
-                    # so a successful manual tap on the gate
-                    # never counted as solved and the bot
-                    # reported "still blocked" after 90s. Each
-                    # solve session owns a dedicated browser
-                    # context that only ever visits sess.url,
-                    # so any fresh cf_clearance here belongs to
-                    # this flow regardless of cookie domain.
-                    # We still log the domain for diagnostics.
-                    if not _domain_ok(c.get("domain", ""), sess.host):
-                        logger.info(
-                            f"[solve_server] accepting cf_clearance with "
-                            f"cookie-domain={c.get('domain')} for host={sess.host} "
-                            f"(cross-domain issue, value is fresh)"
-                        )
-                    try:
-                        # Audit finding H7: cf_clearance is bound
-                        # to IP+UA. The solve browser uses CloakBrowser's
-                        # default UA, but cookie_store was being
-                        # called without user_agent, so a stale
-                        # `_user_agent` from an earlier manual paste
-                        # persisted and the next pipeline/link_exec
-                        # replayed it via get_user_agent_for_url,
-                        # causing UA mismatch and CF rejection.
-                        # Capture the actual UA from the solve
-                        # browser and store it with the cookie.
-                        ua = None
-                        try:
-                            if sess.page is not None:
-                                ua = await sess.page.evaluate("navigator.userAgent")
-                        except Exception as e:
-                            logger.debug(f"[solve_server] UA capture failed: {e!r}")
-                        set_cookies_for_domain(
-                            sess.host,
-                            f"cf_clearance={val}",
-                            user_agent=ua,
-                        )
-                        sess.cf_value = val
-                        sess.solved = True
-                        sess.event.set()
-                        _stash_solved_result(sess.token, cf_value=val)
-                        logger.info(
-                            f"[solve_server] auto-captured NEW cf_clearance for {sess.host} "
-                            f"(cookie-domain={c.get('domain')}) token={sess.token[:8]} "
-                            f"pre_injected={val in pre_injected}"
-                        )
-                    except Exception as e:
-                        logger.warning(f"[solve_server] auto-save failed: {e}")
-                    break
+                    if await _capture_cf_cookie(sess, cookie):
+                        return
             except asyncio.CancelledError:
-                break
+                return
             except Exception:
                 pass
             await asyncio.sleep(1.2)
     except asyncio.CancelledError:
-        pass
+        return
+
 
 async def _auto_nudge(sess: SolveSession) -> bool:
     """Try to bypass CF without user input.
@@ -359,32 +468,14 @@ async def _auto_nudge(sess: SolveSession) -> bool:
     cookie was about to expire. Now we capture the pre-injected set
     once and only count cookies whose value is NOT in that set.
     """
-    # Capture the cookies already present BEFORE we start nudging.
-    pre_injected: set[str] = set()
-    try:
-        if sess.context is not None:
-            for c in await sess.context.cookies():
-                if c.get("name") == "cf_clearance":
-                    pre_injected.add(c.get("value") or "")
-    except Exception:
-        pass
-
     async def has_fresh_cookie() -> bool:
-        """True if a cf_clearance exists that wasn't in pre_injected."""
         try:
             if sess.context is None:
                 return False
-            for c in await sess.context.cookies():
-                if c.get("name") != "cf_clearance":
-                    continue
-                val = c.get("value") or ""
-                if not val or len(val) <= 20:
-                    continue
-                if val not in pre_injected:
-                    return True
+            cookies = await sess.context.cookies()
+            return bool(_cookie_state(sess, cookies).get("has_fresh_cookie"))
         except Exception:
             return False
-        return False
 
     # Step 1: give the page a chance to auto-verify.
     for _ in range(8):  # up to ~8 seconds
@@ -405,11 +496,11 @@ async def _auto_nudge(sess: SolveSession) -> bool:
                 try:
                     await fr.click("body", position={"x": 30, "y": 32}, delay=80, timeout=5000)
                     logger.info("[solve_server] auto-nudged Turnstile frame at 30,32")
-                except Exception as e:
-                    logger.debug(f"[solve_server] auto-nudge click failed: {e!r}")
+                except Exception as exc:
+                    logger.debug(f"[solve_server] auto-nudge click failed: {type(exc).__name__}")
                 break
-    except Exception as e:
-        logger.debug(f"[solve_server] auto-nudge frame search failed: {e!r}")
+    except Exception as exc:
+        logger.debug(f"[solve_server] auto-nudge frame search failed: {type(exc).__name__}")
 
     # Step 3: wait up to ~8 more seconds for a FRESH cookie to appear.
     for _ in range(8):
@@ -439,8 +530,8 @@ async def _launch_for_session(sess: SolveSession):
             useragent=None,
             humanize=True,
         )
-    except Exception as e:
-        sess.goto_error = f"browser launch failed: {e!r}"
+    except Exception as exc:
+        sess.goto_error = f"browser launch failed: {type(exc).__name__}"
         logger.exception("[solve_server] browser launch failed")
         return
     sess.browser = browser
@@ -448,34 +539,17 @@ async def _launch_for_session(sess: SolveSession):
         ctx = await browser.new_context(viewport={"width": 1280, "height": 800})
     except Exception:
         ctx = browser
-    # Gate policy: NEVER block or hide ads on latestnewsonline.sbs.
-    # The gate verifies its ad flow (impressions, popups, modal state);
-    # nuking overlays, hiding modals, or neutering window.open lets us
-    # SEE the buttons but the gate then refuses to generate the link and
-    # never reaches the final destination URL. So on gate URLs we apply
-    # only the stealth fingerprint plugin (not ad-blocking) and use real
-    # trusted clicks. Tabs that are pure about:blank are still reaped by
-    # _close_ad_popups; destination tabs are preserved.
     is_gate = "latestnewsonline.sbs" in (sess.url or "").lower()
     if is_gate:
-        try:
-            from xdmovies.browser_stealth import is_chromium_family, stealth_plugin
-            if is_chromium_family("chromium"):
-                plugin = stealth_plugin()
-                if plugin is not None:
-                    init = getattr(plugin, "init_script", None) or getattr(plugin, "init_scripts", None)
-                    if isinstance(init, list):
-                        for s in init:
-                            try: await ctx.add_init_script(s)
-                            except: pass
-                    elif init:
-                        try: await ctx.add_init_script(init)
-                        except: pass
-        except Exception as e:
-            logger.debug(f"[solve_server] could not apply stealth plugin: {e!r}")
+        await apply_gate_context_init_scripts(ctx)
     try:
         from xdmovies.cookie_store import get_cookies_for_url
         cookies = get_cookies_for_url(sess.url)
+        for cookie in cookies:
+            if str(cookie.get("name") or "").lower() == "cf_clearance":
+                value = str(cookie.get("value") or "")
+                if value:
+                    sess.pre_injected_cf.add(value)
         if cookies:
             try: await ctx.add_cookies(cookies)
             except Exception:
@@ -485,24 +559,37 @@ async def _launch_for_session(sess: SolveSession):
     sess.context = ctx
     try:
         page = await ctx.new_page()
-    except Exception as e:
+    except Exception as exc:
         # Most common case: humanize patch + Xvfb + libnss3 mismatch
         # crashed the renderer before Playwright could attach.
-        sess.goto_error = f"new_page failed: {e!r}"
+        sess.goto_error = f"new_page failed: {type(exc).__name__}"
         logger.exception("[solve_server] new_page failed")
-        try: await browser.close()
-        except Exception: pass
+        try:
+            await close_browser_objects([browser], timeout=3.0)
+        except Exception:
+            pass
         sess.browser = None
         sess.context = None
         return
     sess.page = page
+    if not _session_active(sess):
+        return
+    sess.poll_task = asyncio.create_task(_poll_for_cookie(sess))
     try:
-        # Cap goto at 30s. CF interstitials with light Turnstile auto-verify
-        # in <10s, so 30s is generous.
-        await page.goto(sess.url, wait_until="domcontentloaded", timeout=30000)
-    except Exception as e:
-        sess.goto_error = f"goto failed for {e!r}"
-        logger.warning(f"[solve_server] goto failed for {sess.url}: {e}")
+        response = await page.goto(sess.url, wait_until="domcontentloaded", timeout=30000)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        sess.goto_error = f"goto failed: {type(exc).__name__}"
+        logger.warning(f"[solve_server] goto failed for {sess.host}: {type(exc).__name__}")
+        return
+    gate_ready = not await is_cf_challenge_page(page, response=response)
+    if is_gate and not gate_ready:
+        for _ in range(10):
+            await asyncio.sleep(1.0)
+            if not await is_cf_challenge_page(page):
+                gate_ready = True
+                break
     # Gate auto-drive: if this is a latestnewsonline.sbs URL, drive
     # Generate -> Continue -> Turnstile container automatically. Clicks
     # are synthetic-first (proven live 2026-09-04: main.js handlers check
@@ -511,7 +598,7 @@ async def _launch_for_session(sess: SolveSession):
     # requires ads loaded AND unhidden, so nothing is ever hidden via DOM
     # and window.open is left intact. User only taps Close on covering
     # modals and the inner Turnstile checkbox via the screenshot.
-    if is_gate:
+    if is_gate and gate_ready:
         try:
             from xdmovies.link_exec import (
                 _wait_visible,
@@ -564,7 +651,7 @@ async def _launch_for_session(sess: SolveSession):
                 "Generate",
             )
             if gen_dest:
-                _finish_gate_solve(sess, gen_dest, "after-generate")
+                await _finish_gate_solve(sess, gen_dest, "after-generate")
             # Keep-focused counter wait: poll for #continueBtn unhiding
             # while closing popups and refocusing if paused-notice
             # appears.
@@ -618,7 +705,7 @@ async def _launch_for_session(sess: SolveSession):
                     "Continue",
                 )
                 if cont_dest:
-                    _finish_gate_solve(sess, cont_dest, "after-continue")
+                    await _finish_gate_solve(sess, cont_dest, "after-continue")
             if not sess.solved and cont_ok:
                 try:
                     await page.wait_for_load_state("load", timeout=30000)
@@ -686,6 +773,8 @@ async def _launch_for_session(sess: SolveSession):
                         # Synthetic first (proven live), trusted fallback.
                         go_clicked = False
                         complete_token = None
+                        response_observed = False
+                        trusted_attempted = False
                         try:
                             pre_url = page.url or ""
                         except Exception:
@@ -696,30 +785,24 @@ async def _launch_for_session(sess: SolveSession):
                                 async with page.expect_response(
                                     "**/api/session/complete", timeout=15000
                                 ) as _resp_info:
-                                    go_clicked = bool(await _syn_go(page, "#goToLinkBtn"))
-                                    if not go_clicked:
-                                        try:
-                                            go_clicked = bool(await _trusted_click(page, "#goToLinkBtn"))
-                                        except Exception:
-                                            pass
-                                try:
-                                    _resp = await _resp_info.value
-                                    _body = await _resp.json()
-                                    if isinstance(_body, dict) and _body.get("token"):
-                                        complete_token = str(_body["token"])
-                                        logger.info("[solve_server] gate: complete API issued token")
-                                    elif isinstance(_body, dict) and _body.get("error"):
-                                        logger.warning(f"[solve_server] gate: complete API error: {_body.get('error')}")
-                                except Exception as exc_resp:
-                                    logger.debug(f"[solve_server] gate: complete response unreadable: {exc_resp!r}")
+                                    synthetic_sent = bool(await _syn_go(page, "#goToLinkBtn"))
+                                    if not synthetic_sent:
+                                        trusted_attempted = True
+                                        go_clicked = bool(await _trusted_click(page, "#goToLinkBtn"))
+                                _resp = await _resp_info.value
+                                response_observed = True
+                                go_clicked = True
+                                _body = await _resp.json()
+                                if isinstance(_body, dict) and _body.get("token"):
+                                    complete_token = str(_body["token"])
+                                    logger.info("[solve_server] gate: complete API issued token")
+                                elif isinstance(_body, dict) and _body.get("error"):
+                                    logger.warning(f"[solve_server] gate: complete API error: {_body.get('error')}")
                             except Exception as exc_wait:
-                                # No complete request observed (click missed
-                                # or handler never fired). Fall through to a
-                                # plain trusted click below.
-                                logger.debug(f"[solve_server] gate: no complete response yet: {exc_wait!r}")
+                                logger.debug(f"[solve_server] gate: no complete response yet: {type(exc_wait).__name__}")
                         except Exception:
                             pass
-                        if not go_clicked:
+                        if not response_observed and not trusted_attempted:
                             try:
                                 go_clicked = bool(await _trusted_click(page, "#goToLinkBtn"))
                             except Exception:
@@ -742,14 +825,7 @@ async def _launch_for_session(sess: SolveSession):
                                         )
                                         logger.info("[solve_server] gate: built destination from complete token")
                                 except Exception as exc_mk:
-                                    logger.debug(f"[solve_server] gate: destination build failed: {exc_mk!r}")
-                            # Source-truth (main.js): Go navigates the SAME
-                            # tab to /go/<sid>?t=... (deliberate
-                            # anti-popup-blocker design) while also spawning
-                            # a pop-under ad tab. So poll the gate tab URL
-                            # for the /go/ transit or a dest host AND scan
-                            # tabs; first dest-host hit wins, /go/ transit
-                            # is the fallback.
+                                    logger.debug(f"[solve_server] gate: destination build failed: {type(exc_mk).__name__}")
                             dest = None
                             try:
                                 from xdmovies.link_exec import (
@@ -766,8 +842,17 @@ async def _launch_for_session(sess: SolveSession):
                                         if _is_destination_url(cur):
                                             dest = cur
                                             break
-                                        if "/go/" in cur and not transit:
+                                        if is_gate_transit(cur) and not transit:
                                             transit = cur
+                                    try:
+                                        for tab in list(getattr(ctx, "pages", []) or []):
+                                            if tab == page:
+                                                continue
+                                            tab_url = tab.url or ""
+                                            if is_gate_transit(tab_url) and not transit:
+                                                transit = tab_url
+                                    except Exception:
+                                        pass
                                     try:
                                         tab_dest = await _close_ad_popups(ctx, page)
                                         if tab_dest:
@@ -777,14 +862,16 @@ async def _launch_for_session(sess: SolveSession):
                                         pass
                                     await asyncio.sleep(1.0)
                                 if not dest:
-                                    dest = transit
-                                if not dest:
-                                    dest = constructed
+                                    dest = await _follow_gate_transit(
+                                        page, ctx, transit or constructed or ""
+                                    )
                                 if not dest:
                                     try:
                                         dest = await _extract_destination(page, ctx)
                                     except Exception:
                                         pass
+                                if dest:
+                                    dest = _safe_destination_url(dest)
                             except Exception:
                                 pass
                             if dest:
@@ -799,7 +886,7 @@ async def _launch_for_session(sess: SolveSession):
                                         _cur = page.url or ""
                                     except Exception:
                                         _cur = ""
-                                    if _cur and ("hubcloud" in _cur or "hubdrive" in _cur):
+                                    if _cur and _is_destination_url(_cur):
                                         try:
                                             _hd = _ehd(await page.content() or "")
                                         except Exception:
@@ -808,19 +895,15 @@ async def _launch_for_session(sess: SolveSession):
                                             _note(_cur, _hd.final_url, _hd.title, _hd.size)
                                 except Exception:
                                     pass
-                                _finish_gate_solve(sess, dest, "go-to-link")
+                                await _finish_gate_solve(sess, dest, "go-to-link")
                             else:
                                 logger.warning("[solve_server] gate auto-drive: Go clicked but no destination found")
                 except Exception as exc_go:
-                    logger.warning(f"[solve_server] gate Go-click failed: {exc_go!r}")
+                    logger.warning(f"[solve_server] gate Go-click failed: {type(exc_go).__name__}")
         except Exception as exc:
-            logger.warning(f"[solve_server] gate auto-drive failed (user can still click manually): {exc!r}")
-    # Always start the poller — it picks up cf_clearance as soon as
-    # the page lands.
-    sess.poll_task = asyncio.create_task(_poll_for_cookie(sess))
-    # Try the auto-nudge in the background; result is reflected in
-    # sess.auto_nudge_failed when the user opens the token link.
-    sess.auto_nudge_task = asyncio.create_task(_run_auto_nudge(sess))
+            logger.warning(f"[solve_server] gate auto-drive failed (user can still click manually): {type(exc).__name__}")
+    if _session_active(sess) and sess.auto_nudge_task is None:
+        sess.auto_nudge_task = asyncio.create_task(_run_auto_nudge(sess))
 
 
 async def _run_auto_nudge(sess: SolveSession) -> None:
@@ -830,15 +913,15 @@ async def _run_auto_nudge(sess: SolveSession) -> None:
         await asyncio.sleep(2.0)
         ok = await _auto_nudge(sess)
         if ok:
-            logger.info(f"[solve_server] auto-nudge succeeded for {sess.url}")
+            logger.info(f"[solve_server] auto-nudge succeeded for {sess.host}")
         else:
             sess.auto_nudge_failed = True
             logger.info(f"[solve_server] auto-nudge did not capture cookie within ~20s; "
                        f"user fallback required")
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        logger.warning(f"[solve_server] auto_nudge error: {e!r}")
+    except Exception as exc:
+        logger.warning(f"[solve_server] auto_nudge error: {type(exc).__name__}")
         sess.auto_nudge_failed = True
 
 async def handle_solve_page(request):
@@ -867,13 +950,27 @@ async def handle_solve_page(request):
     # Use .replace() instead of .format() because HTML_TEMPLATE contains literal
     # CSS/JS braces (e.g. body{font-family:...}) which would crash str.format()
     # with KeyError. Only substitute our 3 known placeholders.
-    html = (
+    safe_token = html.escape(token, quote=True)
+    safe_host = html.escape(sess.host, quote=True)
+    safe_url = html.escape(sess.url, quote=True)
+    rendered = (
         HTML_TEMPLATE
-        .replace("{token}", token)
-        .replace("{host}", sess.host)
-        .replace("{url}", sess.url)
+        .replace("{token}", safe_token)
+        .replace("{host}", safe_host)
+        .replace("{url}", safe_url)
     )
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(
+        text=rendered,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+async def _run_browser_operation(operation, timeout: float = BROWSER_OP_TIMEOUT):
+    async def _locked():
+        async with _BROWSER_OP_LOCK:
+            return await operation()
+    return await asyncio.wait_for(_locked(), timeout=timeout)
+
 
 async def handle_shot(request):
     token = request.match_info.get("token", "")
@@ -897,13 +994,13 @@ async def handle_shot(request):
     try:
         # Hard cap on screenshot so a hung page never blocks the
         # browser-side (the user's phone) for more than a few seconds.
-        png = await asyncio.wait_for(
-            sess.page.screenshot(type="jpeg", quality=40, full_page=False),
-            timeout=4.0,
+        png = await _run_browser_operation(
+            lambda: sess.page.screenshot(type="jpeg", quality=40, full_page=False),
+            timeout=5.0,
         )
         return web.Response(body=png, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
     except asyncio.TimeoutError:
-        logger.warning(f"[solve_server] screenshot timed out for {sess.url}")
+        logger.warning(f"[solve_server] screenshot timed out for {sess.host}")
         return web.Response(
             body=_PLACEHOLDER_JPEG,
             content_type="image/jpeg",
@@ -914,9 +1011,9 @@ async def handle_shot(request):
         # closed after a successful solve (destroy races an in-flight
         # shot). Keep it at debug so the log doesn't cry wolf.
         if "TargetClosedError" in type(e).__name__ or "TargetClosedError" in str(e):
-            logger.debug(f"[solve_server] screenshot raced browser close (benign): {e!r}")
+            logger.debug(f"[solve_server] screenshot raced browser close (benign): {type(e).__name__}")
         else:
-            logger.warning(f"[solve_server] screenshot failed: {e!r}")
+            logger.warning(f"[solve_server] screenshot failed: {type(e).__name__}")
         return web.Response(
             body=_PLACEHOLDER_JPEG,
             content_type="image/jpeg",
@@ -1245,12 +1342,9 @@ async def _gate_click_step(page, ctx, selector: str, effect_js: str, label: str)
     tabs are preserved and returned); check effect_js. Nothing is ever
     hidden via DOM. Returns (ok, dest).
     """
-    from xdmovies.link_exec import _wait_visible, _close_ad_popups, _synthetic_click
+    from xdmovies.link_exec import _click_gate_button
     for attempt in (1, 2, 3):
         try:
-            if not await _wait_visible(page, selector, max_wait=12.0):
-                logger.warning(f"[solve_server] gate: {label} never visible (attempt {attempt})")
-                continue
             try:
                 covered, note = await _gate_button_covered(page, selector)
                 if covered:
@@ -1260,64 +1354,40 @@ async def _gate_click_step(page, ctx, selector: str, effect_js: str, label: str)
             except Exception:
                 pass
             logger.info(f"[solve_server] gate auto-drive: clicking {label} (attempt {attempt})")
-            landed = False
-            try:
-                landed = bool(await _synthetic_click(page, selector))
-            except Exception:
-                pass
-            if not landed:
-                try:
-                    landed = bool(await _trusted_click(page, selector))
-                except Exception:
-                    pass
-            if not landed:
-                continue
-            await asyncio.sleep(2.5)
-            try:
-                dest = await _close_ad_popups(ctx, page)
-                if dest:
-                    logger.info(f"[solve_server] gate: destination tab opened after {label}: {dest[:100]}")
-                    return (True, dest)
-            except Exception:
-                pass
-            try:
-                if await page.evaluate(effect_js):
-                    return (True, None)
-            except Exception:
-                pass
+            landed, dest = await _click_gate_button(
+                page, ctx, selector, effect_js, max_wait=12.0, effect_wait=2.5,
+            )
+            if dest:
+                logger.info(f"[solve_server] gate: destination tab opened after {label}")
+                return True, dest
+            if landed:
+                return True, None
             logger.info(f"[solve_server] gate: {label} click had no visible effect (attempt {attempt})")
         except Exception as exc:
-            logger.debug(f"[solve_server] gate click step error ({label}): {exc!r}")
-    return (False, None)
+            logger.debug(f"[solve_server] gate click step error ({label}): {type(exc).__name__}")
+    return False, None
 
 
-def _finish_gate_solve(sess, dest: str, how: str) -> None:
-    """Complete a gate session with a captured destination-tab URL.
-
-    The gate's inner captcha issues no cf_clearance, so only the Go to
-    Link destination (or a destination tab caught mid-flow) completes
-    the session. Stashes the result for bot.py via get_solved_result().
-    """
+async def _finish_gate_solve(sess, dest: str, how: str) -> None:
     try:
-        if not dest or sess.solved:
+        if not dest or sess.solved or not _session_active(sess):
             return
-        try:
-            from xdmovies.link_exec import _is_ad_url
-            if _is_ad_url(dest):
-                logger.warning(f"[solve_server] gate {how}: refusing ad URL as destination: {dest[:100]}")
+        safe_dest = _safe_destination_url(dest)
+        if not safe_dest:
+            logger.warning(f"[solve_server] gate {how}: refused an unsafe destination")
+            return
+        async with sess.capture_lock:
+            if not _session_active(sess) or sess.solved:
                 return
-        except Exception:
-            pass
-        sess.final_url = dest
-        sess.solved = True
-        try:
+            sess.final_url = safe_dest
+            sess.solved = True
             sess.event.set()
-        except Exception:
-            pass
-        _stash_solved_result(sess.token, final_url=dest)
-        logger.info(f"[solve_server] gate {how}: captured destination {dest[:100]}")
-    except Exception:
-        pass
+            _stash_solved_result(sess.token, final_url=safe_dest)
+        logger.info(f"[solve_server] gate {how}: captured destination")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[solve_server] gate capture failed: {type(exc).__name__}")
 
 
 async def _drive_turnstile_stage(page, sess, max_wait: float = 90.0) -> bool:
@@ -1365,7 +1435,7 @@ async def _drive_turnstile_stage(page, sess, max_wait: float = 90.0) -> bool:
             else:
                 logger.debug(f"[solve_server] gate: checkbox uncovered (tick {tick})")
         except Exception as exc:
-            logger.debug(f"[solve_server] gate: cover-check failed: {exc!r}")
+            logger.debug(f"[solve_server] gate: cover-check failed: {type(exc).__name__}")
         # 2. click the checkbox inside the Turnstile frame. Prefer the
         # frame verified inside #turnstileContainer; fall back to any
         # challenges frame. Box-aware point first (checkbox lives at the
@@ -1416,7 +1486,7 @@ async def _drive_turnstile_stage(page, sess, max_wait: float = 90.0) -> bool:
                     except Exception:
                         continue
         except Exception as exc:
-            logger.debug(f"[solve_server] gate: frame click failed: {exc!r}")
+            logger.debug(f"[solve_server] gate: frame click failed: {type(exc).__name__}")
         if tick == 1 or tick % 5 == 0:
             logger.info(f"[solve_server] gate: checkbox tick {tick}: frame={found_frame} click={clicked} modal_closed={closed}")
         # 3. reap pop-under tabs (Close taps and ad scripts spawn them;
@@ -1431,7 +1501,7 @@ async def _drive_turnstile_stage(page, sess, max_wait: float = 90.0) -> bool:
             if _ctx is not None:
                 _td = await _reap(_ctx, page)
                 if _td:
-                    _finish_gate_solve(sess, _td, "checkbox-stage-popup")
+                    await _finish_gate_solve(sess, _td, "checkbox-stage-popup")
                     return True
         except Exception:
             pass
@@ -1444,6 +1514,27 @@ async def _drive_turnstile_stage(page, sess, max_wait: float = 90.0) -> bool:
 
 
 async def handle_click(request):
+    token = request.match_info.get("token", "")
+    sess = _SESSIONS.get(token)
+    if not sess or sess.page is None:
+        return web.json_response({"ok": False, "error": "no session"}, status=404)
+    try:
+        data = await asyncio.wait_for(request.json(), timeout=1.0)
+        x = int(data.get("x", 0))
+        y = int(data.get("y", 0))
+        if not (-10000 <= x <= 10000 and -10000 <= y <= 10000):
+            return web.json_response({"ok": False, "error": "invalid coordinates"}, status=400)
+        return await _run_browser_operation(
+            lambda: _handle_click_unbounded(request),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        return web.json_response({"ok": False, "error": "browser operation timed out"}, status=504)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": type(exc).__name__}, status=500)
+
+
+async def _handle_click_unbounded(request):
     token = request.match_info.get("token", "")
     sess = _SESSIONS.get(token)
     if not sess or sess.page is None:
@@ -1513,8 +1604,8 @@ async def handle_click(request):
             try:
                 if await _auto_solve_iframe(frame):
                     return web.json_response({"ok": True, "mode": "locator"})
-            except Exception as e:
-                logger.debug(f"[solve_server] locator click failed: {e}")
+            except Exception as exc:
+                logger.debug(f"[solve_server] locator click failed: {type(exc).__name__}")
 
             # 1b) Coordinate math fallback: CSS px -> frame-relative px,
             #     then frame.click(body, position=...).
@@ -1546,10 +1637,10 @@ async def handle_click(request):
                     logger.debug("[solve_server] frame.click on body failed (cross-origin?)")
                 if clicked:
                     return web.json_response(
-                        {"ok": True, "mode": "frame-coord", "fx": fx, "fy": fy, "frame": (frame.url or "")[:80]}
+                        {"ok": True, "mode": "frame-coord", "fx": fx, "fy": fy}
                     )
-            except Exception as e:
-                logger.warning(f"[solve_server] frame coord click failed: {e}")
+            except Exception as exc:
+                logger.warning(f"[solve_server] frame coord click failed: {type(exc).__name__}")
 
         # 2) Page-level click at CSS coords (ad Close buttons, Go button,
         #    or Turnstile when no iframe was found). Real trusted click
@@ -1559,8 +1650,48 @@ async def handle_click(request):
         await page.mouse.click(px, py, delay=80)
         return web.json_response({"ok": True, "mode": "page-coord",
                                   "tapped": tapped})
-    except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": type(exc).__name__}, status=500)
+
+async def _collect_browser_status(sess: SolveSession) -> dict:
+    title = ""
+    cookies = []
+    iframe_url = ""
+    iframe_mode = ""
+    try:
+        if sess.page:
+            title = str(await sess.page.title() or "")
+    except Exception:
+        pass
+    try:
+        if sess.context:
+            cookies = await sess.context.cookies()
+    except Exception:
+        pass
+    try:
+        if sess.page:
+            for frame in sess.page.frames:
+                try:
+                    candidate = str(frame.url or "")
+                except Exception:
+                    candidate = ""
+                lower = candidate.lower()
+                if "challenges.cloudflare.com" in lower or "turnstile" in lower:
+                    iframe_url = candidate
+                    parts = [part for part in urlsplit(candidate).path.split("/") if part]
+                    for mode in ("non-interactive", "light", "managed", "interactive", "captcha"):
+                        if mode in parts:
+                            iframe_mode = mode
+                            break
+                    break
+    except Exception:
+        pass
+    return {
+        "title": title,
+        "cookies": cookies,
+        "iframe_mode": iframe_mode,
+    }
+
 
 async def handle_status(request):
     token = request.match_info.get("token", "")
@@ -1568,90 +1699,48 @@ async def handle_status(request):
     if not sess:
         return web.json_response({"error": "invalid token"}, status=404)
     if sess.solved:
-        # Fast path: don't touch page/context (they may already be
-        # closed by wait_for_solve's destroy). Just confirm solved so
-        # the phone tab can close itself.
         return web.json_response({
             "solved": True,
-            "has_cookie": True,
+            "has_cookie": bool(sess.cf_value or sess.final_url),
+            "has_fresh_cookie": bool(sess.cf_value),
+            "has_injected_cookie": False,
+            "cookie_state": "fresh" if sess.cf_value else "gate",
             "title": "",
             "age": time.time() - sess.created_at,
             "host": sess.host,
-            "url": sess.url,
-            "final_url": sess.final_url or "",
-            "iframe_url": "",
             "iframe_mode": "",
             "goto_error": sess.goto_error or "",
             "auto_nudge_failed": sess.auto_nudge_failed,
         })
-    title = ""
     try:
-        if sess.page: title = await sess.page.title()
-    except: pass
-    has_cookie = False
-    try:
-        if sess.context:
-            cookies = await sess.context.cookies()
-            has_cookie = any(c.get("name") == "cf_clearance" for c in cookies)
-    except: pass
-    # Detect whether a Turnstile/challenges iframe is present and grab its
-    # mode (non-interactive, light, managed, interactive) from URL path.
-    iframe_url = ""
-    iframe_mode = ""
-    try:
-        if sess.page:
-            for fr in sess.page.frames:
-                try:
-                    u = (fr.url or "").lower()
-                except Exception:
-                    u = ""
-                if "challenges.cloudflare.com" in u or "turnstile" in u:
-                    iframe_url = fr.url or ""
-                    # mode is in path: /.../light/... or /.../non-interactive/...
-                    from urllib.parse import urlparse
-                    parts = [s for s in urlparse(iframe_url).path.split("/") if s]
-                    for k in ("non-interactive", "light", "managed", "interactive", "captcha"):
-                        if k in parts:
-                            iframe_mode = k
-                            break
-                    break
-    except Exception:
-        pass
+        browser_status = await _run_browser_operation(
+            lambda: _collect_browser_status(sess),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "browser status timed out"}, status=504)
+    except Exception as exc:
+        return web.json_response({"error": type(exc).__name__}, status=500)
+    cookie_status = _cookie_state(sess, browser_status.get("cookies") or [])
     return web.json_response({
-        "solved": sess.solved,
-        "has_cookie": has_cookie,
-        "title": title,
+        "solved": False,
+        **cookie_status,
+        "title": browser_status.get("title") or "",
         "age": time.time() - sess.created_at,
         "host": sess.host,
-        "url": sess.url,
-        "final_url": sess.final_url or "",
-        "iframe_url": iframe_url,
-        "iframe_mode": iframe_mode,
+        "iframe_mode": browser_status.get("iframe_mode") or "",
         "goto_error": sess.goto_error or "",
         "auto_nudge_failed": sess.auto_nudge_failed,
     })
 
 async def handle_health(request):
-    out = {"ok": True, "sessions": len(_SESSIONS), "details": []}
-    for tok, sess in list(_SESSIONS.items()):
-        try:
-            age = time.time() - sess.created_at
-            out["details"].append({
-                "token": tok[:8],
-                "solved": sess.solved,
-                "age": round(age, 1),
-                "url": (sess.url or "")[:80],
-                "goto_error": sess.goto_error or "",
-            })
-        except Exception:
-            pass
-    return web.json_response(out)
+    return web.json_response({"ok": True})
 
 
 async def create_app():
     if web is None:
         raise RuntimeError("aiohttp not installed — pip install aiohttp")
-    app = web.Application()
+    app = web.Application(client_max_size=16 * 1024)
     app.router.add_get("/solve/{token}", handle_solve_page)
     app.router.add_get("/solve/{token}/shot", handle_shot)
     app.router.add_post("/solve/{token}/click", handle_click)
@@ -1664,102 +1753,120 @@ async def start_server():
     if web is None:
         logger.warning("solve_server: aiohttp not installed")
         return
-    if _APP is not None:
-        return
-    _APP = await create_app()
-    _RUNNER = web.AppRunner(_APP)
-    await _RUNNER.setup()
-    _SITE = web.TCPSite(_RUNNER, SOLVE_HOST, SOLVE_PORT)
-    await _SITE.start()
-    logger.info(f"solve_server listening on {SOLVE_HOST}:{SOLVE_PORT} public_base={SOLVE_PUBLIC_BASE}")
+    async with _START_LOCK:
+        if _APP is not None and _RUNNER is not None:
+            return
+        app = None
+        runner = None
+        site = None
+        try:
+            app = await create_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, SOLVE_HOST, SOLVE_PORT)
+            await site.start()
+        except Exception:
+            if site is not None:
+                try: await asyncio.wait_for(site.stop(), timeout=3.0)
+                except Exception: pass
+            if runner is not None:
+                try: await asyncio.wait_for(runner.cleanup(), timeout=5.0)
+                except Exception: pass
+            _APP = None
+            _RUNNER = None
+            _SITE = None
+            raise
+        _APP = app
+        _RUNNER = runner
+        _SITE = site
+    logger.info(f"solve_server listening on {SOLVE_HOST}:{SOLVE_PORT}")
 
 async def stop_server():
     global _APP, _RUNNER, _SITE
-    for token in list(_SESSIONS.keys()):
-        await destroy_session(token)
-    if _SITE is not None:
-        try: await _SITE.stop()
-        except: pass
+    async with _START_LOCK:
+        for token in list(_SESSIONS.keys()):
+            await destroy_session(token)
+        if _SITE is not None:
+            try: await asyncio.wait_for(_SITE.stop(), timeout=3.0)
+            except Exception: pass
+        if _RUNNER is not None:
+            try: await asyncio.wait_for(_RUNNER.cleanup(), timeout=5.0)
+            except Exception: pass
         _SITE = None
-    if _RUNNER is not None:
-        try: await _RUNNER.cleanup()
-        except: pass
         _RUNNER = None
-    _APP = None
+        _APP = None
+        _SOLVED_RESULTS.clear()
 
 async def create_session(url: str, user_id: int, host: str, chat_id: int = 0) -> str:
-    token = uuid.uuid4().hex[:12]
-    sess = SolveSession(token=token, url=url, host=_normalize_domain(host), user_id=user_id, chat_id=chat_id or user_id)
+    safe_url, normalized_host = _validated_target_url(url, host)
     async with _LOCK:
+        if len(_SESSIONS) >= MAX_ACTIVE_SESSIONS:
+            raise SolveBusyError(len(_SESSIONS), MAX_ACTIVE_SESSIONS)
+        while True:
+            token = secrets.token_urlsafe(32)
+            if token not in _SESSIONS:
+                break
+        sess = SolveSession(
+            token=token,
+            url=safe_url,
+            host=normalized_host,
+            user_id=user_id,
+            chat_id=chat_id or user_id,
+        )
         _SESSIONS[token] = sess
-    # Keep a handle on the launch task and capture its exception into
-    # goto_error. Previously this was a bare create_task with no
-    # reference, so a launch crash surfaced only as "Task exception was
-    # never retrieved" and the user's page sat on "loading" forever.
     async def _launch_wrapped():
         try:
             await _launch_for_session(sess)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            sess.goto_error = f"browser launch failed: {exc!r}"
+            sess.goto_error = f"browser launch failed: {type(exc).__name__}"
             logger.exception("[solve_server] _launch_for_session crashed")
+            try:
+                await close_browser_objects([sess.browser], timeout=CLEANUP_TIMEOUT)
+            finally:
+                sess.browser = None
+                sess.context = None
+                sess.page = None
     sess.launch_task = asyncio.create_task(_launch_wrapped())
-    # SESSION_TTL caps how long the VPS browser + solve page stay alive
-    # for any single token. Solved sessions are destroyed as soon as
-    # `wait_for_solve` returns; the safety-net `_expire` destroys any
-    # session that outlasts SESSION_TTL even if `wait_for_solve` was
-    # never called.
-    #
-    # NOTE: do NOT expire failed sessions early. The bot waits up to
-    # 90-120s for a solve AND the user needs time to open the link on
-    # their phone — a 60s fast-expiry raced the user's click and
-    # produced "Invalid or expired solve link" on a perfectly good
-    # token. Every session gets the full TTL.
     async def _expire():
-        for _ in range(SESSION_TTL):
-            await asyncio.sleep(1)
-            if sess.solved:
-                break
-        if token in _SESSIONS:
+        await asyncio.sleep(SESSION_TTL)
+        if _SESSIONS.get(token) is sess:
+            sess.expired = True
             await destroy_session(token)
-    asyncio.create_task(_expire())
+    sess.expire_task = asyncio.create_task(_expire())
     return token
 
 async def destroy_session(token: str):
-    sess = _SESSIONS.pop(token, None)
+    async with _LOCK:
+        sess = _SESSIONS.pop(token, None)
     if not sess:
         return
-    if sess.poll_task:
-        try: sess.poll_task.cancel()
-        except: pass
-    if sess.auto_nudge_task:
-        try: sess.auto_nudge_task.cancel()
-        except: pass
-    if sess.launch_task:
-        try: sess.launch_task.cancel()
-        except: pass
-    try:
-        if sess.page:
-            try: await sess.page.close()
-            except: pass
-        if sess.context:
-            try: await sess.context.close()
-            except: pass
-        if sess.browser:
-            try: await sess.browser.close()
-            except: pass
-        if sess.pw:
-            try: await sess.pw.stop()
-            except: pass
-    except: pass
+    sess.closing = True
+    tasks = [sess.poll_task, sess.auto_nudge_task, sess.launch_task, sess.expire_task]
+    current = asyncio.current_task()
+    owned = []
+    for task in tasks:
+        if task is None or task is current or task in owned:
+            continue
+        if not task.done():
+            task.cancel()
+        owned.append(task)
+    if owned:
+        await cancel_tasks(owned, timeout=CLEANUP_TIMEOUT)
+    await close_browser_objects([sess.page, sess.context, sess.browser], timeout=CLEANUP_TIMEOUT)
+    sess.page = None
+    sess.context = None
+    sess.browser = None
+    sess.pw = None
 
 def get_session(token: str) -> Optional[SolveSession]:
     return _SESSIONS.get(token)
 
 def get_public_url(token: str) -> str:
-    base = SOLVE_PUBLIC_BASE.rstrip("/")
-    return f"{base}/solve/{token}"
+    if not _SOLVE_TOKEN_RE.fullmatch(token or ""):
+        raise ValueError("invalid solve token")
+    return f"{validate_solve_public_base()}/solve/{token}"
 
 async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
     sess = _SESSIONS.get(token)
@@ -1767,24 +1874,16 @@ async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
         return False
     solved = False
     try:
-        await asyncio.wait_for(sess.event.wait(), timeout=timeout)
-        solved = sess.solved
+        await asyncio.wait_for(sess.event.wait(), timeout=max(0.0, float(timeout)))
+        solved = bool(sess.solved and not sess.closing)
     except asyncio.TimeoutError:
         solved = False
+    except asyncio.CancelledError:
+        raise
     finally:
-        # Audit finding C5: stop leaking the headed Chromium once the
-        # bot has the cookie (or has given up waiting). The user's
-        # phone page may still be open, but the JS status poller
-        # now sees `solved=true` and closes the tab.
-        if solved:
-            # Fix A: hold the session ~25s before destroy so the user's
-            # in-app browser (Telegram mobile is a one-shot GET — it
-            # does NOT keep the JS poller running) has time to fetch
-            # /status once and self-close. Without this, the destroy
-            # races the user's tap: VPS auto-captures the cookie in
-            # ~8s locally, the bot retries the page and succeeds,
-            # destroy_session fires, and the user clicks their
-            # already-dead link to find "Invalid or expired".
-            await asyncio.sleep(25)
+        try:
+            if solved:
+                await asyncio.sleep(25)
+        finally:
             await destroy_session(token)
     return solved

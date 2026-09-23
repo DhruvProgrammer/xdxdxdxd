@@ -13,6 +13,12 @@ import re
 from typing import Tuple
 
 from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, _normalize_domain
+from xdmovies.browser_runtime import (
+    GATE_HOST,
+    close_browser_objects,
+    is_cf_challenge_page,
+    validate_gate_destination_url,
+)
 
 
 # Audit finding L6: removed the sync `follow_download_link` (httpx
@@ -41,8 +47,8 @@ async def follow_download_link_in_browser_async(
     # domains; otherwise the gate is guaranteed to challenge.
     # Audit finding C3.
     cookies = list(get_cookies_for_url(download_url))
-    cookies.extend(get_cookies_for_url("https://latestnewsonline.sbs/"))
-    ua = get_user_agent_for_url(download_url)
+    cookies.extend(get_cookies_for_url(f"https://{GATE_HOST}/"))
+    ua = get_user_agent_for_url(f"https://{GATE_HOST}/")
 
     browser = await launch_chromium(
         browser_type="chromium", headless=False, useragent=ua,
@@ -53,19 +59,13 @@ async def follow_download_link_in_browser_async(
         ctx_kwargs = {}
         if ua:
             ctx_kwargs["user_agent"] = ua
-        try:
-            ctx = await browser.new_context(**ctx_kwargs)
-            page = await ctx.new_page()
-        except Exception:
-            page = await browser.new_page()
-        if cookies and ctx is not None:
+        ctx = await browser.new_context(**ctx_kwargs)
+        page = await ctx.new_page()
+        if cookies:
             try:
                 await ctx.add_cookies(cookies)
             except Exception:
-                try:
-                    await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
-                except Exception:
-                    pass
+                await ctx.add_cookies([{**c, "domain": c["domain"].lstrip(".")} for c in cookies])
         await page.set_extra_http_headers({
             "Referer": "https://top.xdmovies.wtf/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -75,104 +75,61 @@ async def follow_download_link_in_browser_async(
             await page.route(re.compile(r"\.(png|jpe?g|css|woff2?|gif|svg|ico)$"), lambda r: r.abort())
         except Exception:
             pass
-        try:
-            resp = await page.goto(download_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        except Exception:
-            resp = None
+        response = await page.goto(download_url, wait_until="domcontentloaded", timeout=timeout_ms)
         try:
             await page.wait_for_load_state("load", timeout=4000)
         except Exception:
             pass
         await asyncio.sleep(0.6)
         final_url = page.url
-        status = resp.status if resp else 0
-        try:
-            title = (await page.title()) or ""
-            html = await page.content()
-            # Tighter detection (same as live_solver.py proven on xdmovies):
-            # only flag challenge if title is the real "Just a moment" interstitial,
-            # or the body has the explicit CF marker. Don't flag on bare
-            # "challenge-platform/turnstile" substring — those words appear in
-            # post-clearance pages too (CSP meta + script tags).
-            is_chal = ("Just a moment" in title or "Checking your browser" in title or "cf-mitigated" in html)
-            if is_chal:
-                # for latestnews invisible (non-interactive, no box) — try passive auto-wait before asking human
-                mode = "unknown"
-                try:
-                    for fr in page.frames:
-                        u = (fr.url or "").lower()
-                        if "challenges.cloudflare.com" in u and "turnstile" in u or "challenge-platform" in u:
-                            from urllib.parse import urlparse as _up
-                            parts = [s for s in _up(fr.url).path.split("/") if s]
-                            for k in ("non-interactive", "light", "managed", "interactive", "captcha"):
-                                if k in parts:
-                                    mode = k
-                                    break
-                            break
-                except Exception:
-                    pass
-                if mode == "non-interactive":
-                    # invisible fingerprint — no click needed, just wait 8s for auto-verify
-                    await asyncio.sleep(8)
-                    try:
-                        title2 = (await page.title()) or ""
-                        html2 = await page.content()
-                        still = ("Just a moment" in title2 or "Checking your browser" in title2 or "cf-mitigated" in html2)
-                        if not still:
-                            # auto-solved — only save cookie if it's actually fresh
-                            # (don't overwrite good cookie with the same injected one)
-                            try:
-                                cookies = await page.context.cookies()
-                                dest_host = _normalize_domain(final_url)
-                                from xdmovies.cookie_store import get_entry
-                                old_entry = get_entry(dest_host) or {}
-                                old_cf = (old_entry.get("cf_clearance") or "")
-                                for c in cookies:
-                                    if c.get("name") == "cf_clearance" and len(c.get("value","")) > 20:
-                                        new_val = c.get("value")
-                                        if new_val != old_cf:
-                                            # only save when value actually changed — fresh from CF
-                                            from xdmovies.cookie_store import set_cookies_for_domain
-                                            set_cookies_for_domain(dest_host, f"cf_clearance={new_val}")
-                                        break
-                            except Exception:
-                                pass
-                        else:
-                            dest_host = _normalize_domain(final_url)
-                            from xdmovies.cookie_store import get_entry
-                            if not get_entry(dest_host):
-                                raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
-                            else:
-                                raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
-                    except CFChallengeError:
-                        raise
-                    except Exception:
-                        pass
-                else:
-                    dest_host = _normalize_domain(final_url)
-                    from xdmovies.cookie_store import get_entry
-                    if not get_entry(dest_host):
-                        raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
-                    else:
-                        raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
-        except CFChallengeError:
-            raise
-        except Exception:
-            pass
-        text = await page.evaluate("document.documentElement.outerHTML") or ""
+        if await is_cf_challenge_page(page, response=response):
+            mode = "unknown"
+            try:
+                for fr in page.frames:
+                    frame_url = (fr.url or "").lower()
+                    if "challenges.cloudflare.com" in frame_url or "challenge-platform" in frame_url:
+                        from urllib.parse import urlparse as _up
+                        parts = [s for s in _up(fr.url).path.split("/") if s]
+                        for key in ("non-interactive", "light", "managed", "interactive", "captcha"):
+                            if key in parts:
+                                mode = key
+                                break
+                        break
+            except Exception:
+                pass
+            if mode == "non-interactive":
+                await asyncio.sleep(8)
+                final_url = page.url
+            if await is_cf_challenge_page(page):
+                dest_host = _normalize_domain(final_url)
+                from xdmovies.cookie_store import get_entry
+                if not get_entry(dest_host):
+                    raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
+                raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
+            try:
+                actual_user_agent = str(await page.evaluate("navigator.userAgent") or ua or "")
+                stored_cookies = await page.context.cookies()
+                dest_host = _normalize_domain(final_url)
+                from xdmovies.cookie_store import get_entry, set_cookies_for_domain
+                old_entry = get_entry(dest_host) or {}
+                old_cf = old_entry.get("cf_clearance") or ""
+                for cookie in stored_cookies:
+                    if cookie.get("name") == "cf_clearance" and len(cookie.get("value", "")) > 20:
+                        if cookie.get("value") != old_cf:
+                            await asyncio.to_thread(
+                                set_cookies_for_domain,
+                                dest_host,
+                                f"cf_clearance={cookie['value']}",
+                                user_agent=actual_user_agent,
+                            )
+                        break
+            except CFChallengeError:
+                raise
+            except Exception:
+                pass
+        final_url = validate_gate_destination_url(page.url)
+        status = response.status if response is not None else 0
+        text = await page.content()
         return final_url, status, text
     finally:
-        try:
-            if page is not None:
-                await page.close()
-        except Exception:
-            pass
-        try:
-            if ctx is not None:
-                await ctx.close()
-        except Exception:
-            pass
-        try:
-            await browser.close()
-        except Exception:
-            pass
+        await close_browser_objects([page, ctx, browser], timeout=10.0)

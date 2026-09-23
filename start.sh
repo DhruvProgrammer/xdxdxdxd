@@ -18,7 +18,9 @@ fi
 SOLVE_PORT="${SOLVE_SERVER_PORT:-8080}"
 export SOLVE_SERVER_HOST="${SOLVE_SERVER_HOST:-0.0.0.0}"
 export SOLVE_SERVER_PORT="$SOLVE_PORT"
-export SOLVE_SERVER_PUBLIC_BASE="${SOLVE_SERVER_PUBLIC_BASE:-http://$VPS_IP:$SOLVE_PORT}"
+if [[ -n "${SOLVE_SERVER_PUBLIC_BASE:-}" ]]; then
+    export SOLVE_SERVER_PUBLIC_BASE
+fi
 
 DISPLAY="${DISPLAY-}"
 HOME="${HOME:-$USERPROFILE}"
@@ -45,7 +47,6 @@ AWK_BIN="$(command -v awk 2>/dev/null || true)"
 GETOPT_BIN="$(command -v getopt 2>/dev/null || true)"
 [[ -x "$GETOPT_BIN" ]] || GETOPT_BIN="/usr/bin/getopt"
 
-# Sanity: if any of these are missing/non-executable, fall back to no-xvfb.
 if [[ -n "$XVFB_BIN" && -x "$AWK_BIN" && -x "$GETOPT_BIN" ]]; then
     if [[ "$USE_XVFB" == "1" && -z "$DISPLAY" ]]; then
         NEEDS_XVFB=1
@@ -53,10 +54,14 @@ if [[ -n "$XVFB_BIN" && -x "$AWK_BIN" && -x "$GETOPT_BIN" ]]; then
         export XVFB_RUN="$XVFB_BIN"
     fi
 else
-    echo "[start.sh] xvfb-run not usable (xvfb=$XVFB_BIN awk=$AWK_BIN getopt=$GETOPT_BIN) — running headless"
-    NEEDS_XVFB=0
+    XVFB_BIN=""
 fi
-[[ "$NEEDS_XVFB" == "1" ]] && echo "[start.sh] wrapping in xvfb-run (solve link http://$VPS_IP:$SOLVE_PORT/solve/<token> will be deleted after capture)"
+if [[ "$NEEDS_XVFB" != "1" && -z "$DISPLAY" ]]; then
+    echo "[start.sh] FATAL: headed Chromium requires DISPLAY or a usable xvfb-run." >&2
+    echo "[start.sh] Install Xvfb or set DISPLAY before starting." >&2
+    exit 1
+fi
+[[ "$NEEDS_XVFB" == "1" ]] && echo "[start.sh] wrapping in xvfb-run"
 
 # ---------------------------------------------------------------------------
 # Early .env sanity check — refuse to start with the placeholder
