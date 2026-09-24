@@ -210,34 +210,69 @@ does not sleep mid-import.
 
 ---
 
-## Plugin side
+## Plugin side — included
 
-1. Post-meta box: **"Send to xdmovies resolver"** → stores `job_id` in
-   `_xdm_job_id` post meta.
-2. WP-Cron (30s) polls `/xdm-result/<job_id>` for posts that still have a
-   `job_id` and no terminal marker.
-3. On `needs_human`, render an admin notice with the `solve_url` — do not
-   resend the request, the bot resumes by itself once solved.
-4. On `done`, build your existing pipe rows from `result.cards` and call the
-   route you already have:
+The WordPress plugin ships in this repo at
+`wp-plugins/xdmovies-bridge/`. Build an installable zip with:
+
+```bash
+python -c "
+import zipfile, pathlib
+root = pathlib.Path('wp-plugins')
+with zipfile.ZipFile('xdmovies-bridge.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for p in sorted(root.rglob('*')):
+        if p.is_file():
+            z.write(p, p.relative_to(root).as_posix())
+"
+```
+
+Then upload `xdmovies-bridge.zip` in **wp-admin → Plugins → Add New**. Do not
+build the zip with PowerShell's `Compress-Archive` or .NET `CreateFromDirectory`
+— both write Windows backslash separators, which WordPress's `PclZip` fallback
+cannot extract.
+
+| File | Role |
+|---|---|
+| `xdmovies-bridge.php` | Plugin header + bootstrap |
+| `includes/class-xdm-regex.php` | Quality / language / source-tag / host parsing (ported from `4kbolly.py`) |
+| `includes/class-xdm-shortener.php` | cinealert shortener, multi-format response handling |
+| `includes/class-xdm-bridge-client.php` | HTTP to the Render bridge (never sees the bot key) |
+| `includes/class-xdm-writer.php` | Builds the `<b>QUALITY</b>` pipe rows, calls `auto-post` / `append-links` |
+| `includes/class-xdm-jobs.php` | Job CPT, WP-Cron poller, `needs_human` handling |
+| `includes/class-xdm-admin.php` | Settings screen, editor meta box, AJAX, job list |
+| `tests/run-tests.php` | Standalone tests for the ported parsing logic |
+
+Run the tests on the server (or any PHP 7.4+ box):
+
+```bash
+php wp-plugins/xdmovies-bridge/tests/run-tests.php
+```
+
+Then in wp-admin: **xDMovies Bridge** → set the bridge URL, bridge key, tgmories
+URL, tgmories `secret_key`, and the shortener endpoint. Open any post, paste an
+xdmovies URL into the **xDMovies Resolver** box, and click **Resolve with bot**.
+
+### What the plugin does on `done`
+
+It builds exactly the rows the importer already parses, then calls your
+existing routes:
 
 ```
 <b>2160P</b>
-2160P NF WEB-DL DDP5.1 H.265 HINDI, TAMIL [HUBCLOUD]|<shortened>|<size>
+2160P NF WEB-DL DDP5.1 ATMOS H.265 HINDI, TAMIL [HUBCLOUD]|<shortened>|13.02 GB
 <b>1080P</b>
-...
+1080P NF WEB-DL DDP5.1 H.264 HINDI, TAMIL [HUBDRIVE]|<shortened>|4.90 GB
 ```
 
-   Derive the quality/host/source tags from `raw_title` + `url` (port
-   `extract_quality` / `identify_host` / `extract_source_tag` from
-   `4kbolly.py`), shorten via cinealert, then `POST /tgmovies/v1/auto-post`
-   with `merge_links: true`. If it answers `already imported`, call
-   `/tgmovies/v1/append-links` instead.
-5. Mark the post meta done so cron stops polling.
+via `POST /?rest_route=/tgmovies/v1/auto-post` with `merge_links: true`. If the
+importer answers "already imported", it retries on
+`/?rest_route=/tgmovies/v1/append-links`. The plugin sanitises `raw_title` and
+`url` before they reach `post_content`.
 
-The plugin is responsible for sanitising `raw_title` and `url` before they go
-into `post_content` — they come from a scraped page and must be escaped on
-output.
+Polling runs on a one-minute WP-Cron schedule **and** opportunistically on
+admin page loads, so a finished result appears while you are looking at the
+screen. `needs_human` renders an admin notice with the bot's solve link; the bot
+resumes on its own once you tap the checkbox — do not resend the request.
 
 ---
 
