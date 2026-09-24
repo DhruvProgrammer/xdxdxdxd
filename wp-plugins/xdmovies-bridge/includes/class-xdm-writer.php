@@ -46,25 +46,31 @@ class XDM_Writer {
 			$host    = XDM_Regex::host( $dest );
 
 			// Per-card language: explicit card metadata first, then what the
-			// filename carries, then the page-level audio block.
+			// filename carries, then the page-level audio block. Technical
+			// source tags ride along in front of a real language so the
+			// importer's quality dropdown tells releases apart
+			// ("1080P NF WEB-DL ..." rather than bare "1080P").
 			$language = XDM_Regex::languages( isset( $card['language'] ) ? $card['language'] : '' );
 			if ( 'Unknown Audio' === $language ) {
 				$language = XDM_Regex::languages( $title );
 			}
-			$tags = XDM_Regex::source_tags( $title );
 			if ( 'Unknown Audio' === $language ) {
-				$language = '' !== $tags ? $tags : $page_language;
-			} elseif ( '' !== $tags ) {
-				$language = $tags . ' ' . $language;
+				$language = ( '' !== $page_language && 'Unknown Audio' !== $page_language )
+					? $page_language
+					: '';
 			}
-			if ( 'Unknown Audio' === $language ) {
-				$language = '';
+			$tags = XDM_Regex::source_tags( $title );
+			if ( '' !== $tags ) {
+				$language = '' !== $language ? $tags . ' ' . $language : $tags;
 			}
 
 			$label  = XDM_Regex::row_label( $quality, $language, $host );
 			$short  = XDM_Shortener::shorten( $dest );
 			$rows[] = array(
-				'quality' => $quality,
+				// Uppercased because the importer renders this as the
+				// "<b>QUALITY</b>" group header, and 4kbolly always
+				// emitted "2160P", never "2160p".
+				'quality' => strtoupper( $quality ),
 				'row'     => $label . '|' . $short . '|' . $size,
 			);
 		}

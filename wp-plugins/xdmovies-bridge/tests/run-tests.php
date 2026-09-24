@@ -179,9 +179,15 @@ ok(
 	XDM_Regex::source_tags( 'The Purge 2013 1080p BluRay Hindi DDP 5.1 English DTS 5.1 x264' ),
 	'BLURAY DDP5.1 DTS5.1 X264'
 );
-ok( 'itunes tag', XDM_Regex::source_tags( 'Show.S01E01.1080p.iP.WEB-DL' ), 'IT WEB-DL' );
+ok( 'itunes tag', XDM_Regex::source_tags( 'Show.S01E01.1080p.iT.WEB-DL' ), 'IT WEB-DL' );
+ok( 'lowercase it is not itunes', XDM_Regex::source_tags( 'Show.S01E01.1080p.it.WEB-DL' ), 'WEB-DL' );
 ok( 'no english-word false it', XDM_Regex::source_tags( 'It.2017.1080p.BluRay' ), 'BLURAY' );
-ok( 'release group not leaked', XDM_Regex::source_tags( 'Movie.2024.1080p.WEB-DL.x265-XDMovies.com' ), 'WEB-DL H.265' );
+// x265 is a distinct tag from H.265 and 4kbolly kept it verbatim, so the
+// canonical map only rewrites the H* forms. Matching that is the point.
+ok( 'x265 kept verbatim', XDM_Regex::source_tags( 'Movie.2024.1080p.WEB-DL.x265-XDMovies.com' ), 'WEB-DL X265' );
+ok( 'h265 canonicalised', XDM_Regex::source_tags( 'Movie.2024.2160p.WEB-DL.H265' ), 'WEB-DL H.265' );
+ok( 'h.264 canonicalised', XDM_Regex::source_tags( 'Movie.2024.1080p.WEB-DL.H.264' ), 'WEB-DL H.264' );
+ok( 'release group not leaked', XDM_Regex::source_tags( 'Movie.2024.1080p.WEB-DL.H.265-PrimeFix' ), 'WEB-DL H.265' );
 
 // ---- host ---------------------------------------------------------------
 
@@ -254,6 +260,64 @@ section( 'build_rows edge cases' );
 ok( 'no cards -> WP_Error', is_wp_error( XDM_Writer::build_rows( array( 'cards' => array() ) ) ), true );
 $all_failed = XDM_Writer::build_rows( array( 'cards' => array( array( 'url' => '', 'raw_title' => 'x' ) ) ) );
 ok( 'all unresolved -> WP_Error', is_wp_error( $all_failed ), true );
+
+// Regression: the filename's source tags must not REPLACE the page-level
+// language. Before the fix, a card whose filename carried tags but no
+// language keyword put the tags in the language slot and dropped
+// "Hindi, Tamil" entirely.
+section( 'language fallback (regression)' );
+$base_card = array( 'size' => '', 'language' => '', 'status' => 'resolved' );
+
+$rows = XDM_Writer::build_rows( array(
+	'language' => 'Hindi, Tamil',
+	'cards'    => array( $base_card + array(
+		'raw_title' => 'Movie.2024.2160p.NF.WEB-DL.DDP5.1.H.265',
+		'url'       => 'https://hubcloud.ist/drive/x',
+	) ),
+) );
+ok(
+	'tags + page language kept',
+	$rows,
+	"<b>2160P</b>\n2160P NF WEB-DL DDP5.1 H.265 HINDI, TAMIL [HUBCLOUD]|https://hubcloud.ist/drive/x|"
+);
+
+$rows = XDM_Writer::build_rows( array(
+	'language' => '',
+	'cards'    => array( $base_card + array(
+		'raw_title' => 'Movie.2024.2160p.NF.WEB-DL.DDP5.1.H.265',
+		'url'       => 'https://hubcloud.ist/drive/x',
+	) ),
+) );
+ok(
+	'tags alone when no language anywhere',
+	$rows,
+	"<b>2160P</b>\n2160P NF WEB-DL DDP5.1 H.265 [HUBCLOUD]|https://hubcloud.ist/drive/x|"
+);
+
+$rows = XDM_Writer::build_rows( array(
+	'language' => 'Unknown Audio',
+	'cards'    => array( $base_card + array(
+		'raw_title' => 'Movie.2024.720p',
+		'url'       => 'https://hubcloud.ist/drive/x',
+	) ),
+) );
+ok(
+	'no tags no language -> bare label',
+	$rows,
+	"<b>720P</b>\n720P [HUBCLOUD]|https://hubcloud.ist/drive/x|"
+);
+
+// Group header must be uppercase: 4kbolly always emitted "2160P".
+section( 'group header casing' );
+$rows = XDM_Writer::build_rows( array(
+	'language' => 'Hindi',
+	'cards'    => array( $base_card + array(
+		'raw_title' => 'Movie.2024.2160p.WEB-DL',
+		'url'       => 'https://hubcloud.ist/drive/a',
+	) ),
+) );
+ok( 'header uppercased', ( false !== strpos( $rows, '<b>2160P</b>' ) ), true );
+ok( 'header not lowercase', ( false === strpos( $rows, '<b>2160p</b>' ) ), true );
 
 // ---- report -------------------------------------------------------------
 
