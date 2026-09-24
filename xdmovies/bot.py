@@ -29,7 +29,7 @@ import traceback
 import types
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from xdmovies.extractor import Card
 from xdmovies import bot_config
@@ -639,6 +639,56 @@ async def _finalize_gate_card(card, dest: str, result) -> str:
     return dest
 
 
+def _api_serialize(job, result, results, elapsed: float,
+                   truncated: bool = False) -> Dict[str, Any]:
+    """Turn a finished API job into the JSON the WordPress bridge consumes.
+
+    Deliberately raw: no URL shortening, no quality grouping, no WP
+    formatting. That logic already lives in the plugin (ported from
+    4kbolly.py) and duplicating those regexes across languages is how they
+    drift. The bridge derives quality/host/source-tags from `raw_title` +
+    `url` and renders the pipe-delimited rows itself.
+    """
+    from xdmovies.extractor import extract_tmdb_code
+    cards_out: List[Dict[str, Any]] = []
+    resolved = 0
+    failed = 0
+    for i, (card, dest, err) in enumerate(results, 1):
+        ok = bool(dest) and not err
+        if ok:
+            resolved += 1
+        else:
+            failed += 1
+        cards_out.append({
+            "index": i,
+            "raw_title": getattr(card, "title", "") or "",
+            "size": getattr(card, "size", "") or "",
+            "language": getattr(card, "language", "") or "",
+            "url": dest or "",
+            "status": "resolved" if ok else "failed",
+            "error": None if ok else (err or "unknown error"),
+        })
+    return {
+        "title": (getattr(result, "page_title", "") or "").strip(),
+        "tmdb_id": extract_tmdb_code(getattr(job, "url", "") or "") or None,
+        "language": getattr(result, "audios", "") or "",
+        "meta": {
+            "rating": getattr(result, "rating", "") or "",
+            "genres": getattr(result, "genres", "") or "",
+            "first_air": getattr(result, "air_date", "") or "",
+            "sources": getattr(result, "sources", "") or "",
+        },
+        "cards": cards_out,
+        "stats": {
+            "total": len(cards_out),
+            "resolved": resolved,
+            "failed": failed,
+            "elapsed_s": round(float(elapsed), 1),
+            "truncated": bool(truncated),
+        },
+    }
+
+
 MAX_LINKS_PER_MESSAGE = 10000
 
 
@@ -1101,6 +1151,10 @@ class Job:
     # drained at movie boundaries inside _run_scrape_all, then the
     # scrape resumes. Never set directly — use _enqueue(..., urgent=True).
     priority: int = 0
+    # WordPress bridge (job_type="api"): the api_store row this job is
+    # writing results into. Jobs in this lane live in Bot._api and are
+    # never touched by /cancel or /queue — use DELETE /api/v1/jobs/<id>.
+    api_job_id: str = ""
 
 
 class Bot:
@@ -1132,6 +1186,12 @@ class Bot:
         # Drained movie-by-movie inside _run_scrape_all; _pick_next also
         # prefers it so a queued-but-not-started scrape can't starve it.
         self._urgent: collections.deque[Job] = collections.deque()
+        # API lane: WordPress bridge jobs. Lowest priority by design — a
+        # pasted Telegram link always wins. Picked only when both other
+        # lanes are empty, and a running API job yields at every card
+        # boundary while interactive work is waiting. Kept separate from
+        # queue/_urgent so /queue and /cancel never touch these.
+        self._api: collections.deque[Job] = collections.deque()
         self.current: Optional[Job] = None
         self.last_solve_ago: Optional[float] = None
         self.error_count: int = 0
@@ -1156,6 +1216,9 @@ class Bot:
     def _urgent_depth(self) -> int:
         return len(self._urgent)
 
+    def _api_depth(self) -> int:
+        return len(self._api)
+
     def _total_depth(self) -> int:
         return len(self.queue) + len(self._urgent)
 
@@ -1176,6 +1239,13 @@ class Bot:
             self._queue_cond.notify_all()
             return len(self._urgent) + len(self.queue)
 
+    async def _enqueue_api(self, job: Job) -> int:
+        """Push a WordPress-bridge job onto the lowest-priority lane."""
+        async with self._queue_cond:
+            self._api.append(job)
+            self._queue_cond.notify_all()
+            return len(self._api)
+
     async def _pop_urgent(self) -> Optional[Job]:
         """Pop one urgent job (FIFO). None when empty. Never blocks."""
         async with self._queue_cond:
@@ -1187,17 +1257,20 @@ class Bot:
         return len(self._urgent) > 0
 
     async def _pick_next(self) -> Job:
-        # Block until either lane has a job, then atomically pop.
-        # Urgent lane first so a queued-but-not-started scrape can't
-        # starve an urgent link. Replaces the previous `popleft()` which
+        # Block until any lane has a job, then atomically pop.
+        # Strict priority: urgent -> normal (Telegram) -> api (WordPress).
+        # The api lane is last so a pasted link never waits behind a bulk
+        # WordPress import. Replaces the previous `popleft()` which
         # raised IndexError on every empty-queue iteration, flooding the
         # log with `dispatcher loop error; sleeping 1s`.
         async with self._queue_cond:
-            while not self.queue and not self._urgent:
+            while not self.queue and not self._urgent and not self._api:
                 await self._queue_cond.wait()
             if self._urgent:
                 return self._urgent.popleft()
-            return self.queue.popleft()
+            if self.queue:
+                return self.queue.popleft()
+            return self._api.popleft()
 
     async def _snapshot_queue(self) -> List[Job]:
         """Atomic snapshot under the queue lock."""
@@ -1264,6 +1337,47 @@ class Bot:
                 continue
         return ran
 
+    async def _yield_to_telegram(self, parent_job: Job) -> int:
+        """Let one interactive job run ahead of a running API job.
+
+        Called at API card boundaries. Pops exactly ONE Telegram job
+        (urgent lane first) and runs it inline, so the API job keeps
+        `current` and resumes straight after. Bounded to one job so a long
+        Telegram backlog still lets the API job make forward progress
+        between cards instead of starving behind the whole queue.
+        Returns 1 when a job was run, 0 when nothing was waiting.
+        """
+        if parent_job.cancel_event.is_set():
+            return 0
+        nxt: Optional[Job] = None
+        async with self._queue_cond:
+            if self._urgent:
+                nxt = self._urgent.popleft()
+            elif self.queue:
+                nxt = self.queue.popleft()
+        if nxt is None or nxt.cancel_event.is_set():
+            return 0
+        _LOG.info("api job yielding to telegram job: %s", nxt.url[:90])
+        try:
+            await self._drop_enqueue_note(nxt)
+            await self._run_for_user(nxt)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            _LOG.exception("api-yield telegram job failed: %s", nxt.url)
+            try:
+                nxt.error = f"{exc.__class__.__name__}: {exc}"
+                nxt.status = "cancelled" if nxt.cancel_event.is_set() else "error"
+                nxt.finished_at = time.time()
+            except Exception:
+                pass
+        finally:
+            try:
+                await self._drop_job_clutter(nxt)
+            except Exception:
+                pass
+        return 1
+
     # ---- progress messages ----------------------------------------------
     async def _set_progress(self, job: Job, text: str) -> None:
         if self._bot is None:
@@ -1311,10 +1425,263 @@ class Bot:
         except Exception:
             pass
 
+    # ---- WordPress bridge (job_type="api") -----------------------------
+    async def _run_api_job(self, job: Job) -> None:
+        """Resolve one movie/series for the WordPress bridge.
+
+        Same primitives as the Telegram path (extract -> per-card follow ->
+        gate drive) but zero Telegram traffic: no solve-link message, no
+        wait pill, no batch, no summary. A hard Cloudflare block parks the
+        job in `needs_human` and RETURNS, releasing the dispatcher slot;
+        `_api_await_solve` owns the solve session and re-queues the job
+        once the cookie lands. Without that release a parked job would
+        block interactive Telegram work for the whole session TTL.
+
+        Cancellation is checked per card from two sources: the in-memory
+        Job.cancel_event (DELETE handler) and the durable cancel_flag in
+        api_store (survives a bot restart mid-scrape).
+        """
+        from xdmovies import api_store
+        from xdmovies.cookie_store import CFChallengeError
+        from xdmovies.api_server import API_MAX_CARDS
+
+        job_id = job.api_job_id
+        if not job_id:
+            _LOG.error("api job without api_job_id; dropping")
+            return
+        started = time.time()
+        job.started_at = started
+        job.status = "running"
+        api_store.set_status(job_id, api_store.STATUS_RUNNING)
+
+        try:
+            _load_pipeline()
+        except Exception as exc:
+            api_store.set_status(job_id, api_store.STATUS_FAILED,
+                                 error=f"pipeline-import: {exc!r}")
+            return
+
+        session_id = f"api_{job_id}"
+        try:
+            result = await _extract_with_diagnostics(  # type: ignore[misc]
+                job.url, session_id=session_id, headless=False)
+        except CFChallengeError as exc:
+            await self._api_park(job, getattr(exc, "url", "") or job.url,
+                                 getattr(exc, "host", "") or "xdmovies.wtf")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            api_store.set_status(job_id, api_store.STATUS_FAILED,
+                                 error=f"extract: {exc.__class__.__name__}: {exc}")
+            return
+
+        cards = list(getattr(result, "cards", None) or [])
+
+        if job.card_filter in ("episodes", "packs"):
+            try:
+                from xdmovies.extractor import filter_cards_by_content
+                cards = list(filter_cards_by_content(cards, job.card_filter))
+                result.cards = cards
+            except Exception:
+                _LOG.exception("api job %s: content filter failed", job_id)
+
+        if not cards:
+            api_store.set_status(
+                job_id, api_store.STATUS_FAILED,
+                error="no download links found on page")
+            return
+
+        truncated = False
+        if API_MAX_CARDS > 0 and len(cards) > API_MAX_CARDS:
+            cards = cards[:API_MAX_CARDS]
+            truncated = True
+            _LOG.warning("api job %s truncated %d -> %d cards (API_MAX_CARDS)",
+                         job_id, len(cards), API_MAX_CARDS)
+
+        n = len(cards)
+        job.cards_total = n
+        results: List[Tuple[Card, Optional[str], Optional[str]]] = []
+
+        for i, card in enumerate(cards, 1):
+            if job.cancel_event.is_set() or api_store.cancel_requested(job_id):
+                api_store.set_status(job_id, api_store.STATUS_CANCELLED)
+                return
+            if i > 1:
+                try:
+                    await self._yield_to_telegram(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _LOG.exception("api job %s: telegram yield failed", job_id)
+                if job.cancel_event.is_set() or api_store.cancel_requested(job_id):
+                    api_store.set_status(job_id, api_store.STATUS_CANCELLED)
+                    return
+
+            dest: Optional[str] = None
+            err: Optional[str] = None
+            try:
+                from xdmovies.link_exec import _is_destination_url as _is_dest_url
+                if _is_dest_url(card.url):
+                    dest = await _finalize_gate_card(card, card.url, result)
+                else:
+                    if _is_gate_url(card.url):
+                        url2 = card.url
+                    else:
+                        url2, _status, _text = await _follow_download_link(  # type: ignore[misc]
+                            card.url, session_id=session_id, headless=self.headless)
+                    if not url2:
+                        err = "follow returned empty URL"
+                    else:
+                        for attempt in range(2):
+                            try:
+                                dest = await _execute_button_flow(  # type: ignore[misc]
+                                    url2, session_id=session_id, headless=False)
+                            except CFChallengeError as exc:
+                                await self._api_park(
+                                    job, getattr(exc, "url", "") or url2,
+                                    getattr(exc, "host", "") or "latestnewsonline.sbs")
+                                return
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                err = f"button flow: {exc.__class__.__name__}: {exc}"
+                                _LOG.exception("api job %s: button flow failed %s",
+                                               job_id, url2)
+                                break
+                            if dest:
+                                dest = await _finalize_gate_card(card, dest, result)
+                                break
+                            if attempt == 0:
+                                await asyncio.sleep(2.0)
+                            else:
+                                err = "button flow returned empty"
+            except CFChallengeError as exc:
+                await self._api_park(job, getattr(exc, "url", "") or card.url,
+                                     getattr(exc, "host", "") or "xdmovies.wtf")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                err = f"{exc.__class__.__name__}: {exc}"
+                _LOG.exception("api job %s: card %d failed", job_id, i)
+
+            results.append((card, dest, err))
+            job.cards_done = i
+
+        payload = _api_serialize(job, result, results, time.time() - started, truncated)
+        api_store.save_result(job_id, payload, status=api_store.STATUS_DONE)
+        job.status = "done"
+        job.finished_at = time.time()
+        _LOG.info("api job %s done: %d/%d resolved in %.1fs",
+                  job_id, payload["stats"]["resolved"], n, payload["stats"]["elapsed_s"])
+
+    async def _api_park(self, job: Job, blocked_url: str, host: str) -> None:
+        """Hand a hard-blocked API job to a human and free the slot.
+
+        Creates a solve session, publishes its public URL into the job row
+        (the plugin shows it in wp-admin), and spawns a background waiter.
+        No Telegram message is sent -- this path is silent by design; set
+        XDMOVIES_API_NOTIFY_OWNER=1 to also ping the owner in DM.
+        """
+        from xdmovies import api_store
+        from xdmovies.solve_server import create_session, get_public_url
+
+        job_id = job.api_job_id
+        if not job_id:
+            return
+        try:
+            token = await create_session(blocked_url, user_id=self.cfg.owner_id,
+                                         host=host, chat_id=0)
+            solve_url = get_public_url(token)
+        except Exception as exc:
+            api_store.set_status(job_id, api_store.STATUS_FAILED,
+                                 error=f"solve session failed: {exc!r}")
+            _LOG.exception("api job %s: could not open solve session", job_id)
+            return
+
+        job.status = "needs_human"
+        job.finished_at = None
+        api_store.update_job(job_id, status=api_store.STATUS_NEEDS_HUMAN,
+                             solve_url=solve_url, solve_token=token,
+                             error=None, finished_at=None)
+        _LOG.info("api job %s parked on %s -- solve %s", job_id, host, solve_url)
+
+        if os.environ.get("XDMOVIES_API_NOTIFY_OWNER", "0").strip() in ("1", "true", "yes"):
+            try:
+                await _send_safe(
+                    self._bot, self.cfg.owner_id,
+                    f"🔒 <b>WordPress bridge</b> is blocked on <code>{_html_escape(host)}</code>\n"
+                    f"Job: <code>{job_id}</code>\n"
+                    f"👉 Tap to solve: {solve_url}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                _LOG.debug("api owner notify failed (ignored)", exc_info=True)
+
+        asyncio.create_task(self._api_await_solve(job, token))
+
+    async def _api_await_solve(self, job: Job, token: str) -> None:
+        """Background waiter for a parked API job's solve session.
+
+        Holds no dispatcher slot. When the cookie is captured, re-queues a
+        fresh Job carrying the same api_job_id so the row continues filling
+        in. If nobody taps before SESSION_TTL, the job goes terminal so the
+        plugin stops polling it.
+        """
+        from xdmovies import api_store
+        from xdmovies.solve_server import SESSION_TTL, destroy_session, get_session
+
+        job_id = job.api_job_id
+        try:
+            sess = get_session(token)
+            if sess is None:
+                return
+            try:
+                await asyncio.wait_for(sess.event.wait(), timeout=float(SESSION_TTL))
+            except asyncio.TimeoutError:
+                api_store.set_status(
+                    job_id, api_store.STATUS_FAILED,
+                    error="solve timed out; resubmit to get a fresh solve link")
+                _LOG.info("api job %s solve timed out", job_id)
+                return
+            except asyncio.CancelledError:
+                raise
+            # Hold briefly so an in-app browser can read /status once and
+            # self-close, matching solve_server.wait_for_solve's behaviour.
+            await asyncio.sleep(25)
+            try:
+                await destroy_session(token)
+            except Exception:
+                pass
+            fresh = Job(
+                user_id=job.user_id, chat_id=0, url=job.url,
+                job_type="api", content_type=job.content_type,
+                user_name="api", username="", silent=True,
+                card_filter=job.card_filter, api_job_id=job_id,
+            )
+            api_store.update_job(job_id, status=api_store.STATUS_QUEUED,
+                                 solve_url=None, solve_token=None,
+                                 error=None, finished_at=None)
+            await self._enqueue_api(fresh)
+            _LOG.info("api job %s resumed after solve", job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.exception("api job %s solve waiter failed", job_id)
+            try:
+                api_store.set_status(job_id, api_store.STATUS_FAILED,
+                                     error=f"solve waiter: {exc!r}")
+            except Exception:
+                pass
+
     # ---- the big resolver coroutine -------------------------------------
     async def _run_for_user(self, job: Job) -> None:
         if job.job_type == "scrape_all":
             await self._run_scrape_all(job)
+            return
+        if job.job_type == "api":
+            await self._run_api_job(job)
             return
         cfg = self.cfg
         started = time.time()
@@ -2645,12 +3012,30 @@ class Bot:
             ad_line = f"\n<b>autodetect:</b> {_html_escape(_ad_status())}\n"
         except Exception:
             ad_line = ""
+        # WordPress bridge API
+        try:
+            from xdmovies import api_server as _apis
+            from xdmovies import api_store as _apistore
+            _ad_n = self._api_depth()
+            if _apis.is_enabled():
+                try:
+                    _d = _apistore.queue_depths()
+                except Exception:
+                    _d = {}
+                api_line = (
+                    f"\n<b>wp-bridge:</b> ON :{_apis.API_PORT} "
+                    f"queued={_ad_n} store={_html_escape(str(_d))}\n"
+                )
+            else:
+                api_line = "\n<b>wp-bridge:</b> OFF (set XDMOVIES_API_KEY)\n"
+        except Exception:
+            api_line = ""
         text = (
             "🟢 <b>alive</b> (VPS token solve-server + CloakBrowser, no VPN layer)\n"
             f"queue: <b>{depth}</b>\n"
             f"current: {cur}\n"
             f"last solve: {last}\n"
-            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}{ad_line}\n"
+            f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}{ad_line}{api_line}\n"
             f"<b>cookies:</b>\n{cst}"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -2735,8 +3120,12 @@ class Bot:
 
         # 1. If the currently-running job belongs to this user, mark it
         #    cancelled. The dispatcher observes the cancel_event at the
-        #    next per-card boundary and exits cleanly.
-        if self.current is not None and self.current.user_id == uid:
+        #    next per-card boundary and exits cleanly. WordPress-bridge
+        #    jobs are excluded: they carry the owner id but are not
+        #    interactive, so cancelling them is DELETE /api/v1/jobs/<id>.
+        if (self.current is not None
+                and self.current.user_id == uid
+                and getattr(self.current, "job_type", "") != "api"):
             self.current.cancel_event.set()
             cancelled_running = True
 
@@ -4997,7 +5386,18 @@ class Bot:
             await start_autodetect(self)
             _LOG.info("autodetect loop scheduled (30m interval)")
         except Exception:
-            _LOG.exception("autodetect start failed (non-fatal)")
+            _LOG.exception("keep_alive start failed (non-fatal)")
+        # WordPress bridge API (port 8090) -- only starts when
+        # XDMOVIES_API_KEY is set. Non-fatal: a missing key must never
+        # stop the Telegram bot.
+        try:
+            from xdmovies.api_server import start_api_server
+            if await start_api_server(self):
+                _LOG.info("wordpress bridge API started")
+            else:
+                _LOG.info("wordpress bridge API disabled")
+        except Exception:
+            _LOG.exception("api_server start failed (non-fatal)")
         for h in application.handlers.values():
             for hh in h:
                 _LOG.info("handler: %s", type(hh).__name__)
@@ -5026,6 +5426,11 @@ class Bot:
             pass
 
     async def _post_stop(self, _application: "Application") -> None:
+        try:
+            from xdmovies.api_server import stop_api_server
+            await stop_api_server()
+        except Exception:
+            pass
         try:
             from xdmovies.autodetect import stop_autodetect
             await stop_autodetect()

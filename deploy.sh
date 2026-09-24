@@ -179,6 +179,23 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     sudo firewall-cmd --reload 2>/dev/null || true
 fi
 
+# WordPress bridge API port (8090). Only opened when the operator has
+# actually set XDMOVIES_API_KEY -- an unauthenticated API on a public IP
+# is worse than a closed one, so default to leaving it shut.
+API_PORT="${XDMOVIES_API_PORT:-8090}"
+if grep -qsE '^XDMOVIES_API_KEY=.+' "${REPO_DIR}/xdmovies/.env" 2>/dev/null; then
+    log "XDMOVIES_API_KEY set -- opening firewall $API_PORT/tcp for the bridge API"
+    if command -v ufw >/dev/null 2>&1; then
+        sudo ufw allow "$API_PORT/tcp" 2>/dev/null || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        sudo firewall-cmd --add-port="$API_PORT/tcp" --permanent 2>/dev/null || true
+        sudo firewall-cmd --reload 2>/dev/null || true
+    fi
+else
+    log "XDMOVIES_API_KEY empty -- bridge API stays disabled and $API_PORT stays closed"
+fi
+
 SERVICE_FILE="/etc/systemd/system/xdmovies-bot.service"
 log "Installing systemd unit $SERVICE_FILE..."
 
