@@ -1,0 +1,22 @@
+# Render blueprint for the xdmovies bridge relay.
+#
+# Set PLUGIN_KEY to the same random string you paste into the WordPress
+# plugin's "Bridge Key" field. BOT_KEY must match XDMOVIES_API_KEY in the
+# bot's xdmovies/.env. Neither belongs in git -- both are `sync: false`.
+services:
+  - type: web
+    name: xdmovies-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_BASE
+        sync: false
+      - key: BOT_KEY
+        sync: false
+      - key: PLUGIN_KEY
+        sync: false
+      - key: PORT
+        value: 10000

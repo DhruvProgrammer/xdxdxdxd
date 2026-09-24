@@ -1,0 +1,6 @@
+# Render web-service dependencies for the xdmovies bridge relay.
+# FastAPI + uvicorn match the deployment shape already used by this project's
+# other Render service (see telegram-bot-render/render.yaml).
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+httpx>=0.27,<1.0
