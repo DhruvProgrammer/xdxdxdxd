@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name:       xDMovies Resolver Bridge
- * Plugin URI:        https://tgmovies.morimoflix.xyz
+ * Plugin URI:        https://flixgarden.site
  * Description:       Send an xdmovies page to the resolver bot, then post the resolved links to tgmories through the site's TMDB importer. Uses a Render bridge so this WordPress install never holds the bot API key.
  * Version:           1.0.0
  * Requires at least: 6.0

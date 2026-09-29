@@ -113,7 +113,7 @@ class XDM_Admin {
 					</tr>
 					<tr>
 						<th><label for="tgmovies_base"><?php esc_html_e( 'tgmovies Site URL', 'xdmovies-bridge' ); ?></label></th>
-						<td><input type="url" class="regular-text" id="tgmovies_base" name="tgmovies_base" value="<?php echo esc_attr( XDM_Settings::tgmovies_base() ); ?>" placeholder="https://tgmovies.morimoflix.xyz"></td>
+						<td><input type="url" class="regular-text" id="tgmovies_base" name="tgmovies_base" value="<?php echo esc_attr( XDM_Settings::tgmovies_base() ); ?>" placeholder="https://flixgarden.site"></td>
 					</tr>
 					<tr>
 						<th><label for="wp_secret"><?php esc_html_e( 'tgmovies secret_key', 'xdmovies-bridge' ); ?></label></th>
