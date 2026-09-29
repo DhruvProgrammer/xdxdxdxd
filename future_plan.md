@@ -423,3 +423,62 @@ TMDB: 1317088
 3. Second bot token from BotFather + VPS deploy approval.
 4. (Later, optional) TMDB API clean-name resolution; direct WP posting
    only after further study — out of v1 scope.
+
+## 12. Planned — xdmovies bot ↔ 4kbolly.py connection (added 2026-09-29)
+
+> **Status:** planned, not built. Awaiting direction choice (A, B, or both)
+> plus the API prerequisites below.
+
+### Hard constraint
+
+Telegram bots never receive messages from other bots — not in DMs, not in
+groups, not even as admins — and cannot start chats with bots. Direct
+bot-to-bot messaging is impossible, full stop. Any wiring must go *around*
+Telegram (HTTP API, shared channel + listener), never *through* it.
+
+### Direction A — 4kbolly → xdmovies → 4kbolly (recommended)
+
+4kbolly finds a title with no links (or an xdmovies URL) → submits it to the
+xdmovies job API → polls → converts `cards[]` to pipe rows → the existing
+`post_to_wordpress` / `append-links` flow runs unchanged.
+
+- Transport: `POST /api/v1/jobs` + `GET /api/v1/jobs/<id>` (+ `DELETE` for
+  cancel) on the already-built `api_server.py` (`feature/wp-api-bridge`,
+  tested: 33 unit + 18 live-HTTP). No Telegram messages, no chat-text
+  parsing, no userbot anywhere in the loop.
+- 4kbolly side: ~30 lines — one `requests` submit function, one poll loop
+  (5s while queued/running, 15s while `needs_human`), one converter from API
+  `cards[]` (`raw_title`/`size`/`language`/`url`/`status`) to the existing
+  `LABEL|url|size` pipe rows. `needs_human` surfaces the solve URL for an
+  owner tap (job auto-resumes); `failed` drops into the existing retry path.
+- Queue policy: API jobs already run in the lowest-priority lane
+  (urgent → normal → api) with card-boundary yield, so a bulk import never
+  stalls interactive Telegram use. `/cancel` deliberately cannot touch API
+  jobs.
+
+### Direction B — xdmovies → channel → 4kbolly (half-built already)
+
+xdmovies bot posts result batches to a channel (`post_to_channel`);
+4kbolly's `parse_direct_forward` already parses exactly that card grammar
+(numbered filename cards + Audio/Size rows + final hub URLs) into the WP
+pipeline. Still needed: a channel listener on 4kbolly's side (pyrogram
+channel-history read on an interval, or a userbot forward) feeding new
+channel posts into the existing direct-forward worker, plus dedupe against
+`seen_urls` so re-reads don't repost.
+
+### Prerequisites (owner side, either direction)
+
+1. Merge `feature/wp-api-bridge` (or deploy that branch on the VPS) — `main`
+   has no API code.
+2. Set `XDMOVIES_API_KEY` in `xdmovies/.env`. The API stays off and port 8090
+   stays closed without it. Restart the bot; `/status` must show
+   `wp-bridge: ON :8090`.
+3. Direction A needs nothing else on the VPS. Direction B needs the mirror
+   channel configured.
+
+### Still needed to build
+
+1. Direction choice (A, B, or both).
+2. Direction A: 4kbolly API client (~30 lines) + `cards[]`-to-pipe converter
+   + error mapping.
+3. Direction B: 4kbolly channel listener + `seen_urls` dedupe for re-reads.
