@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -66,20 +67,39 @@ class SolveSession:
     # Background tasks owned by this session (cancelled in destroy).
     launch_task: Optional[asyncio.Task] = None
     auto_nudge_task: Optional[asyncio.Task] = None
+    expire_task: Optional[asyncio.Task] = None
+    last_viewer_activity: float = 0.0
+    last_shot_at: float = 0.0
 
 
-# Audit finding H6: align poller / session-expiry / bot-wait deadlines
-# to a single SESSION_TTL. Previously the poller ran for 180s while
-# the session-expiry ran for 600s and bot.py:wait_for_solve was called
-# with timeout=120 or 90, leaving a 5-minute window where the user
-# could still click the page but nothing was capturing the cookie.
-SESSION_TTL = 300
+SESSION_IDLE_TIMEOUT = max(300, int(os.getenv("XDMOVIES_SOLVE_IDLE_TIMEOUT", "3600") or "3600"))
+VIEWER_ACTIVITY_TIMEOUT = max(60, int(os.getenv("XDMOVIES_SOLVE_VIEWER_WINDOW", "90") or "90"))
+SCREENSHOT_MIN_INTERVAL = max(1.0, float(os.getenv("XDMOVIES_SOLVE_SHOT_INTERVAL", "3") or "3"))
+SCREENSHOT_QUALITY = max(20, min(50, int(os.getenv("XDMOVIES_SOLVE_SHOT_QUALITY", "30") or "30")))
+BLOCK_GATE_IMAGES = os.getenv("XDMOVIES_SOLVE_BLOCK_GATE_IMAGES", "0").lower() in ("1", "true", "yes", "on")
 
 _SESSIONS: Dict[str, SolveSession] = {}
 _APP: Optional[object] = None
 _RUNNER: Optional[object] = None
 _SITE: Optional[object] = None
 _LOCK = asyncio.Lock()
+SESSION_TTL = SESSION_IDLE_TIMEOUT
+
+
+def _touch_viewer(sess: SolveSession) -> None:
+    sess.last_viewer_activity = time.time()
+
+
+def _viewer_is_active(sess: SolveSession, now: Optional[float] = None) -> bool:
+    timestamp = time.time() if now is None else float(now)
+    last = float(sess.last_viewer_activity or 0.0)
+    return last > 0 and timestamp - last <= VIEWER_ACTIVITY_TIMEOUT
+
+
+def _session_idle_seconds(sess: SolveSession, now: Optional[float] = None) -> float:
+    timestamp = time.time() if now is None else float(now)
+    reference = max(float(sess.created_at or timestamp), float(sess.last_viewer_activity or 0.0))
+    return max(0.0, timestamp - reference)
 
 # Solved-result stash, keyed by token. wait_for_solve destroys the
 # session ~25s after capture (Fix A), so by the time the bot's
@@ -156,7 +176,21 @@ function refreshShot(){
   const img=document.getElementById('shot');
   img.src='/solve/'+token+'/shot?t='+Date.now();
 }
-const shotTimer=setInterval(refreshShot, 2000);
+let shotTimer=null;
+function stopStream(){ if(shotTimer!==null){ clearInterval(shotTimer); shotTimer=null; } }
+function startStream(){ if(shotTimer===null){ refreshShot(); shotTimer=setInterval(refreshShot, 5000); } }
+async function markActivity(){
+  if(document.hidden) return;
+  try{ await fetch('/solve/'+token+'/activity',{method:'POST',cache:'no-store'}); }catch(e){}
+}
+markActivity();
+startStream();
+const activityTimer=setInterval(markActivity, 30000);
+document.addEventListener('visibilitychange', ()=>{
+  markActivity();
+  if(document.hidden){ stopStream(); } else { startStream(); }
+});
+window.addEventListener('pagehide', stopStream);
 const statusTimer=setInterval(async ()=>{
   try{
     const r=await fetch('/solve/'+token+'/status');
@@ -164,13 +198,13 @@ const statusTimer=setInterval(async ()=>{
       // Session is gone (destroyed after a successful solve, or expired).
       // Stop polling instead of hammering 404s in a loop.
       setStatus('✅ Solved or session expired — you can close this tab.', 'ok');
-      clearInterval(shotTimer); clearInterval(statusTimer);
+      clearInterval(shotTimer); clearInterval(statusTimer); clearInterval(activityTimer);
       return;
     }
     const j=await r.json();
     if(j.solved){
       setStatus('✅ Solved! You can close this tab.', 'ok');
-      clearInterval(shotTimer); clearInterval(statusTimer);
+      clearInterval(shotTimer); clearInterval(statusTimer); clearInterval(activityTimer);
       return;
     }
     let msg='⏳ Waiting — '+(j.title||'loading');
@@ -190,13 +224,14 @@ const statusTimer=setInterval(async ()=>{
     }
     setStatus(msg, 'info');
   }catch(e){}
-}, 1500);
+}, 3000);
 document.getElementById('shot').addEventListener('click', async (e)=>{
   const r=e.target.getBoundingClientRect();
   const natW=e.target.naturalWidth, natH=e.target.naturalHeight;
   const x=Math.round(((e.clientX - r.left)/r.width)*natW);
   const y=Math.round(((e.clientY - r.top)/r.height)*natH);
   setStatus('↗ clicking VPS @'+x+','+y+'…', 'info');
+  markActivity();
   try{
     const resp=await fetch('/solve/'+token+'/click', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x,y})});
     const j=await resp.json().catch(()=>({ok:false,error:'bad response'}));
@@ -252,7 +287,7 @@ async def _poll_for_cookie(sess: SolveSession):
             pass
         logger.debug(f"[solve_server] pre-injected cf_clearance values: {len(pre_injected)}")
 
-        while not sess.solved and (time.time() - sess.created_at) < SESSION_TTL:
+        while not sess.solved and _SESSIONS.get(sess.token) is sess:
             try:
                 if sess.context is None:
                     await asyncio.sleep(1.2)
@@ -496,6 +531,22 @@ async def _launch_for_session(sess: SolveSession):
         sess.context = None
         return
     sess.page = page
+    media_pattern = r"\.(?:mp4|webm|ogg|mp3|m4a|wav|woff2?|ttf|eot)(?:[?#]|$)"
+    if not is_gate or BLOCK_GATE_IMAGES:
+        media_pattern = r"\.(?:png|jpe?g|gif|webp|svg|ico|css|mp4|webm|ogg|mp3|m4a|wav|woff2?|ttf|eot)(?:[?#]|$)"
+    async def _abort_media(route):
+        try:
+            request_url = str(getattr(getattr(route, "request", None), "url", "") or "").lower()
+            if "challenges.cloudflare.com" in request_url:
+                await route.continue_()
+                return
+            await route.abort()
+        except Exception:
+            pass
+    try:
+        await ctx.route(re.compile(media_pattern, re.IGNORECASE), _abort_media)
+    except Exception as exc:
+        logger.warning(f"[solve_server] media blocking failed: {exc!r}")
     try:
         # Cap goto at 30s. CF interstitials with light Turnstile auto-verify
         # in <10s, so 30s is generous.
@@ -846,9 +897,7 @@ async def handle_solve_page(request):
     sess = _SESSIONS.get(token)
     if not sess:
         # Friendly expiry page (was bare "Invalid or expired solve
-        # link" text). Sessions live SESSION_TTL=300s; after that the
-        # token is gone by design so a leaked link can't be replayed.
-        # Tell the user exactly what to do: resend the movie URL.
+        # link" text). Sessions close after one hour without viewer activity.
         return web.Response(
             text=(
                 "<!doctype html><html><head><meta charset='utf-8'>"
@@ -857,7 +906,7 @@ async def handle_solve_page(request):
                 "<style>body{font-family:system-ui;margin:0;padding:24px;background:#0f1419;color:#e6e6e6}"
                 "h2{margin:0 0 8px}.box{background:#1a222b;border-radius:8px;padding:16px;margin-top:12px}</style>"
                 "</head><body><h2>⏰ This solve link has expired</h2>"
-                "<div class='box'>Solve links stay alive for 5 minutes. "
+                "<div class='box'>Solve links close after one hour without viewer activity. "
                 "Go back to Telegram and send the movie URL again — "
                 "the bot will issue a fresh link.</div></body></html>"
             ),
@@ -867,6 +916,7 @@ async def handle_solve_page(request):
     # Use .replace() instead of .format() because HTML_TEMPLATE contains literal
     # CSS/JS braces (e.g. body{font-family:...}) which would crash str.format()
     # with KeyError. Only substitute our 3 known placeholders.
+    _touch_viewer(sess)
     html = (
         HTML_TEMPLATE
         .replace("{token}", token)
@@ -874,6 +924,14 @@ async def handle_solve_page(request):
         .replace("{url}", sess.url)
     )
     return web.Response(text=html, content_type="text/html")
+
+async def handle_activity(request):
+    token = request.match_info.get("token", "")
+    sess = _SESSIONS.get(token)
+    if not sess:
+        return web.json_response({"ok": False}, status=404)
+    _touch_viewer(sess)
+    return web.json_response({"ok": True, "idle_seconds": int(_session_idle_seconds(sess))})
 
 async def handle_shot(request):
     token = request.match_info.get("token", "")
@@ -888,17 +946,30 @@ async def handle_shot(request):
         # otherwise race the close and log TargetClosedError). Return a
         # 1x1 gray JPEG with a short Cache-Control so the page can show
         # it and the status poller keeps the user informed.
-        placeholder = _PLACEHOLDER_JPEG
         return web.Response(
-            body=placeholder,
+            body=_PLACEHOLDER_JPEG,
             content_type="image/jpeg",
             headers={"Cache-Control": "no-store, max-age=1"},
         )
+    now = time.time()
+    if not _viewer_is_active(sess, now):
+        return web.Response(
+            body=_PLACEHOLDER_JPEG,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "no-store, max-age=1"},
+        )
+    if now - float(sess.last_shot_at or 0.0) < SCREENSHOT_MIN_INTERVAL:
+        return web.Response(
+            body=_PLACEHOLDER_JPEG,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "no-store, max-age=1"},
+        )
+    sess.last_shot_at = now
     try:
         # Hard cap on screenshot so a hung page never blocks the
         # browser-side (the user's phone) for more than a few seconds.
         png = await asyncio.wait_for(
-            sess.page.screenshot(type="jpeg", quality=40, full_page=False),
+            sess.page.screenshot(type="jpeg", quality=SCREENSHOT_QUALITY, full_page=False),
             timeout=4.0,
         )
         return web.Response(body=png, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -1448,6 +1519,7 @@ async def handle_click(request):
     sess = _SESSIONS.get(token)
     if not sess or sess.page is None:
         return web.json_response({"ok": False, "error": "no session"}, status=404)
+    _touch_viewer(sess)
     try:
         data = await request.json()
         x = int(data.get("x", 0))
@@ -1583,6 +1655,8 @@ async def handle_status(request):
             "iframe_mode": "",
             "goto_error": sess.goto_error or "",
             "auto_nudge_failed": sess.auto_nudge_failed,
+            "viewer_active": _viewer_is_active(sess),
+            "idle_seconds": int(_session_idle_seconds(sess)),
         })
     title = ""
     try:
@@ -1629,6 +1703,8 @@ async def handle_status(request):
         "iframe_mode": iframe_mode,
         "goto_error": sess.goto_error or "",
         "auto_nudge_failed": sess.auto_nudge_failed,
+        "viewer_active": _viewer_is_active(sess),
+        "idle_seconds": int(_session_idle_seconds(sess)),
     })
 
 async def handle_health(request):
@@ -1653,6 +1729,7 @@ async def create_app():
         raise RuntimeError("aiohttp not installed — pip install aiohttp")
     app = web.Application()
     app.router.add_get("/solve/{token}", handle_solve_page)
+    app.router.add_post("/solve/{token}/activity", handle_activity)
     app.router.add_get("/solve/{token}/shot", handle_shot)
     app.router.add_post("/solve/{token}/click", handle_click)
     app.router.add_get("/solve/{token}/status", handle_status)
@@ -1689,7 +1766,16 @@ async def stop_server():
 
 async def create_session(url: str, user_id: int, host: str, chat_id: int = 0) -> str:
     token = uuid.uuid4().hex[:12]
-    sess = SolveSession(token=token, url=url, host=_normalize_domain(host), user_id=user_id, chat_id=chat_id or user_id)
+    normalized_chat = chat_id or user_id
+    stale = [
+        existing.token for existing in list(_SESSIONS.values())
+        if not existing.solved
+        and existing.user_id == user_id
+        and existing.chat_id == normalized_chat
+    ]
+    for existing_token in stale:
+        await destroy_session(existing_token)
+    sess = SolveSession(token=token, url=url, host=_normalize_domain(host), user_id=user_id, chat_id=normalized_chat)
     async with _LOCK:
         _SESSIONS[token] = sess
     # Keep a handle on the launch task and capture its exception into
@@ -1705,25 +1791,17 @@ async def create_session(url: str, user_id: int, host: str, chat_id: int = 0) ->
             sess.goto_error = f"browser launch failed: {exc!r}"
             logger.exception("[solve_server] _launch_for_session crashed")
     sess.launch_task = asyncio.create_task(_launch_wrapped())
-    # SESSION_TTL caps how long the VPS browser + solve page stay alive
-    # for any single token. Solved sessions are destroyed as soon as
-    # `wait_for_solve` returns; the safety-net `_expire` destroys any
-    # session that outlasts SESSION_TTL even if `wait_for_solve` was
-    # never called.
-    #
-    # NOTE: do NOT expire failed sessions early. The bot waits up to
-    # 90-120s for a solve AND the user needs time to open the link on
-    # their phone — a 60s fast-expiry raced the user's click and
-    # produced "Invalid or expired solve link" on a perfectly good
-    # token. Every session gets the full TTL.
+    # Viewer-aware idle cleanup keeps a token usable for one hour while the
+    # solve page is being used. Hidden tabs stop screenshot requests, and a
+    # fresh bot link always creates and launches a new browser session.
     async def _expire():
-        for _ in range(SESSION_TTL):
-            await asyncio.sleep(1)
-            if sess.solved:
+        while _SESSIONS.get(token) is sess and not sess.solved:
+            if _session_idle_seconds(sess) >= SESSION_IDLE_TIMEOUT:
                 break
-        if token in _SESSIONS:
+            await asyncio.sleep(min(30.0, max(1.0, float(SESSION_IDLE_TIMEOUT))))
+        if _SESSIONS.get(token) is sess:
             await destroy_session(token)
-    asyncio.create_task(_expire())
+    sess.expire_task = asyncio.create_task(_expire())
     return token
 
 async def destroy_session(token: str):
@@ -1738,6 +1816,9 @@ async def destroy_session(token: str):
         except: pass
     if sess.launch_task:
         try: sess.launch_task.cancel()
+        except: pass
+    if sess.expire_task and sess.expire_task is not asyncio.current_task():
+        try: sess.expire_task.cancel()
         except: pass
     try:
         if sess.page:

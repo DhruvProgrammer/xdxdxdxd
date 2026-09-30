@@ -164,15 +164,18 @@ and delete this message to hide VPS IP.
 ```
 
 2. Open the link → you see a live screenshot of the VPS browser (refreshes
-   every 2s) → **tap the checkbox** (taps are forwarded with correct
-   coordinates; taps on ad popups go to the page, taps on the checkbox go
-   to the Turnstile iframe).
+   every 5s while the tab is visible) → **tap the checkbox** (taps are forwarded
+   with correct coordinates; taps on ad popups go to the page, taps on the
+   checkbox go to the Turnstile iframe). Hidden tabs stop the screenshot stream,
+   and video/audio/font assets are blocked to reduce VPS bandwidth.
 3. The bot auto-captures the fresh `cf_clearance`, **deletes the solve
    message**, and resumes your job where it stopped.
 
 Timeouts: movie-page solves wait up to **120s**; gate solves up to **240s**
-(latestnews) or **90s** (other hosts). On timeout you get
-`⏰ Solve timed out…` — just resend the link for a fresh solve link.
+(latestnews) or **90s** (other hosts). The solve browser itself remains
+available for **one hour of viewer activity**, then closes automatically.
+On bot wait timeout you get `⏰ Solve timed out…` — just resend the link for a
+fresh solve link.
 
 > Solve links always go to the requester's DM — even for channel jobs. The
 > public channel only ever sees clean result batches. The same applies to
@@ -631,11 +634,14 @@ from every log line.
 | `XDMOVIES_TXT_MAX_LINES` | – | `.txt` batch cap, default `10000` |
 | `XDMOVIES_ENABLE_VNC` | – | deploy-time only: adds XFCE + x11vnc + noVNC (`:6080`) |
 | `XDMOVIES_USAGE_INTERFACE` | – | interface used by `/usage`; blank auto-detects the default route |
+| `XDMOVIES_SOLVE_IDLE_TIMEOUT` | – | solve browser idle lifetime in seconds, default `3600` |
+| `XDMOVIES_SOLVE_VIEWER_WINDOW` | – | seconds of viewer activity required before screenshots resume, default `90` |
+| `XDMOVIES_SOLVE_BLOCK_GATE_IMAGES` | – | `=1` also blocks images on latestnews gate pages; default `0` to preserve ad verification |
 
 Timings baked into code: keep-alive refresh **25m** (check every 30s),
 autodetect poll **30m** (max 5 posts/tick), solve waits **120s** movie /
 **240s** gate / **90s** follow, nudge **max 3 clicks + 10s gaps**, solve
-sessions live **300s**, search cache **20m**, channel-setup window **10m**,
+sessions close after **1h** without viewer activity, search cache **20m**, channel-setup window **10m**,
 picker timeouts **2m**.
 
 ---

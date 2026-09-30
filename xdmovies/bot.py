@@ -1386,9 +1386,8 @@ class Bot:
             # never the public channel (it carries the VPS IP).
             token, msg_id = await self._send_solve_link(_op_dm(job), blocked_url, host, job.user_id)
             if token:
-                # Audit finding H6: align with SESSION_TTL (300s) and
-                # shorten the wait so the user isn't left waiting after
-                # the solve_server already destroyed the session.
+                # Keep the bot wait short; the solve page/browser remains available
+                # for one hour of viewer activity so a late tap still works.
                 _waitpill = await _send_transient_note(self._bot, _op_dm(job), "⏳ Waiting up to 120s -- open solve link and tap checkbox if you see it. Keep-alive will resume after.")
                 try:
                     _solved = await self._wait_for_solve(token, timeout=120.0)
