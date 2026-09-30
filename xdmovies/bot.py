@@ -2534,6 +2534,7 @@ class Bot:
             "/search -- find a movie/series, tap to scrape (e.g. /search lucky baskhar)\n"
             "Tip: send a .txt file (one title per line) to search them all at once\n"
             "/status -- bot health + keep-alive\n"
+            "/usage -- current-month + since-restart bandwidth\n"
             "/queue -- show who's waiting\n"
             "/scrapeall -- scrape every movie or series (owner + admins)\n"
             "/scrapeallchannel -- scrape to your channel (owner only)\n"
@@ -2653,6 +2654,21 @@ class Bot:
             f"errors: {self.error_count} (see {self.cfg.error_log_path}){keep_txt}{cloak_line}{vpn_line}{desktop_line}{_modes_line}{_chan_line}{ad_line}\n"
             f"<b>cookies:</b>\n{cst}"
         )
+        await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
+
+    async def _cmd_usage(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not bot_config.is_allowed(update.effective_user.id, self.cfg):
+            return
+        from xdmovies import usage
+        try:
+            text = await asyncio.to_thread(usage.report_html)
+        except usage.UsageUnavailable as exc:
+            text = f"⚠️ <b>Bandwidth usage unavailable</b>\n{_html_escape(str(exc))}"
+        except Exception as exc:
+            _LOG.exception("usage report failed")
+            text = f"⚠️ <b>Bandwidth usage unavailable</b>\n{_html_escape(f'{exc.__class__.__name__}: {exc}')}"
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
 
     async def _cmd_queue(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -4980,6 +4996,12 @@ class Bot:
         self._bot = application.bot
         _LOG.info("bot initialized (token=...%s)", self.cfg.token[-6:])
         try:
+            from xdmovies.usage import reset_baseline
+            baseline = await asyncio.to_thread(reset_baseline)
+            _LOG.info("usage baseline started on %s", baseline.get("interface", "?"))
+        except Exception:
+            _LOG.exception("usage baseline reset failed (non-fatal)")
+        try:
             from xdmovies.solve_server import start_server
             await start_server()
         except Exception:
@@ -5007,6 +5029,7 @@ class Bot:
                 BotCommand("start", "show welcome card"),
                 BotCommand("search", "find a movie/series, tap to scrape"),
                 BotCommand("status", "show bot health"),
+                BotCommand("usage", "show bandwidth usage"),
                 BotCommand("queue", "show running + queued jobs"),
                 BotCommand("cancel", "cancel queued job(s) by /queue number, or all"),
                 BotCommand("restart", "restart the whole bot (owner only)"),
@@ -5098,6 +5121,7 @@ class Bot:
         )
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("usage", self._cmd_usage))
         app.add_handler(CommandHandler("queue", self._cmd_queue))
         app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         app.add_handler(CommandHandler("restart", self._cmd_restart))

@@ -32,13 +32,15 @@ sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
     git curl wget unzip fontconfig ca-certificates \
-    xvfb gawk mawk util-linux xauth \
+    xvfb gawk mawk util-linux xauth vnstat \
     x11-xkb-utils xkb-data \
     libgbm1 libnss3 libxshmfence1 libasound2 \
     libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 \
     libcups2 libdbus-1-3 libdrm2 libglib2.0-0 \
     libnspr4 libpango-1.0-0 libxcomposite1 \
     libxdamage1 libxfixes3 libxcb1 libxkbcommon0 libxrandr2
+
+sudo systemctl enable --now vnstat 2>/dev/null || log "WARN: vnstat service not started; /usage current-month data may be unavailable"
 
 # Optional but recommended: real desktop + VNC for the operator to
 # manually solve the first Turnstile. Off by default; set

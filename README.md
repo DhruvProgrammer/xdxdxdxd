@@ -24,6 +24,7 @@ the whole catalog**.
    - [/start](#start)
    - [/search](#search)
    - [/status](#status)
+   - [/usage](#usage)
    - [/queue](#queue)
    - [/cancel](#cancel)
    - [/qmode](#qmode)
@@ -254,6 +255,34 @@ autodetect: ON feed=all seen=128 last_check=4m ago
 cookies:
 xdmovies.wtf: cf_clearance ✅ (12m old) ...
 ```
+
+### /usage
+
+| | |
+|---|---|
+| Who | all |
+| Usage | `/usage` |
+| Does | Shows current-month VPS bandwidth from vnstat and whole-VPS traffic since the last bot restart. |
+
+```
+📊 Bandwidth Usage
+
+🌐 Overall — current month (eth0)
+⬇️ Received: 4.82 GiB
+⬆️ Sent: 612.40 MiB
+🔁 Total: 5.41 GiB
+
+🔄 Since last bot restart
+⬇️ Received: 1.24 GiB
+⬆️ Sent: 88.20 MiB
+🔁 Total: 1.32 GiB
+⏱️ Uptime: 6h 14m
+```
+
+The public interface is detected from the default route. Set
+`XDMOVIES_USAGE_INTERFACE=eth0` in `.env` to override it. `vnstat` is
+installed by `deploy.sh`; if it is unavailable, the since-restart counters
+still work.
 
 ### /queue
 
@@ -601,6 +630,7 @@ from every log line.
 | `XDMOVIES_INNER_NUDGE` | – | `=0` disables the gate-page Turnstile nudge (default on) |
 | `XDMOVIES_TXT_MAX_LINES` | – | `.txt` batch cap, default `10000` |
 | `XDMOVIES_ENABLE_VNC` | – | deploy-time only: adds XFCE + x11vnc + noVNC (`:6080`) |
+| `XDMOVIES_USAGE_INTERFACE` | – | interface used by `/usage`; blank auto-detects the default route |
 
 Timings baked into code: keep-alive refresh **25m** (check every 30s),
 autodetect poll **30m** (max 5 posts/tick), solve waits **120s** movie /
@@ -652,11 +682,12 @@ xdmovies_bot_repo/
 │   ├── eternal_bypass.py          # operator-only single-shot manual helper
 │   ├── scrape_all.py              # catalog parsing, checkpoints, channel config
 │   ├── search.py                  # site search API client
+│   ├── usage.py                   # /usage: vnstat month + restart bandwidth baseline
 │   ├── channel_post.py            # channel-title → search matching
 │   ├── qmode_store.py / dmode_store.py / settings_store.py  # per-user prefs
 │   └── requirements.txt
 ├── xdmovies_state/                # runtime data (gitignored): cookies, prefs,
-│                                  # checkpoints, autodetect state, keep-alive state
+│                                  # checkpoints, autodetect/keep-alive/usage state
 ├── deploy.sh                      # VPS setup (apt + venv + cloak + systemd + awk/getopt repair)
 ├── start.sh                       # wrapper (xvfb-run + .env sanity check)
 ├── start_bot.cmd                  # Windows launcher
