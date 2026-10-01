@@ -116,6 +116,23 @@ for lf in "${LOCK_CANDIDATES[@]}"; do
 done
 ok "lockfiles cleared"
 
+SHUTDOWN_CANDIDATES=(
+    "$HOME/xdmovies_bot_repo/xdmovies_state/shutdown.json"
+    "$HOME/xdmovies_bot_deploy/xdmovies_bot_repo/xdmovies_state/shutdown.json"
+    "$HOME/xdmovies_bot_deploy_v2/xdmovies_bot_repo/xdmovies_state/shutdown.json"
+    "/home/*/xdmovies_bot_repo/xdmovies_state/shutdown.json"
+    "/opt/xdmovies_bot_repo/xdmovies_state/shutdown.json"
+)
+for sf in "${SHUTDOWN_CANDIDATES[@]}"; do
+    for f in $sf; do
+        if [[ -f "$f" ]]; then
+            log "removing persistent shutdown flag: $f"
+            $SUDO rm -f "$f"
+        fi
+    done
+done
+ok "shutdown flags cleared"
+
 # ---------------------------------------------------------------------------
 # 5. Verify nothing is left
 # ---------------------------------------------------------------------------

@@ -1166,6 +1166,8 @@ class Bot:
         return cur is not None and getattr(cur, "job_type", "") == "scrape_all"
 
     async def _enqueue(self, job: Job, urgent: bool = False) -> int:
+        if self._shutdown_mode:
+            return -2
         async with self._queue_cond:
             if urgent:
                 job.priority = 1
@@ -5023,12 +5025,6 @@ class Bot:
 
     async def _start_runtime_services(self) -> None:
         try:
-            from xdmovies.usage import reset_baseline
-            baseline = await asyncio.to_thread(reset_baseline)
-            _LOG.info("usage baseline started on %s", baseline.get("interface", "?"))
-        except Exception:
-            _LOG.exception("usage baseline reset failed (non-fatal)")
-        try:
             from xdmovies.solve_server import start_server
             await start_server()
         except Exception:
@@ -5054,12 +5050,23 @@ class Bot:
             return
         if not task.done():
             task.cancel()
+        done = set()
+        pending = {task}
         try:
-            await task
+            done, pending = await asyncio.wait({task}, timeout=20.0)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            _LOG.exception("dispatcher shutdown failed")
+        if pending:
+            _LOG.error("dispatcher did not stop within 20s; abandoning it")
+            for pending_task in pending:
+                pending_task.cancel()
+            await asyncio.wait(pending, timeout=2.0)
+        for completed in done:
+            if completed.done() and not completed.cancelled():
+                try:
+                    completed.exception()
+                except BaseException:
+                    pass
 
     async def _stop_runtime_services(self) -> None:
         async with self._queue_cond:
@@ -5073,6 +5080,21 @@ class Bot:
             self.queue.clear()
             self._urgent.clear()
             self._queue_cond.notify_all()
+        for job in {id(item): item for item in active if item is not None}.values():
+            try:
+                await self._drop_job_clutter(job)
+            except Exception:
+                pass
+            try:
+                if self._bot is not None:
+                    await _send_safe(
+                        self._bot,
+                        _op_dm(job),
+                        "🛑 Bot stopped — this job was dropped. Send the link again after /start.",
+                        parse_mode=ParseMode.HTML,
+                    )
+            except Exception:
+                pass
         try:
             from xdmovies.autodetect import stop_autodetect
             await stop_autodetect()
@@ -5099,20 +5121,25 @@ class Bot:
         async with self._shutdown_lock:
             if self._shutdown_mode:
                 return
+            persisted = True
             try:
                 shutdown_store.set_stopped(self.cfg.owner_id)
             except Exception:
+                persisted = False
                 _LOG.exception("could not persist shutdown state")
             self._shutdown_mode = True
             try:
-                await self._stop_runtime_services()
+                await asyncio.wait_for(self._stop_runtime_services(), timeout=45.0)
+            except asyncio.TimeoutError:
+                _LOG.error("runtime shutdown exceeded 45s; continuing in stopped mode")
             finally:
                 await self._set_command_menu()
         await _send_safe(
             context.bot,
             update.effective_chat.id,
             "🛑 <b>Bot stopped</b> — jobs, browsers, keep-alive, autodetect and the solve server are off.\n"
-            "Only the owner can resume with /start.",
+            "Only the owner can resume with /start."
+            + ("" if persisted else "\n⚠️ Shutdown state could not be saved; a process restart may resume it."),
             parse_mode=ParseMode.HTML,
         )
 
@@ -5120,12 +5147,12 @@ class Bot:
         async with self._shutdown_lock:
             if not self._shutdown_mode:
                 return False
-            await self._start_runtime_services()
             try:
                 shutdown_store.clear_stopped()
             except Exception:
                 _LOG.exception("could not clear persisted shutdown state")
             self._shutdown_mode = False
+            await self._start_runtime_services()
             await self._set_command_menu()
             return True
 
@@ -5143,6 +5170,15 @@ class Bot:
                     parse_mode=ParseMode.HTML,
                 )
                 await self._cmd_start(update, context)
+            elif not self._shutdown_mode:
+                await handler(update, context)
+            return None
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            try:
+                await query.answer()
+            except Exception:
+                pass
         return None
 
     async def _post_init(self, application: "Application") -> None:
@@ -5152,6 +5188,12 @@ class Bot:
         for handlers in application.handlers.values():
             for handler in handlers:
                 _LOG.info("handler: %s", type(handler).__name__)
+        try:
+            from xdmovies.usage import reset_baseline
+            baseline = await asyncio.to_thread(reset_baseline)
+            _LOG.info("usage baseline started on %s", baseline.get("interface", "?"))
+        except Exception:
+            _LOG.exception("usage baseline reset failed (non-fatal)")
         await self._set_command_menu()
         if self._shutdown_mode:
             stopped_at = shutdown_store.stopped_at()
@@ -5167,7 +5209,10 @@ class Bot:
             pass
 
     async def _post_stop(self, _application: "Application") -> None:
-        await self._stop_runtime_services()
+        try:
+            await asyncio.wait_for(self._stop_runtime_services(), timeout=45.0)
+        except asyncio.TimeoutError:
+            _LOG.error("application shutdown exceeded 45s")
 
     async def _send_solve_link(self, chat_id: int, url: str, host: str, user_id: int):
         try:

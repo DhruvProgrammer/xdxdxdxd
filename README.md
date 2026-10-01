@@ -469,7 +469,9 @@ Behavior notes:
 Shutdown mode is saved in `xdmovies_state/shutdown.json`, so a bot process
 restart stays stopped until the owner sends `/start`. The VPS, SSH and systemd
 service are not shut down. While stopped, all other commands, links, documents
-and buttons are silently ignored, and Telegram shows only `/start`.
+and buttons are silently ignored, and Telegram shows only `/start`. To clear it
+from SSH instead, remove `xdmovies_state/shutdown.json` (or run
+`xdmovies_kill_all.sh`) and restart the service.
 
 ### /restart
 
