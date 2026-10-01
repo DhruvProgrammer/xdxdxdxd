@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from xdmovies.extractor import Card
-from xdmovies import bot_config
+from xdmovies import bot_config, shutdown_store
 
 # Single-instance lock: prevent a second `python -m xdmovies` from
 # stealing the polling slot (Telegram raises "Conflict: terminated by
@@ -1106,6 +1106,8 @@ class Job:
 class Bot:
     def __init__(self, cfg: "bot_config.BotConfig"):
         self.cfg = cfg
+        self._shutdown_mode = shutdown_store.is_stopped()
+        self._shutdown_lock = asyncio.Lock()
         # We always launch Chromium HEADED (`headless=False`). On a
         # desktop this is straightforward; on a headless server (VPS /
         # systemd) `start.sh` wraps the bot in `xvfb-run` to give it a
@@ -2543,6 +2545,7 @@ class Bot:
             "/dmode -- toggle section (Packs/Episodes) picker for series\n"
             "/settings -- choose which details result cards show\n"
             "/autodetect -- auto-detect new posts, resolve, post to channel (owner only)\n"
+            "/stop -- shut down all bot work until owner /start (owner only)\n"
             "/restart -- restart the whole bot (owner only)\n"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
@@ -4990,10 +4993,35 @@ class Bot:
         return
 
     # ---- lifecycle -------------------------------------------------------
-    async def _post_init(self, application: "Application") -> None:
-        self._app = application
-        self._bot = application.bot
-        _LOG.info("bot initialized (token=...%s)", self.cfg.token[-6:])
+    async def _set_command_menu(self) -> None:
+        if self._bot is None:
+            return
+        try:
+            from telegram import BotCommand
+            if self._shutdown_mode:
+                commands = [BotCommand("start", "resume the bot (owner only)")]
+            else:
+                commands = [
+                    BotCommand("start", "show welcome card"),
+                    BotCommand("search", "find a movie/series, tap to scrape"),
+                    BotCommand("status", "show bot health"),
+                    BotCommand("usage", "show bandwidth usage"),
+                    BotCommand("queue", "show running + queued jobs"),
+                    BotCommand("cancel", "cancel queued job(s) by /queue number, or all"),
+                    BotCommand("stop", "shut down all bot work (owner only)"),
+                    BotCommand("restart", "restart the whole bot (owner only)"),
+                    BotCommand("scrapeall", "scrape every movie or series"),
+                    BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
+                    BotCommand("qmode", "toggle quality picker for series"),
+                    BotCommand("dmode", "toggle section (Packs/Episodes) picker for series"),
+                    BotCommand("settings", "choose which details result cards show"),
+                    BotCommand("autodetect", "auto-detect new posts, resolve, post to channel (owner)"),
+                ]
+            await self._bot.set_my_commands(commands)
+        except Exception:
+            _LOG.exception("set_my_commands failed (non-fatal)")
+
+    async def _start_runtime_services(self) -> None:
         try:
             from xdmovies.usage import reset_baseline
             baseline = await asyncio.to_thread(reset_baseline)
@@ -5005,49 +5033,46 @@ class Bot:
             await start_server()
         except Exception:
             _LOG.exception("solve_server start failed")
-        # hybrid keep-alive -- post-level refresh every 25m (CF is on posts, not home)
         try:
             from xdmovies.keep_alive import start_keep_alive
-            await start_keep_alive(application)
+            await start_keep_alive(self._app)
             _LOG.info("keep_alive started (post refresh 25m + VPS fallback)")
         except Exception:
             _LOG.exception("keep_alive start failed (non-fatal)")
-        # auto-detect — 30m catalog poll -> new posts -> channel
         try:
             from xdmovies.autodetect import start_autodetect
             await start_autodetect(self)
             _LOG.info("autodetect loop scheduled (30m interval)")
         except Exception:
             _LOG.exception("autodetect start failed (non-fatal)")
-        for h in application.handlers.values():
-            for hh in h:
-                _LOG.info("handler: %s", type(hh).__name__)
-        try:
-            from telegram import BotCommand
-            await application.bot.set_my_commands([
-                BotCommand("start", "show welcome card"),
-                BotCommand("search", "find a movie/series, tap to scrape"),
-                BotCommand("status", "show bot health"),
-                BotCommand("usage", "show bandwidth usage"),
-                BotCommand("queue", "show running + queued jobs"),
-                BotCommand("cancel", "cancel queued job(s) by /queue number, or all"),
-                BotCommand("restart", "restart the whole bot (owner only)"),
-                BotCommand("scrapeall", "scrape all movies or series"),
-                BotCommand("scrapeallchannel", "scrape to channel (owner only)"),
-                BotCommand("qmode", "toggle quality picker for series"),
-                BotCommand("dmode", "toggle section picker for series"),
-                BotCommand("settings", "choose result card details"),
-                BotCommand("autodetect", "auto-detect new posts to channel (owner)"),
-            ])
-        except Exception:
-            _LOG.exception("set_my_commands failed (non-fatal)")
         await self._start_dispatcher_after_polling()
-        try:
-            await _announce_restart_if_pending(application.bot)
-        except Exception:
-            pass
 
-    async def _post_stop(self, _application: "Application") -> None:
+    async def _stop_dispatcher(self) -> None:
+        task = self._dispatcher_task
+        self._dispatcher_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOG.exception("dispatcher shutdown failed")
+
+    async def _stop_runtime_services(self) -> None:
+        async with self._queue_cond:
+            active = [self.current, *self.queue, *self._urgent]
+            for job in active:
+                if job is None:
+                    continue
+                job.cancel_event.set()
+                job.status = "cancelled"
+                job.finished_at = time.time()
+            self.queue.clear()
+            self._urgent.clear()
+            self._queue_cond.notify_all()
         try:
             from xdmovies.autodetect import stop_autodetect
             await stop_autodetect()
@@ -5058,18 +5083,91 @@ class Bot:
             await stop_keep_alive()
         except Exception:
             pass
+        await self._stop_dispatcher()
         try:
             from xdmovies.solve_server import stop_server
             await stop_server()
         except Exception:
             pass
-        if self._dispatcher_task is not None:
-            self._dispatcher_task.cancel()
+        self.current = None
+
+    async def _cmd_stop(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        if update.effective_user is None or update.effective_chat is None:
+            return
+        if not self.cfg.is_owner(update.effective_user.id):
+            return
+        async with self._shutdown_lock:
+            if self._shutdown_mode:
+                return
             try:
-                await self._dispatcher_task
-            except asyncio.CancelledError:
-                pass
-            self._dispatcher_task = None
+                shutdown_store.set_stopped(self.cfg.owner_id)
+            except Exception:
+                _LOG.exception("could not persist shutdown state")
+            self._shutdown_mode = True
+            try:
+                await self._stop_runtime_services()
+            finally:
+                await self._set_command_menu()
+        await _send_safe(
+            context.bot,
+            update.effective_chat.id,
+            "🛑 <b>Bot stopped</b> — jobs, browsers, keep-alive, autodetect and the solve server are off.\n"
+            "Only the owner can resume with /start.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _resume_from_shutdown(self) -> bool:
+        async with self._shutdown_lock:
+            if not self._shutdown_mode:
+                return False
+            await self._start_runtime_services()
+            try:
+                shutdown_store.clear_stopped()
+            except Exception:
+                _LOG.exception("could not clear persisted shutdown state")
+            self._shutdown_mode = False
+            await self._set_command_menu()
+            return True
+
+    async def _shutdown_guard(self, update: "Update", context, handler, allow_start: bool = False):
+        if not self._shutdown_mode:
+            return await handler(update, context)
+        user = update.effective_user
+        chat = update.effective_chat
+        if allow_start and user is not None and chat is not None and self.cfg.is_owner(user.id):
+            if await self._resume_from_shutdown():
+                await _send_safe(
+                    context.bot,
+                    chat.id,
+                    "✅ <b>Bot resumed</b> — dispatcher, browsers, keep-alive, autodetect and the solve server are active.",
+                    parse_mode=ParseMode.HTML,
+                )
+                await self._cmd_start(update, context)
+        return None
+
+    async def _post_init(self, application: "Application") -> None:
+        self._app = application
+        self._bot = application.bot
+        _LOG.info("bot initialized (token=...%s)", self.cfg.token[-6:])
+        for handlers in application.handlers.values():
+            for handler in handlers:
+                _LOG.info("handler: %s", type(handler).__name__)
+        await self._set_command_menu()
+        if self._shutdown_mode:
+            stopped_at = shutdown_store.stopped_at()
+            _LOG.warning(
+                "bot is in persistent shutdown mode (stopped_at=%s); only owner /start will resume",
+                stopped_at,
+            )
+            return
+        await self._start_runtime_services()
+        try:
+            await _announce_restart_if_pending(application.bot)
+        except Exception:
+            pass
+
+    async def _post_stop(self, _application: "Application") -> None:
+        await self._stop_runtime_services()
 
     async def _send_solve_link(self, chat_id: int, url: str, host: str, user_id: int):
         try:
@@ -5118,77 +5216,88 @@ class Bot:
             .post_stop(self._post_stop)
             .build()
         )
-        app.add_handler(CommandHandler("start", self._cmd_start))
-        app.add_handler(CommandHandler("status", self._cmd_status))
-        app.add_handler(CommandHandler("usage", self._cmd_usage))
-        app.add_handler(CommandHandler("queue", self._cmd_queue))
-        app.add_handler(CommandHandler("cancel", self._cmd_cancel))
-        app.add_handler(CommandHandler("restart", self._cmd_restart))
-        app.add_handler(CommandHandler("scrapeall", self._cmd_scrapeall))
-        app.add_handler(CommandHandler("scrapeallchannel", self._cmd_scrapeallchannel))
-        app.add_handler(CommandHandler("search", self._cmd_search))
+        def guarded(handler, allow_start: bool = False):
+            async def wrapped(update, context):
+                return await self._shutdown_guard(
+                    update,
+                    context,
+                    handler,
+                    allow_start=allow_start,
+                )
+            return wrapped
+
+        app.add_handler(CommandHandler("start", guarded(self._cmd_start, allow_start=True)))
+        app.add_handler(CommandHandler("status", guarded(self._cmd_status)))
+        app.add_handler(CommandHandler("usage", guarded(self._cmd_usage)))
+        app.add_handler(CommandHandler("queue", guarded(self._cmd_queue)))
+        app.add_handler(CommandHandler("cancel", guarded(self._cmd_cancel)))
+        app.add_handler(CommandHandler("stop", guarded(self._cmd_stop)))
+        app.add_handler(CommandHandler("restart", guarded(self._cmd_restart)))
+        app.add_handler(CommandHandler("scrapeall", guarded(self._cmd_scrapeall)))
+        app.add_handler(CommandHandler("scrapeallchannel", guarded(self._cmd_scrapeallchannel)))
+        app.add_handler(CommandHandler("search", guarded(self._cmd_search)))
         app.add_handler(CallbackQueryHandler(
-            self._on_search_pick,
+            guarded(self._on_search_pick),
             pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:content:(all|ep|pack)$|^search:tochan:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_scrapeall_choice,
+            guarded(self._on_scrapeall_choice),
             pattern=r"^scrapeall:(select|resume|start):(all|movies|series)$|^scrapeall:cancel:-$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_scrapechan_choice,
+            guarded(self._on_scrapechan_choice),
             pattern=r"^scrapechan:(select|resume|start):(all|movies|series)$|^scrapechan:cancel:-$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_qmode_choice,
+            guarded(self._on_qmode_choice),
             pattern=r"^qmode:set:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_qpick,
+            guarded(self._on_qpick),
             pattern=r"^qp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
         ))
-        app.add_handler(CommandHandler("qmode", self._cmd_qmode))
+        app.add_handler(CommandHandler("qmode", guarded(self._cmd_qmode)))
         app.add_handler(CallbackQueryHandler(
-            self._on_dmode_choice,
+            guarded(self._on_dmode_choice),
             pattern=r"^dmode:set:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_dpick,
+            guarded(self._on_dpick),
             pattern=r"^dp:[0-9a-f]{8}:(t:\d+|done|cancel|all)$",
         ))
-        app.add_handler(CommandHandler("dmode", self._cmd_dmode))
-        app.add_handler(CommandHandler("settings", self._cmd_settings))
+        app.add_handler(CommandHandler("dmode", guarded(self._cmd_dmode)))
+        app.add_handler(CommandHandler("settings", guarded(self._cmd_settings)))
         app.add_handler(CallbackQueryHandler(
-            self._on_settings,
+            guarded(self._on_settings),
             pattern=r"^settings:(toggle:[a-z_]+|all|close)$",
         ))
-        app.add_handler(CommandHandler("autodetect", self._cmd_autodetect))
+        app.add_handler(CommandHandler("autodetect", guarded(self._cmd_autodetect)))
         app.add_handler(CallbackQueryHandler(
-            self._on_autodetect_feed,
+            guarded(self._on_autodetect_feed),
             pattern=r"^autodetect:feed:(movies|series|all)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_autodetect_set,
+            guarded(self._on_autodetect_set),
             pattern=r"^autodetect:set:(yes|no)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_autodetect_content,
+            guarded(self._on_autodetect_content),
             pattern=r"^autodetect:content:(show|all|ep|pack)$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_autodetect_back,
+            guarded(self._on_autodetect_back),
             pattern=r"^autodetect:back$",
         ))
         app.add_handler(CallbackQueryHandler(
-            self._on_autodetect_close,
+            guarded(self._on_autodetect_close),
             pattern=r"^autodetect:close$",
         ))
-        app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
+        app.add_handler(MessageHandler(filters.Document.ALL, guarded(self._on_document)))
         # TEXT covers plain DMs, CAPTION covers forwarded channel
         # photo+caption posts (filters are disjoint in PTB v21).
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guarded(self._on_text)))
         try:
-            app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, self._on_text))
+            app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, guarded(self._on_text)))
         except Exception:
             pass
         return app

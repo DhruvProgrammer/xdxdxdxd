@@ -27,7 +27,7 @@ def _check() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     failures = []
 
-    for name in ("bot_config", "extractor", "cookie_store", "pipeline", "channel_post", "usage", "bot"):
+    for name in ("bot_config", "extractor", "cookie_store", "pipeline", "channel_post", "usage", "shutdown_store", "bot"):
         path = os.path.join(here, f"{name}.py")
         spec = ilu.spec_from_file_location(f"xdmovies_smoke_{name}", path)
         if spec is None or spec.loader is None:

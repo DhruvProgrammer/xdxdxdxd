@@ -33,6 +33,7 @@ the whole catalog**.
    - [/scrapeall](#scrapeall)
    - [/scrapeallchannel](#scrapeallchannel)
    - [/autodetect](#autodetect)
+   - [/stop](#stop)
    - [/restart](#restart)
 6. [Features](#6-features)
 7. [Use cases with examples](#7-use-cases-with-examples)
@@ -457,6 +458,19 @@ Behavior notes:
   keeps VPS bandwidth tiny while catching same-day uploads.
 - `/status` shows `autodetect: ON feed=series content=episodes seen=42 …`.
 
+### /stop
+
+| | |
+|---|---|
+| Who | **owner only** |
+| Usage | `/stop` |
+| Does | Cancels all bot work, closes browsers/solve sessions, and stops keep-alive, autodetect, the dispatcher and solve server. The lightweight Telegram listener remains so only the owner's `/start` can resume it. |
+
+Shutdown mode is saved in `xdmovies_state/shutdown.json`, so a bot process
+restart stays stopped until the owner sends `/start`. The VPS, SSH and systemd
+service are not shut down. While stopped, all other commands, links, documents
+and buttons are silently ignored, and Telegram shows only `/start`.
+
 ### /restart
 
 | | |
@@ -469,6 +483,9 @@ Behavior notes:
 
 ## 6. Features
 
+- **Owner-only shutdown mode.** `/stop` turns off every browser, job, solve server,
+  keep-alive and autodetect task while leaving a minimal Telegram listener;
+  only the owner's `/start` resumes it, even after a process restart.
 - **Queue, never busy.** One dispatcher, one running job; everything else
   FIFO-queues with position + ETA at enqueue (`deque` + lock + condition, no
   drain/re-put races). An **urgent lane** lets a pasted link jump ahead of a
@@ -689,11 +706,12 @@ xdmovies_bot_repo/
 │   ├── scrape_all.py              # catalog parsing, checkpoints, channel config
 │   ├── search.py                  # site search API client
 │   ├── usage.py                   # /usage: vnstat month + restart bandwidth baseline
+│   ├── shutdown_store.py          # persistent owner /stop + /start state
 │   ├── channel_post.py            # channel-title → search matching
 │   ├── qmode_store.py / dmode_store.py / settings_store.py  # per-user prefs
 │   └── requirements.txt
 ├── xdmovies_state/                # runtime data (gitignored): cookies, prefs,
-│                                  # checkpoints, autodetect/keep-alive/usage state
+│                                  # checkpoints, autodetect/keep-alive/usage/shutdown state
 ├── deploy.sh                      # VPS setup (apt + venv + cloak + systemd + awk/getopt repair)
 ├── start.sh                       # wrapper (xvfb-run + .env sanity check)
 ├── start_bot.cmd                  # Windows launcher
