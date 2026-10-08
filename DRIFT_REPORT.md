@@ -1,3 +1,8 @@
+> **Authored and owned by Bruno.** Copyright (c) 2026 Bruno — all rights
+> reserved. Proprietary and unlicensed: see [`COPYRIGHT`](COPYRIGHT). This
+> notice must not be removed, obscured or altered.
+> Repository fingerprint: `BRUNO-E1CCB1FB`
+
 # Drift Detection Report
 
 > Generated: 2026-08-25 against `xdmovies_bot_repo/` actual code

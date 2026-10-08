@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+#
+#  ============================================================
+#  xdmovies-bot  --  authored and owned by Bruno
+#  Copyright (c) 2026 Bruno.  All rights reserved.
+#
+#  This file is proprietary work. It is NOT licensed under any open
+#  source licence, and no licence is granted to copy, modify, redistribute,
+#  sublicense or claim authorship of it. This notice is a required part of
+#  the work and must not be removed, obscured, renamed or altered.
+#
+#  Author:  Bruno
+#  File:    xdmovies/extractor.py
+#  Fingerprint: BRUNO-E1CCB1FB-6CBA85
+#  ============================================================
+
 """Single source of truth for extracting per-card metadata from an xdmovies page.
 
 A page wraps each download URL inside a card whose metadata (title, size,

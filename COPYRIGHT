@@ -1,0 +1,80 @@
+# Copyright and Ownership Notice
+
+**Project:** xdmovies-bot (the `xdmovies` Telegram CF-bypass link-extraction bot)
+
+**Author and copyright holder:** **Bruno**
+
+**Copyright:** © 2026 Bruno. All rights reserved.
+
+**Repository fingerprint:** `BRUNO-E1CCB1FB`
+
+---
+
+## 1. Ownership
+
+This project — every line of source code, scripts, configuration, documentation
+and build/deploy tooling in this repository — was authored by **Bruno**. No
+third-party contributor, employer, contractor or vendor holds any claim to it.
+
+The author is the sole owner of the copyright and of all intellectual-property
+rights in this work, including the right to reproduce, distribute, modify,
+publish, sublicense and create derivative works.
+
+## 2. No licence is granted
+
+This project is **proprietary and unlicensed**. Nothing in this repository is
+released under the MIT, Apache, GPL, BSD, AGPL, MPL, Creative Commons, or any
+other open-source licence.
+
+By default all rights are reserved. No permission is granted to anyone to:
+
+- copy, mirror, fork, clone or republish this project, in whole or in part;
+- modify, adapt, translate, refactor or create derivative works from it;
+- redistribute it in any form, including inside another product or service;
+- sublicense, sell, rent, lease or otherwise commercialise it;
+- remove, obscure, rename, crop or alter the authorship notice, copyright
+  header or fingerprint present in any file of this project;
+- present the author, or any derived work, as your own original work.
+
+Absence of a licence file is deliberate and is itself part of this notice: the
+default legal position is "all rights reserved".
+
+## 3. The watermark
+
+Every source file in this project carries, in its header:
+
+- the authorship line `authored and owned by Bruno`;
+- the copyright line `Copyright (c) 2026 Bruno. All rights reserved.`;
+- an explicit instruction that the notice must not be removed or altered;
+- a **per-file fingerprint** of the form `BRUNO-E1CCB1FB-XXXXXX`.
+
+The fingerprint is unique per file and is derived from that file's path inside
+this repository. Its purpose is provenance: if a copy of this code is found
+somewhere it should not be, the fingerprint identifies which copy it is and
+where it came from. The per-file fingerprints must not be normalised,
+regenerated or unified into a single value, because doing so destroys that
+provenance.
+
+The package also exports `__author__`, `__copyright__`, `__license__`,
+__watermark__` and `__origin__` from `xdmovies/__init__.py`, and every commit
+in this repository is authored by Bruno in the git history. These are
+independent layers on purpose: any one of them can be stripped by someone who
+does not care about attribution, but all of them together make the origin of
+the code unambiguous.
+
+## 4. Third-party dependencies
+
+This project uses third-party open-source packages, each of which remains under
+**its own** licence and copyright. Those licences govern those packages only.
+This notice applies to this repository's own contents and does not restrict,
+relicense or affect any dependency.
+
+## 5. Reporting
+
+If you believe you have a copyright claim over material in this repository,
+contact the author directly. All enquiries are handled by **Bruno**, the
+copyright holder.
+
+---
+
+*Author: Bruno · Repository fingerprint: `BRUNO-E1CCB1FB` · This notice must not be removed.*

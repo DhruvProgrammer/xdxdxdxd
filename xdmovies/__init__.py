@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+#
+#  ============================================================
+#  xdmovies-bot  --  authored and owned by Bruno
+#  Copyright (c) 2026 Bruno.  All rights reserved.
+#
+#  This file is proprietary work. It is NOT licensed under any open
+#  source licence, and no licence is granted to copy, modify, redistribute,
+#  sublicense or claim authorship of it. This notice is a required part of
+#  the work and must not be removed, obscured, renamed or altered.
+#
+#  Author:  Bruno
+#  File:    xdmovies/__init__.py
+#  Fingerprint: BRUNO-E1CCB1FB-7F19E5
+#  ============================================================
+
 """xdmovies package — orchestration for xdmovies.wtf movie → final destination.
 
 This file avoids eagerly importing the heavy CF-bypass chain at package
@@ -9,6 +25,15 @@ being importable straight away. Submodules that *do* want the re-exports
     from xdmovies.pipeline import extract_download_links
 """
 from __future__ import annotations
+
+# --- authorship / provenance metadata -------------------------------------
+# Machine-readable ownership record. Deliberately NOT listed in __all__, so
+# star-imports behave exactly as before.
+__author__ = "Bruno"
+__copyright__ = "Copyright (c) 2026 Bruno. All rights reserved."
+__license__ = "Proprietary - unlicensed, all rights reserved."
+__watermark__ = "BRUNO-E1CCB1FB"
+__origin__ = "Authored by Bruno. Copying or claiming authorship is prohibited."
 
 __all__ = [
     "Card",

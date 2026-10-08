@@ -1,4 +1,17 @@
+> **Authored and owned by Bruno.** Copyright (c) 2026 Bruno — all rights
+> reserved. Proprietary and unlicensed: see [`COPYRIGHT`](COPYRIGHT). This
+> notice must not be removed, obscured or altered.
+> Repository fingerprint: `BRUNO-E1CCB1FB`
+
 # xdmovies-bot — Telegram movie-link resolver (CloakBrowser, no VPN)
+
+**Author: Bruno — sole author and copyright holder.**
+Copyright © 2026 Bruno. All rights reserved. Proprietary and unlicensed; no
+licence is granted to copy, modify, redistribute, sublicense or claim
+authorship. Full terms: [`COPYRIGHT`](COPYRIGHT).
+Every source file carries an authorship header with a unique per-file
+fingerprint (`BRUNO-E1CCB1FB-XXXXXX`) for provenance, and every commit in this
+repository is authored by Bruno. Do not remove or alter those notices.
 
 A Telegram bot that turns `top.xdmovies.wtf` movie/series pages into final
 download links (HubCloud / GDrive / etc.). You send a link, it bypasses every

@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ============================================================
+#  xdmovies-bot  --  authored and owned by Bruno
+#  Copyright (c) 2026 Bruno.  All rights reserved.
+#
+#  Proprietary work. No open-source licence is granted to copy, modify,
+#  redistribute or claim authorship of this file. This notice must not be
+#  removed, obscured, renamed or altered.
+#
+#  Author:  Bruno
+#  File:    start.sh
+#  Fingerprint: BRUNO-E1CCB1FB-65A5DB
+# ============================================================
+
 # Boot xdmovies bot — VPS token solve-server (VPS_IP:8080), no Docker.
 # Direct IP from VPS (no VPN layer — Cloudflare will fingerprint the
 # Oracle Cloud ASN; this is intentional per the v6 architecture).

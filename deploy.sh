@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ============================================================
+#  xdmovies-bot  --  authored and owned by Bruno
+#  Copyright (c) 2026 Bruno.  All rights reserved.
+#
+#  Proprietary work. No open-source licence is granted to copy, modify,
+#  redistribute or claim authorship of this file. This notice must not be
+#  removed, obscured, renamed or altered.
+#
+#  Author:  Bruno
+#  File:    deploy.sh
+#  Fingerprint: BRUNO-E1CCB1FB-30883D
+# ============================================================
+
 # xdmovies bot — VPS deploy — VPS token only, no Docker/Cantarebella
 
 set -euo pipefail

@@ -1,3 +1,8 @@
+> **Authored and owned by Bruno.** Copyright (c) 2026 Bruno — all rights
+> reserved. Proprietary and unlicensed: see [`COPYRIGHT`](COPYRIGHT). This
+> notice must not be removed, obscured or altered.
+> Repository fingerprint: `BRUNO-E1CCB1FB`
+
 # [ARCHIVED] Future Plan — Linux VPS Cloudflare Bypass (Fortress + Raw CDP)
 
 > **Status:** deferred. Not implementing now. This document is the reference when the VPS deploy is ready to start.

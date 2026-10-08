@@ -1,3 +1,8 @@
+> **Authored and owned by Bruno.** Copyright (c) 2026 Bruno — all rights
+> reserved. Proprietary and unlicensed: see [`COPYRIGHT`](COPYRIGHT). This
+> notice must not be removed, obscured or altered.
+> Repository fingerprint: `BRUNO-E1CCB1FB`
+
 # AGENTS.md — xdmovies_bot_repo
 
 Telegram bot that scrapes movie download links from xdmovies.wtf, bypassing

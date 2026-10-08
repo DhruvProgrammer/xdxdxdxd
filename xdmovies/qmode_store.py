@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+#
+#  ============================================================
+#  xdmovies-bot  --  authored and owned by Bruno
+#  Copyright (c) 2026 Bruno.  All rights reserved.
+#
+#  This file is proprietary work. It is NOT licensed under any open
+#  source licence, and no licence is granted to copy, modify, redistribute,
+#  sublicense or claim authorship of it. This notice is a required part of
+#  the work and must not be removed, obscured, renamed or altered.
+#
+#  Author:  Bruno
+#  File:    xdmovies/qmode_store.py
+#  Fingerprint: BRUNO-E1CCB1FB-463D77
+#  ============================================================
+
 """Quality-mode setting: per-user ON/OFF for the series quality picker.
 
 `/qmode` asks "Do you want to enable quality mode?" (Yes/No). Default is

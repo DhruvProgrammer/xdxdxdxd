@@ -1,1 +1,7 @@
+# xdmovies-bot -- authored and owned by Bruno.
+# Copyright (c) 2026 Bruno. All rights reserved.
+# Proprietary: no open-source licence is granted to copy, modify,
+# redistribute or claim authorship. Do not remove this notice.
+# Fingerprint: BRUNO-E1CCB1FB-4D7C51
+
 -r xdmovies/requirements.txt

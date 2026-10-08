@@ -1,3 +1,8 @@
+> **Authored and owned by Bruno.** Copyright (c) 2026 Bruno — all rights
+> reserved. Proprietary and unlicensed: see [`COPYRIGHT`](COPYRIGHT). This
+> notice must not be removed, obscured or altered.
+> Repository fingerprint: `BRUNO-E1CCB1FB`
+
 # [ARCHIVED] Speed Improvements — Aug 2026
 
 > ⚠️ This document is historical. It describes the v2 era of the bot
