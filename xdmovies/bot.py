@@ -2541,7 +2541,8 @@ class Bot:
                 context.bot,
                 update.effective_chat.id,
                 f"⛔ This bot is private. Your Telegram user ID is <code>{update.effective_user.id}</code>. "
-                "Add it to TELEGRAM_OWNER_ID or TELEGRAM_ADMIN_IDS and restart the bot.",
+                "Add it to TELEGRAM_OWNER_ID or TELEGRAM_ADMIN_IDS and restart the bot.\n\n"
+                "made by bruno 💖💖",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2565,6 +2566,8 @@ class Bot:
             "/autodetect -- auto-detect new posts, resolve, post to channel (owner only)\n"
             "/stop -- shut down all bot work until owner /start (owner only)\n"
             "/restart -- restart the whole bot (owner only)\n"
+            "\n"
+            "made by bruno 💖💖"
         )
         await _send_safe(context.bot, update.effective_chat.id, text, parse_mode=ParseMode.HTML)
 
