@@ -29,9 +29,9 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 
 CATALOG_URLS = {
-    "all": "https://top.xdmovies.wtf/",
-    "movies": "https://top.xdmovies.wtf/?type=movies",
-    "series": "https://top.xdmovies.wtf/?type=series",
+    "all": "https://huh.xdmovies.wtf/",
+    "movies": "https://huh.xdmovies.wtf/?type=movies",
+    "series": "https://huh.xdmovies.wtf/?type=series",
 }
 STATE_DIR = Path(__file__).resolve().parent.parent / "xdmovies_state"
 
@@ -41,7 +41,7 @@ def catalog_page_url(kind: str, page: int) -> str:
     if page <= 1:
         return base
     if kind == "all":
-        return f"https://top.xdmovies.wtf/?page={page}"
+        return f"https://huh.xdmovies.wtf/?page={page}"
     return f"{base}&page={page}"
 
 
@@ -138,7 +138,8 @@ def save_channel(cfg: ScrapeChannel) -> None:
 def _canonical_detail_url(href: str, base_url: str, kind: str) -> str | None:
     absolute = urljoin(base_url, href)
     parsed = urlsplit(absolute)
-    if parsed.hostname not in {"xdmovies.wtf", "top.xdmovies.wtf"}:
+    h = (parsed.hostname or "").lower()
+    if h != "xdmovies.wtf" and not h.endswith(".xdmovies.wtf"):
         return None
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) != 2 or parts[0].lower() not in {"movies", "series"} or not parts[1]:
@@ -146,7 +147,7 @@ def _canonical_detail_url(href: str, base_url: str, kind: str) -> str | None:
     content_kind = parts[0].lower()
     if kind != "all" and content_kind != kind:
         return None
-    return urlunsplit(("https", "top.xdmovies.wtf", f"/{content_kind}/{parts[1]}", "", ""))
+    return urlunsplit(("https", "huh.xdmovies.wtf", f"/{content_kind}/{parts[1]}", "", ""))
 
 
 class _LinkParser(HTMLParser):

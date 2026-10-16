@@ -34,7 +34,7 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-SEARCH_BASE = os.environ.get("XDMOVIES_SEARCH_BASE", "https://top.xdmovies.wtf").rstrip("/")
+SEARCH_BASE = os.environ.get("XDMOVIES_SEARCH_BASE", "https://huh.xdmovies.wtf").rstrip("/")
 SEARCH_MAX_RESULTS = int(os.environ.get("XDMOVIES_SEARCH_MAX", "8") or "8")
 
 

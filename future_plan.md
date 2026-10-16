@@ -176,7 +176,7 @@ volumes:
    ```bash
    docker compose up -d cf-bypass
    ```
-7. **End-to-end validation** — send a Telegram message to the bot with an xdmovies URL (e.g. `https://top.xdmovies.wtf/movies/coco-2160p-1080p-hindi-english-download-354912`). The bot logs should show:
+7. **End-to-end validation** — send a Telegram message to the bot with an xdmovies URL (e.g. `https://huh.xdmovies.wtf/movies/coco-2160p-1080p-hindi-english-download-354912`). The bot logs should show:
    - `chromium connected to http://fortress:9222`
    - `cf_clearance` obtained
    - Total solve time **8–15s** (the benchmark expectation for raw CDP + C++ patches on light Turnstile).
@@ -309,7 +309,7 @@ colab / curl ──HTTPS──▶ Caddy (auto-TLS) ──▶ bypass-api:8090 ─
 ## 5. Security (non-negotiable for public use)
 
 1. **SSRF allowlist.** Only gate/movie/hub hosts accepted
-   (`latestnewsonline.sbs`, `top.xdmovies.wtf` / `xdmovies.wtf`, `hubcloud`,
+   (`latestnewsonline.sbs`, `huh.xdmovies.wtf` / `xdmovies.wtf`, `hubcloud`,
    `hubdrive`, `gamerxyt`, `gdflix`, …). Everything else (including cloud
    metadata `169.254.169.254` and internal ranges) → `unsupported_host`.
 2. **Limits:** per-IP + per-key rate windows, max 2 concurrent solves

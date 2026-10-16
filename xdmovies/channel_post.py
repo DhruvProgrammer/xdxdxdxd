@@ -22,7 +22,7 @@ Example captions:
     💿 Source: Netflix, BluRay
     🎬 Qualities: 1080p, 720p
     ✅ Now Available !!!
-    🎬 Visit: top.xdmovies.wtf
+    🎬 Visit: huh.xdmovies.wtf
     🔖 Bookmark: XDMovies.com
 
 Only the first line carries the title (+ optional year in parens).

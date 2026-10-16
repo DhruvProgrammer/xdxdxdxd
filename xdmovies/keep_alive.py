@@ -16,7 +16,7 @@
 
 """Hybrid keep-alive — post-level CF refresh (25m) + VPS token fallback.
 
-CF is on posts (top.xdmovies.wtf/movies/<slug>), NOT on homepage.
+CF is on posts (huh.xdmovies.wtf/movies/<slug>), NOT on homepage.
 So we must hit a deep link to trigger renewal. Hitting / alone does nothing.
 
 Flow:
@@ -45,9 +45,9 @@ from xdmovies.logger_utils import logger
 
 # CF is on posts, so we need a real movie page to refresh
 DEFAULT_MOVIE_TARGETS = [
-    "https://top.xdmovies.wtf/movies/coco-2160p-1080p-hindi-english-download-354912",
-    "https://top.xdmovies.wtf/movies/kantara-2160p-1080p-hindi-kannada-download-858485",
-    "https://top.xdmovies.wtf/movies/road-movie-1080p-720p-hindi-download-37438",
+    "https://huh.xdmovies.wtf/movies/jailer-2160p-1080p-hindi-tamil-download-937020",
+    "https://huh.xdmovies.wtf/movies/players-1080p-720p-hindi-download-83382",
+    "https://huh.xdmovies.wtf/movies/aasha-2160p-1080p-malayalam-hindi-download-1513475",
 ]
 
 CHECK_INTERVAL = 30  # seconds to check timer

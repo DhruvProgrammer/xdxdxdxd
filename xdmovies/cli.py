@@ -17,7 +17,7 @@
 """CLI — MANUAL CF COOKIE MODE.
 
 Usage:
-    python -m xdmovies.cli "https://top.xdmovies.wtf/movies/<slug>"
+    python -m xdmovies.cli "https://huh.xdmovies.wtf/movies/<slug>"
 Requires a stored cookie: /setcookie or xdmovies_state/cf_cookies.json
 If CF blocks, the CLI will tell you to solve and set cookie, then retry.
 """
@@ -122,7 +122,7 @@ async def run(movie_url: str, headless: bool = False) -> Dict[str, Any]:
 
 def _prompt_for_url() -> str:
     print("\n=== xdmovies bypass CLI (cookie mode) ===")
-    print("Paste the movie URL (e.g. https://top.xdmovies.wtf/movies/<slug>):")
+    print("Paste the movie URL (e.g. https://huh.xdmovies.wtf/movies/<slug>):")
     while True:
         url = input("URL> ").strip()
         if not url:

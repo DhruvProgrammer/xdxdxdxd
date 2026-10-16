@@ -457,7 +457,7 @@ class CFChallengeError(RuntimeError):
 def cf_prompt_text(url: str, host: str = "") -> str:
     h = host or _normalize_domain(url)
     is_xmovies = h == "xdmovies.wtf"
-    host_label = "xdmovies.wtf (covers top.xdmovies.wtf + link.xdmovies.wtf)" if is_xmovies else h
+    host_label = "xdmovies.wtf (covers every subdomain (*.xdmovies.wtf: top, huh, new, link))" if is_xmovies else h
     return (
         f"🔒 <b>Cloudflare blocked</b> — <code>{h}</code>\n\n"
         f"Link: <code>{url}</code>\n\n"
@@ -480,6 +480,6 @@ def cookie_help_text() -> str:
         "<b>How to copy (desktop):</b> F12 → Application → Cookies → find <code>cf_clearance</code> → copy Value\n"
         "<b>Mobile:</b> Cookie-Editor → Export → paste JSON\n\n"
         "<b>All accepted:</b> <code>cf_clearance=abc</code> • <code>cf_clearance=abc; __cf_bm=xyz</code> • bare token • JSON • Netscape cookies.txt • with UA: <code>value | Mozilla/5.0 ...</code>\n\n"
-        "<b>Domains:</b> <code>xdmovies.wtf</code> covers top+link • <code>latestnewsonline.sbs</code> needs its own cookie if its gate blocks.\n\n"
+        "<b>Domains:</b> <code>xdmovies.wtf</code> covers every subdomain (*.xdmovies.wtf) • <code>latestnewsonline.sbs</code> needs its own cookie if its gate blocks.\n\n"
         "If still blocked after pasting, cookie is IP-bound — retry from network near VPS."
     )

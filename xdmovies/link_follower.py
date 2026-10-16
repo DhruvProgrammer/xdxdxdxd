@@ -83,7 +83,7 @@ async def follow_download_link_in_browser_async(
                 except Exception:
                     pass
         await page.set_extra_http_headers({
-            "Referer": "https://top.xdmovies.wtf/",
+            "Referer": "https://huh.xdmovies.wtf/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         })

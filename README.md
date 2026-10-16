@@ -13,7 +13,7 @@ Every source file carries an authorship header with a unique per-file
 fingerprint (`BRUNO-E1CCB1FB-XXXXXX`) for provenance, and every commit in this
 repository is authored by Bruno. Do not remove or alter those notices.
 
-A Telegram bot that turns `top.xdmovies.wtf` movie/series pages into final
+A Telegram bot that turns `huh.xdmovies.wtf` movie/series pages into final
 download links (HubCloud / GDrive / etc.). You send a link, it bypasses every
 Cloudflare Turnstile and ad-gate in the path, and replies with clean,
 ready-to-download links. It can also **watch the site for new uploads** and
@@ -81,13 +81,13 @@ TELEGRAM_OWNER_ID or TELEGRAM_ADMIN_IDS and restart the bot.
 The main interaction is not a command — just **send a movie/series URL**:
 
 ```
-https://top.xdmovies.wtf/movies/kalki-2898-ad-2160p-1080p-hindi-tamil-download-123456
+https://huh.xdmovies.wtf/movies/kalki-2898-ad-2160p-1080p-hindi-tamil-download-123456
 ```
 
 or a series URL:
 
 ```
-https://top.xdmovies.wtf/series/mirzapur-1080p-720p-hindi-download-789012
+https://huh.xdmovies.wtf/series/mirzapur-1080p-720p-hindi-download-789012
 ```
 
 You get back a result card like:
@@ -116,7 +116,7 @@ Kalki 2898 AD:
 ## 3. What happens after you send a link (the pipeline)
 
 ```
-You send https://top.xdmovies.wtf/movies/<slug> (or /series/<slug>)
+You send https://huh.xdmovies.wtf/movies/<slug> (or /series/<slug>)
   │
   ├─ 0. EXTRACT (extractor.py, pure function, no browser)
   │     Parses download cards straight from the movie-page HTML:
@@ -170,7 +170,7 @@ challenge survives automation:
 
 ```
 🔒 Cloudflare blocked -- xdmovies.wtf
-Link: https://top.xdmovies.wtf/movies/...
+Link: https://huh.xdmovies.wtf/movies/...
 👉 Tap to solve (auto-captures, no paste):
 http://132.145.15.58:8080/solve/ce334dd24d22
 Open it, tap checkbox on screenshot if you see it. I'll auto-capture
@@ -539,7 +539,7 @@ from SSH instead, remove `xdmovies_state/shutdown.json` (or run
 ### A. "I want tonight's movie, fast"
 
 ```
-(you) https://top.xdmovies.wtf/movies/dune-part-two-2160p-1080p-hindi-english-download-999999
+(you) https://huh.xdmovies.wtf/movies/dune-part-two-2160p-1080p-hindi-english-download-999999
 (bot) 🔄 Bypassing Cloudflare on the movie page...  →  (seconds later)
       Dune Part Two:
       1) Dune.Part.Two.2160p... [12.4 GB] ...
@@ -579,7 +579,7 @@ Short-circuit path: cards already on hub hosts resolve with no browser at all.
 ### E. "My queue is full of autodetect items but I need one movie NOW"
 
 ```
-(you) https://top.xdmovies.wtf/movies/urgent-film-...
+(you) https://huh.xdmovies.wtf/movies/urgent-film-...
 (bot) ⚡ Urgent link — running now (channel scrape paused).
       → resolves immediately → channel scrape resumes after.
 /cancel 2 4   → drop the two autodetect items you don't care about.

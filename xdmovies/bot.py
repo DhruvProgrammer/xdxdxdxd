@@ -17,7 +17,7 @@
 """Telegram bot for xdmovies.wtf CF-bypass link extraction.
 
 Pipeline per DM:
-    DM with `top.xdmovies.wtf` URL
+    DM with `huh.xdmovies.wtf` URL
         → extract_download_links / extract_cards_async  (CF bypass + parse)
         → for each card: follow_download_link → execute_button_flow
         → per-link Telegram card + summary
@@ -181,7 +181,7 @@ except ImportError:  # pragma: no cover
 # as a single-card follow+gate job: it redirects to latestnews, so we keep
 # the follow hop then drive the gate (same path as a movie-page card).
 URL_RE = re.compile(
-    r"https?://(?:top\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
+    r"https?://(?:[a-z0-9-]+\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
     r"|https?://link\.xdmovies\.wtf/download/[A-Za-z0-9_\-]+"
     r"|https?://latestnewsonline\.sbs/r/[A-Za-z0-9_-]+",
     re.IGNORECASE,
@@ -5006,7 +5006,7 @@ class Bot:
             return
         await _send_safe(
             context.bot, update.effective_chat.id,
-            "[FAIL] not a supported URL. Send a movie page like `https://top.xdmovies.wtf/movies/<slug>` "
+            "[FAIL] not a supported URL. Send a movie page like `https://huh.xdmovies.wtf/movies/<slug>` "
             "or a download link like `https://link.xdmovies.wtf/download/<token>` "
             "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
             parse_mode=ParseMode.HTML,

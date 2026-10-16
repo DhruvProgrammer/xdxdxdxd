@@ -62,7 +62,7 @@ the lockfile. Set `RESTART=1` to also restart the service.
 
 ## 3. The 3-stage CF flow
 
-CF is on **posts** (`/movies/<slug>`), not on `top.xdmovies.wtf/` home.
+CF is on **posts** (`/movies/<slug>`), not on `huh.xdmovies.wtf/` home.
 Keep-alive must hit a deep link, not home. The flow:
 
 1. `pipeline.py` — fetch movie page with stored `cf_clearance` injected

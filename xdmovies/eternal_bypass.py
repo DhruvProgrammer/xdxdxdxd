@@ -51,7 +51,7 @@ from typing import Optional
 from xdmovies.logger_utils import logger
 
 
-TARGET_URL = "https://top.xdmovies.wtf"
+TARGET_URL = "https://huh.xdmovies.wtf"
 COOKIE_NAME = "cf_clearance"
 RENEWAL_MARGIN = 300   # 5 min before expiry: renew
 CHECK_INTERVAL = 30    # how often to check the cookie

@@ -16,7 +16,7 @@
 
 """Stage 1+2+3: Movie page (URL1) → extract all download links (URLs2) — MANUAL CF ONLY (bullet proof).
 
-  https://top.xdmovies.wtf/movies/<slug>
+  https://huh.xdmovies.wtf/movies/<slug>
       ↓ fetch with stored cf_clearance (manual) via Playwright
   HTML with 6 <a href="https://link.xdmovies.wtf/download/<base64>">...
 
