@@ -198,6 +198,87 @@ MSG_LIMIT = 4000
 _BATCH_CHUNK_BUDGET = MSG_LIMIT - 400
 _BATCH_SEP = "─" * 25
 
+# --- forwarded hub-card dump (mirror expansion) ---
+_HUB_DUMP_MAX_CARDS = 25        # max hub cards resolved from one forwarded message
+_HUB_DUMP_MAX_MIRRORS = 12      # max mirror lines emitted per card
+_HUB_DUMP_TIMEOUT = 12.0        # per-card wall-clock budget for the mirror fetch
+_HUB_DUMP_JOB_BUDGET = 180.0    # whole-dump wall-clock budget (seconds)
+_HUB_DUMP_KEEP_HUB = True       # keep the original "→ <hub url>" line above the mirrors
+# A run of >= 2 box-drawing characters (U+2500-U+257F) -- the bot's own
+# card separator. Its presence in a pasted message is the signal that
+# the message is a card dump and not a bare URL / a title.
+_BOX_RUN_RE = re.compile("[\u2500-\u257f]{2,}")
+
+
+def _ddl_fail_text(err: str, url: str) -> str:
+    """House-style failure text for ONE hub page.
+
+    A Cloudflare challenge on a hub page is reported as
+    "[FAIL] CF challenge on <host>" -- it is NEVER routed to the solve
+    server (the mirror path must stay solve-free).
+
+    The text is redacted: an exception message can embed a URL the
+    user never pasted (httpx renders the request URL inside the repr
+    of a failed request), and the failure line ends up in a chat.
+    """
+    e = (err or "").strip()
+    try:
+        from xdmovies import url_guard as _ug
+        e = _ug.redact_foreign_urls(_ug.redact_request_url(e), keep=url)
+    except Exception:
+        pass
+    if not e:
+        return "no mirrors found"
+    if "challenge" in e.lower():
+        host = ""
+        try:
+            from xdmovies import url_guard as _ug
+            host = _ug.host_of(url)
+        except Exception:
+            host = ""
+        return f"CF challenge on {host or 'hub page'}"
+    return e
+
+
+async def _ddl_fetch_mirrors(url: str) -> Tuple[List[Tuple[str, str]], str]:
+    """Mirror pairs for ONE hub page + an error string ('' on success).
+
+    Never raises: a dead hub page must never kill the whole batch.
+
+    The hub page is fetched EXACTLY ONCE. The generator page randomises
+    its mirror set per request, so a second attempt would throw the
+    first result away -- the reason this used to report "[FAIL] no
+    mirrors found" for a card whose links were already in hand. The
+    SAME result object carries the mirrors AND the error reason, so
+    there is no second HTTP chain at all (2 GETs per card, never 4).
+    """
+    from xdmovies import hub_mirrors as _hm
+    try:
+        res = await asyncio.wait_for(
+            _hm.fetch_hub_page(
+                url,
+                timeout=_HUB_DUMP_TIMEOUT,
+                total_timeout=_HUB_DUMP_TIMEOUT,
+            ),
+            timeout=_HUB_DUMP_TIMEOUT + 5.0,
+        )
+    except asyncio.TimeoutError:
+        return [], f"timeout after {_HUB_DUMP_TIMEOUT:g}s"
+    except Exception as exc:
+        try:
+            from xdmovies import url_guard as _ug
+            msg = _ug.redact_foreign_urls(
+                _ug.redact_request_url(f"{exc.__class__.__name__}: {exc}"),
+                keep=url,
+            )
+        except Exception:
+            msg = f"{exc.__class__.__name__}: {exc}"
+        return [], msg
+    pairs = [(m.label, m.url) for m in (getattr(res, "mirrors", None) or [])]
+    if pairs:
+        return pairs, ""
+    return [], _ddl_fail_text(getattr(res, "error", "") or "", url)
+
 
 _DETAIL_KEYS = ("rating", "genres", "air_date", "sources", "tmdb")
 
@@ -1074,7 +1155,7 @@ class Job:
     resolved: int = 0
     failed: int = 0
     cancel_event: "asyncio.Event" = field(default_factory=asyncio.Event)
-    job_type: str = "resolve"  # resolve | scrape_all
+    job_type: str = "resolve"  # resolve | scrape_all | ddl_dump
     content_type: str = ""     # all | movies | series
     # Who queued it -- captured at enqueue so /queue can show a clickable
     # name instead of a raw id. May be empty for legacy/programmatic jobs.
@@ -1117,6 +1198,27 @@ class Job:
     # drained at movie boundaries inside _run_scrape_all, then the
     # scrape resumes. Never set directly — use _enqueue(..., urgent=True).
     priority: int = 0
+    # Parsed cards for a forwarded hub-card dump (job_type == "ddl_dump").
+    ddl_cards: list = field(default_factory=list)
+    # Page title of the forwarded dump (job_type == "ddl_dump").
+    ddl_page_title: str = ""
+    # Readable label of a ddl_dump job -- "hub mirror expansion (25
+    # cards)". The job.url carries the same text so every display path
+    # that renders job.url (the /queue list, the /cancel reply, the
+    # enqueue note) shows a readable title instead of a bare number.
+    ddl_display_title: str = ""
+    # The hub page URL of every card of a ddl_dump job, in the same
+    # order as ddl_cards. A card can carry SEVERAL links; the hub page
+    # is the one that passed the hub-page policy, not necessarily the
+    # first one.
+    ddl_hub_urls: list = field(default_factory=list)
+    # Number of cards in the forwarded dump (the denominator of the
+    # summary -- it counts the cards that carry NO hub link too).
+    ddl_dump_total: int = 0
+    # Cards of the dump that carry no hub page link at all.
+    ddl_no_hub: int = 0
+    # Cards of the dump that were dropped by the per-dump card cap.
+    ddl_dropped: int = 0
 
 
 class Bot:
@@ -1335,6 +1437,9 @@ class Bot:
     async def _run_for_user(self, job: Job) -> None:
         if job.job_type == "scrape_all":
             await self._run_scrape_all(job)
+            return
+        if job.job_type == "ddl_dump":
+            await self._run_ddl_dump(job)
             return
         cfg = self.cfg
         started = time.time()
@@ -1860,6 +1965,296 @@ class Bot:
                 remember_movie_url(job.url)
             except Exception:
                 pass
+
+    async def _filter_card_links(self, card, hub_url: str = "") -> None:
+        """Drop every part of `card` that must not be echoed back.
+
+        The card's own hub link stays (the user pasted it and the bot
+        resolved it) and a link that points at a real mirror host
+        stays. Everything else -- the bot's own solve server, the VPS
+        IP, a tracker, an internal endpoint -- is removed BEFORE the
+        message is rendered: the reply can land in a group chat and the
+        VPS IP is deliberately hidden everywhere else in the bot.
+
+        The card's prose lines ("extra") are filtered the same way: a
+        pasted line that carries a URL the bot must not publish is
+        dropped as well.
+
+        Never raises; the card is left untouched on any error.
+        """
+        from xdmovies import url_guard as _ug
+        try:
+            links = list(getattr(card, "links", None) or [])
+        except Exception:
+            links = []
+        if links:
+            keep = []
+            for link in links:
+                url = ""
+                try:
+                    url = (getattr(link, "url", "") or "")
+                except Exception:
+                    url = ""
+                if hub_url and url == hub_url:
+                    keep.append(link)
+                    continue
+                try:
+                    safe = await asyncio.to_thread(_ug.is_echo_safe_url, url)
+                except Exception:
+                    safe = False
+                if safe:
+                    keep.append(link)
+            try:
+                card.links = keep
+            except Exception:
+                pass
+        try:
+            extras = list(getattr(card, "extra", None) or [])
+        except Exception:
+            extras = []
+        if extras:
+            keep_x = []
+            for line in extras:
+                try:
+                    found = _ug.urls_in(line)
+                except Exception:
+                    found = []
+                if not found:
+                    keep_x.append(line)
+                    continue
+                safe = True
+                for u in found:
+                    try:
+                        ok = await asyncio.to_thread(_ug.is_echo_safe_url, u)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        safe = False
+                        break
+                if safe:
+                    keep_x.append(line)
+            try:
+                card.extra = keep_x
+            except Exception:
+                pass
+
+    async def _run_ddl_dump(self, job: Job) -> None:
+        """Expand a forwarded hub-card dump into real DDL mirror links.
+
+        The owner forwards a block of already-resolved result cards back
+        to the bot; every card's hub page is opened with the plain-HTTPS
+        mirror engine (hub_mirrors -- two GETs, no browser) and the real
+        DDL mirrors (pixeldrain / buzz / 10Gbps / telegram) are listed
+        under the card.
+
+        A hub page that IS behind a Cloudflare challenge is reported
+        inline as "[FAIL] CF challenge on <host>" -- it is NEVER sent to
+        the solve server (this path must stay solve-free).
+        """
+        from xdmovies import card_dump as _cd
+        from xdmovies import url_guard as _ug
+
+        started = time.time()
+        job.started_at = started
+        job.status = "running"
+        cards = list(getattr(job, "ddl_cards", None) or [])[:_HUB_DUMP_MAX_CARDS]
+        total = len(cards)
+        # The denominator of the summary is the number of cards in the
+        # DUMP -- not the number of cards that carry a hub link. The
+        # owner can then see how many cards were skipped.
+        try:
+            dump_total = int(getattr(job, "ddl_dump_total", 0) or 0)
+        except Exception:
+            dump_total = 0
+        if dump_total < total:
+            dump_total = total
+        try:
+            no_hub = int(getattr(job, "ddl_no_hub", 0) or 0)
+        except Exception:
+            no_hub = 0
+        try:
+            dropped = int(getattr(job, "ddl_dropped", 0) or 0)
+        except Exception:
+            dropped = 0
+        # The hub page URL of every card (a card can carry SEVERAL
+        # links -- the hub page is the one that passed the policy).
+        try:
+            hub_urls = list(getattr(job, "ddl_hub_urls", None) or [])
+        except Exception:
+            hub_urls = []
+        # Whole-dump wall-clock budget. The dispatcher is single-lane:
+        # one slow dump would block every other user's job, so the dump
+        # is cut off at the budget and the truncation is reported.
+        deadline = started + _HUB_DUMP_JOB_BUDGET
+        mirrors_by_card: List[List[Tuple[str, str]]] = []
+        cancelled = 0
+        skipped = 0
+        # Drop every link / prose line that must not be echoed back:
+        # the card's own hub link stays (the user pasted it) and a link
+        # to a real mirror host stays -- everything else (the bot's own
+        # solve server, the VPS IP, a tracker) is removed BEFORE the
+        # message is rendered. The reply can land in a group chat, so
+        # the VPS IP must never be re-published. This runs BEFORE the
+        # fetch loop, so the bot's own "[FAIL] ..." / "⚠️ ..." lines
+        # (added later) are never filtered.
+        for _idx, _card in enumerate(cards, 1):
+            _hub = ""
+            try:
+                if _idx - 1 < len(hub_urls):
+                    _hub = hub_urls[_idx - 1] or ""
+            except Exception:
+                _hub = ""
+            await self._filter_card_links(_card, _hub)
+        try:
+            await self._set_progress(job, "🔄 Fetching DDL mirrors...")
+            for idx, card in enumerate(cards, 1):
+                # /cancel: stop the whole dump. The dispatcher is the
+                # only lane, so every card left would keep blocking
+                # every other user's job.
+                if job.cancel_event.is_set():
+                    cancelled = total - (idx - 1)
+                    break
+                # Budget exhausted: stop and report the truncation.
+                if time.time() >= deadline:
+                    skipped = total - (idx - 1)
+                    break
+                hub = ""
+                try:
+                    if idx - 1 < len(hub_urls):
+                        hub = hub_urls[idx - 1] or ""
+                except Exception:
+                    hub = ""
+                if not hub:
+                    try:
+                        link = getattr(card, "hub", None)
+                        if link is not None:
+                            hub = getattr(link, "url", "") or ""
+                    except Exception:
+                        hub = ""
+                pairs: List[Tuple[str, str]] = []
+                err = ""
+                if not hub:
+                    err = "no hub link"
+                elif not _ug.is_hub_page_url(hub):
+                    # Defence in depth: the enqueue filter already
+                    # rejects non-hub URLs -- never fetch one.
+                    err = "not a hub page URL"
+                else:
+                    pairs, err = await _ddl_fetch_mirrors(hub)
+                if err:
+                    job.failed += 1
+                    try:
+                        card.extra = list(card.extra) + [f"[FAIL] {err}"]
+                    except Exception:
+                        pass
+                else:
+                    job.resolved += 1
+                    if len(pairs) > _HUB_DUMP_MAX_MIRRORS:
+                        # The mirror cap is reported -- a silent
+                        # truncation would look like a short mirror set.
+                        more = len(pairs) - _HUB_DUMP_MAX_MIRRORS
+                        try:
+                            card.extra = list(card.extra) + [
+                                f"⚠️ +{more} more mirrors ignored "
+                                f"(max {_HUB_DUMP_MAX_MIRRORS})."
+                            ]
+                        except Exception:
+                            pass
+                        pairs = pairs[:_HUB_DUMP_MAX_MIRRORS]
+                mirrors_by_card.append(pairs)
+                try:
+                    job.cards_done = idx
+                except Exception:
+                    pass
+                try:
+                    await self._set_progress(
+                        job,
+                        f"🔄 Fetching DDL mirrors... <b>{idx}/{total}</b>",
+                    )
+                except Exception:
+                    pass
+            # Drop every link that must not be echoed back: the card's
+            # own hub link stays (the user pasted it) and a link to a
+            # real mirror host stays -- everything else (the bot's own
+            # solve server, the VPS IP, a tracker) is removed BEFORE
+            # the message is rendered. The reply can land in a group
+            # chat, so the VPS IP must never be re-published.
+            dump = _cd.Dump(
+                page_title=(getattr(job, "ddl_page_title", "") or None),
+                cards=cards,
+            )
+            text = _cd.render_dump(dump, mirrors_by_card, keep_hub=_HUB_DUMP_KEEP_HUB)
+            for chunk in _cd.chunk_dump(text, limit=MSG_LIMIT):
+                if not chunk:
+                    continue
+                await _send_safe(
+                    self._bot, job.chat_id, chunk, parse_mode=ParseMode.HTML
+                )
+            elapsed = time.time() - started
+            mm, ss = divmod(int(elapsed), 60)
+            _title_line = ""
+            if getattr(job, "ddl_page_title", ""):
+                _title_line = (
+                    f"🎬 <b>title:</b> "
+                    f"<code>{_html_escape(job.ddl_page_title)}</code>\n"
+                )
+            summary = (
+                f"{_title_line}"
+                f"⏱ <b>total_time_for_all:</b> {mm}m {ss}s\n"
+                f"[OK] {job.resolved}/{dump_total} hub pages  "
+                f"[FAIL] {job.failed} failed  "
+                f"[cancelled] {cancelled}  [skipped] {skipped}"
+            )
+            if no_hub:
+                summary += (
+                    f"\n⚠️ {no_hub} cards had no hub page link "
+                    f"and were skipped."
+                )
+            if dropped:
+                summary += f"\n⚠️ +{dropped} more cards ignored (max {_HUB_DUMP_MAX_CARDS})."
+            if cancelled:
+                summary += "\n🛑 cancelled -- the remaining cards were not fetched."
+            if skipped:
+                summary += (
+                    f"\n⏱ stopped after {_HUB_DUMP_JOB_BUDGET:g}s "
+                    f"(the rest was not fetched)."
+                )
+            try:
+                if self._bot is not None:
+                    await self._bot.send_message(
+                        chat_id=job.chat_id, text=summary, parse_mode=ParseMode.HTML
+                    )
+            except Exception:
+                _LOG.exception("ddl dump summary send failed")
+        except Exception as exc:
+            # Never raise out of this coroutine -- the dispatcher would
+            # turn it into an "unhandled error" with a traceback file.
+            _LOG.exception("ddl dump failed")
+            job.status = "error"
+            try:
+                from xdmovies import url_guard as _ug
+                job.error = _ug.redact_foreign_urls(
+                    _ug.redact_request_url(f"{exc.__class__.__name__}: {exc}")
+                )
+            except Exception:
+                job.error = f"{exc.__class__.__name__}: {exc}"
+            job.finished_at = time.time()
+            try:
+                await _send_safe(
+                    self._bot, _op_dm(job),
+                    f"[FAIL] error: {_html_escape(job.error)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+        if job.cancel_event.is_set():
+            # Cancellation is a status, not an error (same convention as
+            # every other job type).
+            job.status = "cancelled"
+        else:
+            job.status = "done" if job.failed == 0 else "done_with_errors"
+        job.finished_at = time.time()
 
     async def _run_scrape_all(self, job: Job) -> None:
         from xdmovies.scrape_all import (
@@ -4341,6 +4736,95 @@ class Bot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _cmd_ddl(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """`/ddl <hub page url>` -- expand one hub page into its DDL mirrors."""
+        if update.effective_user is None or update.effective_chat is None or update.message is None:
+            return
+        uid = update.effective_user.id
+        if not bot_config.is_allowed(uid, self.cfg):
+            return  # silent ignore
+        from xdmovies import card_dump as _cd
+        from xdmovies import hub_mirrors as _hm
+        from xdmovies import url_guard as _ug
+        args = list(context.args or [])
+        url = args[0].strip() if args else ""
+        if not url:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "Usage: <code>/ddl https://hubcloud.ist/drive/&lt;code&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not _ug.is_hub_page_url(url):
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                "[FAIL] not a supported hub page URL",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            safe_url = await asyncio.to_thread(_ug.check_url, url)
+        except Exception as exc:
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                f"[FAIL] not a supported hub page URL ({_html_escape(str(exc))})",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            res = await _hm.fetch_hub_page(
+                safe_url,
+                timeout=_HUB_DUMP_TIMEOUT,
+                total_timeout=_HUB_DUMP_TIMEOUT,
+            )
+        except Exception as exc:
+            _msg = f"{exc.__class__.__name__}: {exc}"
+            try:
+                _msg = _ug.redact_foreign_urls(
+                    _ug.redact_request_url(_msg), keep=safe_url
+                )
+            except Exception:
+                pass
+            await _send_safe(
+                context.bot, update.effective_chat.id,
+                f"[FAIL] error: {_html_escape(_msg)}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        mirrors = list(getattr(res, "mirrors", None) or [])
+        pairs = [(m.label, m.url) for m in mirrors]
+        more_mirrors = 0
+        if len(pairs) > _HUB_DUMP_MAX_MIRRORS:
+            more_mirrors = len(pairs) - _HUB_DUMP_MAX_MIRRORS
+            pairs = pairs[:_HUB_DUMP_MAX_MIRRORS]
+        info = getattr(res, "info", None)
+        title = (getattr(info, "title", "") or "").strip()
+        size = (getattr(info, "size", "") or "").strip()
+        meta = []
+        if size:
+            meta.append(("Size", size))
+        card = _cd.DumpCard(
+            number=1,
+            title=title or "(untitled)",
+            meta=meta,
+            links=[_cd.DumpLink(url=safe_url)],
+        )
+        err = (getattr(res, "error", "") or "").strip()
+        if err and not pairs:
+            card.extra = [f"[FAIL] {_ddl_fail_text(err, safe_url)}"]
+        if more_mirrors:
+            card.extra = list(card.extra) + [
+                f"⚠️ +{more_mirrors} more mirrors ignored "
+                f"(max {_HUB_DUMP_MAX_MIRRORS})."
+            ]
+        text = _cd.render_card(card, mirrors=pairs, keep_hub=_HUB_DUMP_KEEP_HUB)
+        for chunk in _cd.chunk_dump(text, limit=MSG_LIMIT):
+            if not chunk:
+                continue
+            await _send_safe(
+                context.bot, update.effective_chat.id, chunk, parse_mode=ParseMode.HTML
+            )
+
     async def _acceptall_enqueue(self, uid: int, chat_id: int, results,
                                  user_name: str, username: str,
                                  to_channel: int = 0,
@@ -4983,6 +5467,98 @@ class Bot:
                              parse_mode=ParseMode.HTML)
             return
 
+        # Forwarded hub-card dump: the owner pastes the bot's own result
+        # cards back in. Every card's hub page is expanded into its real
+        # DDL mirror links (pixeldrain / buzz / 10Gbps / telegram).
+        #
+        # The branch is deliberately CONSERVATIVE: a message is only
+        # hijacked when it really looks like a card dump. A title plus
+        # a single hub link ("Chennai Express" + "-> https://hubcloud...")
+        # is a title search, not a dump -- that keeps the channel-title
+        # path below reachable. A bare hub URL is handled by /ddl.
+        try:
+            from xdmovies import card_dump as _cd
+            from xdmovies import url_guard as _ug
+            _dump = _cd.parse_dump(text)
+            _all_cards = list(getattr(_dump, "cards", None) or [])
+            _hub_cards = []
+            _hub_urls = []
+            _no_hub = 0
+            for _c in _all_cards:
+                # A card can carry SEVERAL links -- the hub page is the
+                # FIRST link that passes the hub-page policy, not
+                # necessarily the first link of the card.
+                _u = ""
+                for _lk in (getattr(_c, "links", None) or []):
+                    _lu = (getattr(_lk, "url", "") or "")
+                    if _lu and _ug.is_hub_page_url(_lu):
+                        _u = _lu
+                        break
+                if _u:
+                    _hub_cards.append(_c)
+                    _hub_urls.append(_u)
+                else:
+                    _no_hub += 1
+        except Exception:
+            _dump = None
+            _all_cards = []
+            _hub_cards = []
+            _hub_urls = []
+            _no_hub = 0
+        # "Looks like a card dump"? At least one numbered card, or at
+        # least two cards, or the bot's own card separator.
+        try:
+            _numbered = any(
+                getattr(_c, "number", None) is not None for _c in _all_cards
+            )
+        except Exception:
+            _numbered = False
+        _has_sep = bool(_BOX_RUN_RE.search(text or ""))
+        _dumpish = bool(_numbered) or (len(_all_cards) >= 2) or _has_sep
+        if _hub_cards and _dumpish:
+            _found_cards = len(_all_cards) or len(_hub_cards)
+            _dropped_cards = 0
+            if len(_hub_cards) > _HUB_DUMP_MAX_CARDS:
+                _dropped_cards = len(_hub_cards) - _HUB_DUMP_MAX_CARDS
+                _hub_cards = _hub_cards[:_HUB_DUMP_MAX_CARDS]
+                _hub_urls = _hub_urls[:_HUB_DUMP_MAX_CARDS]
+            _label = "hub mirror expansion (%d card%s)" % (
+                len(_hub_cards), "" if len(_hub_cards) == 1 else "s"
+            )
+            job = Job(user_id=uid, chat_id=update.effective_chat.id,
+                      url=_label,
+                      user_name=_nm, username=_un,
+                      job_type="ddl_dump")
+            job.ddl_cards = _hub_cards
+            job.ddl_hub_urls = _hub_urls
+            job.ddl_page_title = (getattr(_dump, "page_title", "") or "")
+            job.ddl_display_title = _label
+            job.ddl_dump_total = _found_cards
+            job.ddl_no_hub = _no_hub
+            job.ddl_dropped = _dropped_cards
+            job.cards_total = _found_cards
+            job.cards_done = 0
+            pos = await self._enqueue(job)
+            # The job url IS the readable label, so the queue note and
+            # the /queue list show "hub mirror expansion (25 cards)"
+            # instead of a bare number.
+            job.enqueue_msg_id = await self._confirm_enqueued(
+                context, update.effective_chat.id, _label, pos)
+            if _dropped_cards:
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    f"⚠️ +{_dropped_cards} more cards ignored "
+                    f"(max {_HUB_DUMP_MAX_CARDS}).",
+                    parse_mode=ParseMode.HTML,
+                )
+            if _no_hub:
+                await _send_safe(
+                    context.bot, update.effective_chat.id,
+                    f"⚠️ {_no_hub} cards had no hub page link and were skipped.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
         # No URLs — maybe a forwarded XDMovies channel post
         # (photo+caption). Extract the title and auto-scrape it.
         try:
@@ -5025,6 +5601,7 @@ class Bot:
                 commands = [
                     BotCommand("start", "show welcome card"),
                     BotCommand("search", "find a movie/series, tap to scrape"),
+                    BotCommand("ddl", "expand a hub page into DDL mirror links"),
                     BotCommand("status", "show bot health"),
                     BotCommand("usage", "show bandwidth usage"),
                     BotCommand("queue", "show running + queued jobs"),
@@ -5300,6 +5877,7 @@ class Bot:
         app.add_handler(CommandHandler("scrapeall", guarded(self._cmd_scrapeall)))
         app.add_handler(CommandHandler("scrapeallchannel", guarded(self._cmd_scrapeallchannel)))
         app.add_handler(CommandHandler("search", guarded(self._cmd_search)))
+        app.add_handler(CommandHandler("ddl", guarded(self._cmd_ddl)))
         app.add_handler(CallbackQueryHandler(
             guarded(self._on_search_pick),
             pattern=r"^search:(pick|page):\d+$|^search:(close|acceptall)$|^search:content:(all|ep|pack)$|^search:tochan:(yes|no)$",
