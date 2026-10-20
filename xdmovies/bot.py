@@ -180,6 +180,14 @@ except ImportError:  # pragma: no cover
 # page load per link). A pasted link.xdmovies.wtf/download/<token> URL runs
 # as a single-card follow+gate job: it redirects to latestnews, so we keep
 # the follow hop then drive the gate (same path as a movie-page card).
+#
+# LANDMINE: the hub drive hosts (hubcloud.ist / hubcloud.one / ...) are
+# DELIBERATELY NOT here. Adding them would make _extract_links match a
+# hub URL, the URL branch below would win, and the hub page would be run
+# through the full CF-bypass browser as if it were a movie page -- ending
+# in "[FAIL] no download links found on that page" and polluting the
+# keep-alive refresh list. Hub pages are handled by the ddl branch
+# further down, which resolves them into DDL mirrors with plain HTTPS.
 URL_RE = re.compile(
     r"https?://(?:[a-z0-9-]+\.)?xdmovies\.wtf/(?:movies|series)/[A-Za-z0-9_\-]+"
     r"|https?://link\.xdmovies\.wtf/download/[A-Za-z0-9_\-]+"
@@ -240,8 +248,13 @@ def _ddl_fail_text(err: str, url: str) -> str:
     return e
 
 
-async def _ddl_fetch_mirrors(url: str) -> Tuple[List[Tuple[str, str]], str]:
+async def _ddl_fetch_mirrors(url: str) -> Tuple[List[Tuple[str, str]], str, object]:
     """Mirror pairs for ONE hub page + an error string ('' on success).
+
+    The THIRD element is the hub page's own metadata
+    (hub_mirrors.HubPageInfo: title + size). It comes from the SAME
+    response object, so a card that carries no title of its own (a bare
+    hub link) can be completed WITHOUT a second HTTP chain.
 
     Never raises: a dead hub page must never kill the whole batch.
 
@@ -263,7 +276,7 @@ async def _ddl_fetch_mirrors(url: str) -> Tuple[List[Tuple[str, str]], str]:
             timeout=_HUB_DUMP_TIMEOUT + 5.0,
         )
     except asyncio.TimeoutError:
-        return [], f"timeout after {_HUB_DUMP_TIMEOUT:g}s"
+        return [], f"timeout after {_HUB_DUMP_TIMEOUT:g}s", None
     except Exception as exc:
         try:
             from xdmovies import url_guard as _ug
@@ -273,11 +286,228 @@ async def _ddl_fetch_mirrors(url: str) -> Tuple[List[Tuple[str, str]], str]:
             )
         except Exception:
             msg = f"{exc.__class__.__name__}: {exc}"
-        return [], msg
+        return [], msg, None
     pairs = [(m.label, m.url) for m in (getattr(res, "mirrors", None) or [])]
+    info = getattr(res, "info", None)
     if pairs:
-        return pairs, ""
-    return [], _ddl_fail_text(getattr(res, "error", "") or "", url)
+        return pairs, "", info
+    return [], _ddl_fail_text(getattr(res, "error", "") or "", url), info
+
+
+def _fill_card_from_info(card, info) -> None:
+    """Complete an untitled card from the hub page's own metadata.
+
+    A bare hub link carries no title and no size: both come from the
+    hub page itself (its <title> and its "File Size" row) -- exactly
+    what the /ddl command renders. A card that already has a title (a
+    pasted dump card) KEEPS it: the pasted metadata wins, so the
+    existing dump output does not change by a single byte.
+
+    Never raises: a broken card must never kill the dump.
+    """
+    try:
+        if card is None or info is None:
+            return
+        if (getattr(card, "title", "") or "").strip():
+            return  # pasted metadata wins
+        title = (getattr(info, "title", "") or "").strip()
+        size = (getattr(info, "size", "") or "").strip()
+        if title:
+            try:
+                card.title = title
+            except Exception:
+                pass
+        if size:
+            try:
+                meta = list(getattr(card, "meta", None) or [])
+                if not any(str(l).lower() == "size" for l, _ in meta):
+                    meta.append(("Size", size))
+                    card.meta = meta
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# --- bare hub-link detection ---------------------------------------------
+# The owner pastes a hub drive URL on its own
+# ("https://hubcloud.ist/drive/<code>") and expects the same DDL mirror
+# expansion a forwarded card dump gets.
+#
+# This scan finds the URL CANDIDATES; the POLICY is
+# url_guard.is_hub_page_url -- the cheap structural hub-page check (host
+# + path shape, no DNS, no I/O). Only a real hub drive page survives it,
+# so a link to the bot's own solve server, the VPS IP, a tracker or an
+# ad host can never become a card. The URL that is finally REQUESTED
+# goes through the full check_url guard inside hub_mirrors._get.
+#
+# The charset is the RFC 3986 URI characters, so a URL may sit anywhere
+# in the text and is still found, while whitespace, quotes and angle
+# brackets (never legal in a URI) terminate the match.
+_HUB_TEXT_URL_RE = re.compile(
+    r"https?://[A-Za-z0-9\-._~:/?\#\[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
+
+#: Trailing punctuation a chat message glues onto a URL. The hub-page
+#: policy only looks at the path SHAPE, so ".../drive/abc." would pass
+#: it and then 404.
+_URL_TRAIL_PUNCT = ".,;:!?'\""
+
+#: A trailing HTML entity is stripped as a UNIT -- otherwise ".../x&amp;"
+#: would be mangled into ".../x&amp" (the ";" goes first, and then the
+#: "&" is no longer trailing).
+_URL_TAIL_ENTITY_RE = re.compile(
+    r"&(?:[a-zA-Z][a-zA-Z0-9]{0,30}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});$"
+)
+
+#: Bracket pairs, for the "unbalanced closer" rule below.
+_URL_BRACKETS = (("(", ")"), ("[", "]"), ("{", "}"))
+
+#: A scheme boundary. Used to split a candidate that holds SEVERAL urls
+#: glued together -- NEVER the bare substring "http": a drive code may
+#: legitimately contain that (".../drive/myhttp") and splitting there
+#: would fetch a DIFFERENT file.
+_URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
+
+
+#: How many scheme boundaries one candidate may be split into. A real
+#: message holds a handful of links; a blob of thousands is malformed
+#: input, and splitting it would cost one policy check per piece.
+_URL_MAX_SPLITS = 64
+
+#: How many URL candidates one message may contribute. The dump job
+#: caps the cards at _HUB_DUMP_MAX_CARDS (25), so scanning far past
+#: that is wasted work on input the bot will not fetch anyway.
+_URL_MAX_CANDIDATES = 200
+
+
+def _split_url_candidates(chunk: str) -> List[str]:
+    """Split a candidate that holds SEVERAL urls glued together.
+
+    The split happens on a SCHEME boundary ("http://" / "https://") and
+    only BEFORE the first "?" of the candidate -- a query string may
+    legitimately contain "://" ("?u=http://x") and splitting there
+    would mangle the URL.
+
+    At most _URL_MAX_SPLITS boundaries are honoured: a blob with
+    thousands of them is malformed input, and splitting it would cost
+    a policy check per piece for no benefit.
+
+    Never raises.
+    """
+    text = chunk or ""
+    if not text:
+        return []
+    try:
+        q = text.find("?")
+    except Exception:
+        q = -1
+    limit = len(text) if q < 0 else q
+    try:
+        starts = [m.start() for m in _URL_SCHEME_RE.finditer(text, 0, limit)]
+    except Exception:
+        return [text]
+    if len(starts) <= 1:
+        return [text]
+    if len(starts) > _URL_MAX_SPLITS:
+        starts = starts[:_URL_MAX_SPLITS]
+        starts.append(len(text))
+        starts = sorted(set(starts))
+    out: List[str] = []
+    for a, b in zip(starts, starts[1:]):
+        out.append(text[a:b])
+    out.append(text[starts[-1]:])
+    return [p for p in out if p]
+
+
+def _trim_url_candidate(u: str) -> str:
+    """Strip the punctuation a message glues onto a URL.
+
+    A trailing ")" is removed only while the pair is UNBALANCED inside
+    the candidate, so a legitimate ".../a_(b)" keeps its parenthesis
+    while ".../drive/abc)" loses it. Never raises.
+    """
+    out = (u or "").strip()
+    changed = True
+    while changed and out:
+        changed = False
+        # The entity pattern is anchored at the end and is at most ~37
+        # characters long, so only the tail has to be searched -- that
+        # keeps the trim linear on a huge candidate.
+        tail = out[-64:]
+        try:
+            m = _URL_TAIL_ENTITY_RE.search(tail)
+        except Exception:
+            m = None
+        if m:
+            out = out[: len(out) - len(tail) + m.start()]
+            changed = True
+            continue
+        if out[-1] in _URL_TRAIL_PUNCT:
+            out = out[:-1]
+            changed = True
+            continue
+        for op, cl in _URL_BRACKETS:
+            if out.endswith(cl) and out.count(op) < out.count(cl):
+                out = out[:-1]
+                changed = True
+                break
+        if changed:
+            continue
+        for op, cl in _URL_BRACKETS:
+            if out.endswith(op) and out.count(cl) < out.count(op):
+                out = out[:-1]
+                changed = True
+                break
+    return out
+
+
+def _scan_hub_page_urls(text: str) -> List[str]:
+    """Every hub-page URL in `text` (deduped, source order).
+
+    The text is normalised first (entities decoded, zero-width
+    characters stripped) so "?a=1&amp;b=2" is found as the URL it
+    really is. Candidates are then filtered with
+    url_guard.is_hub_page_url -- host + path shape only, no DNS and no
+    I/O -- so ONLY a real hub drive page survives. A match may hold
+    SEVERAL urls glued together ("https://a,https://b"), so they are
+    split apart. Never raises.
+    """
+    out: List[str] = []
+    seen = set()
+
+    def _add(u: str) -> None:
+        if not u or u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    try:
+        from xdmovies import card_dump as _cdscan
+        from xdmovies import url_guard as _ugscan
+        try:
+            body = _cdscan.normalize(text or "")
+        except Exception:
+            body = text or ""
+        for m in _HUB_TEXT_URL_RE.finditer(body):
+            if len(out) >= _URL_MAX_CANDIDATES:
+                break
+            for piece in _split_url_candidates(m.group(0) or ""):
+                if len(out) >= _URL_MAX_CANDIDATES:
+                    break
+                u = _trim_url_candidate(piece)
+                if not u:
+                    continue
+                try:
+                    if not _ugscan.is_hub_page_url(u):
+                        continue
+                except Exception:
+                    continue
+                _add(u)
+    except Exception:
+        return out
+    return out
 
 
 _DETAIL_KEYS = ("rating", "genres", "air_date", "sources", "tmdb")
@@ -1219,6 +1449,12 @@ class Job:
     ddl_no_hub: int = 0
     # Cards of the dump that were dropped by the per-dump card cap.
     ddl_dropped: int = 0
+    # True when the job came from a BARE hub link (a link the owner
+    # pasted on its own) rather than a forwarded card dump. A bare card
+    # carries no title of its own, so its title and size are completed
+    # from the hub page; a pasted dump card keeps its own metadata and
+    # must NOT be touched, so the dump output stays byte-identical.
+    ddl_bare: bool = False
 
 
 class Bot:
@@ -2133,6 +2369,7 @@ class Bot:
                         hub = ""
                 pairs: List[Tuple[str, str]] = []
                 err = ""
+                info = None
                 if not hub:
                     err = "no hub link"
                 elif not _ug.is_hub_page_url(hub):
@@ -2140,7 +2377,15 @@ class Bot:
                     # rejects non-hub URLs -- never fetch one.
                     err = "not a hub page URL"
                 else:
-                    pairs, err = await _ddl_fetch_mirrors(hub)
+                    pairs, err, info = await _ddl_fetch_mirrors(hub)
+                # A BARE hub link (job.ddl_bare) carries no title and no
+                # size: both are completed from the hub page -- its
+                # <title> and its "File Size" row. That is exactly what
+                # /ddl renders. A pasted dump card keeps its own
+                # metadata untouched, so the dump output does not change
+                # by a single byte.
+                if getattr(job, "ddl_bare", False):
+                    _fill_card_from_info(card, info)
                 if err:
                     job.failed += 1
                     try:
@@ -5515,6 +5760,43 @@ class Bot:
             _numbered = False
         _has_sep = bool(_BOX_RUN_RE.search(text or ""))
         _dumpish = bool(_numbered) or (len(_all_cards) >= 2) or _has_sep
+        # ---- bare hub-link drop -----------------------------------------
+        # A message that is NOT a card dump but carries a hub page URL
+        # is a link drop: the owner pasted
+        # "https://hubcloud.ist/drive/<code>" and expects the same DDL
+        # mirror expansion a forwarded dump gets.
+        #
+        # The cards are built HERE, one per URL. card_dump folds
+        # consecutive bare URLs into ONE card with several links, and
+        # the dump path takes only the FIRST hub link of a card -- so
+        # reusing the parser's cards here would resolve one of N.
+        #
+        # A hub link WINS over a title in the same message: the link is
+        # the more specific request (the title path would search for a
+        # film, the link path resolves a file the owner already has).
+        # A title on its own -- no link anywhere -- still searches, so
+        # the title path is untouched for the way it is actually used.
+        _bare_cards = []
+        _bare_urls = []
+        try:
+            if not _dumpish:
+                from xdmovies import card_dump as _cdb
+                _scan = _scan_hub_page_urls(text)
+                for _i, _u in enumerate(_scan, 1):
+                    _bare_cards.append(_cdb.DumpCard(
+                        number=_i, title="",
+                        links=[_cdb.DumpLink(url=_u)]))
+                _bare_urls = [c.links[0].url for c in _bare_cards]
+        except Exception:
+            _bare_cards = []
+            _bare_urls = []
+        if _bare_cards:
+            # The synthetic cards replace the parsed ones.
+            _all_cards = list(_bare_cards)
+            _hub_cards = list(_bare_cards)
+            _hub_urls = list(_bare_urls)
+            _no_hub = 0
+            _dumpish = True
         if _hub_cards and _dumpish:
             _found_cards = len(_all_cards) or len(_hub_cards)
             _dropped_cards = 0
@@ -5531,6 +5813,7 @@ class Bot:
                       job_type="ddl_dump")
             job.ddl_cards = _hub_cards
             job.ddl_hub_urls = _hub_urls
+            job.ddl_bare = bool(_bare_cards)
             job.ddl_page_title = (getattr(_dump, "page_title", "") or "")
             job.ddl_display_title = _label
             job.ddl_dump_total = _found_cards
@@ -5584,7 +5867,8 @@ class Bot:
             context.bot, update.effective_chat.id,
             "[FAIL] not a supported URL. Send a movie page like `https://huh.xdmovies.wtf/movies/<slug>` "
             "or a download link like `https://link.xdmovies.wtf/download/<token>` "
-            "or a direct gate link like `https://latestnewsonline.sbs/r/<code>`",
+            "or a direct gate link like `https://latestnewsonline.sbs/r/<code>` "
+            "or a hub page like `https://hubcloud.ist/drive/<code>`",
             parse_mode=ParseMode.HTML,
         )
         return
