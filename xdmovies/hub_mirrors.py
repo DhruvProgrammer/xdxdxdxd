@@ -82,19 +82,29 @@ MIRROR_HOSTS: tuple[str, ...] = (
     "pixeldrain.dev",
     "pixeldrain.com",
     "fuckingfast.net",
+    # ZipDisk also serves some files from a public Google Cloud Storage
+    # bucket.
+    "storage.googleapis.com",
 )
+
+#: Mirror families whose subdomain is randomised per deployment, so no
+#: single hostname can be allowlisted: ZipDisk on Cloudflare Workers
+#: (ddl2.<random>.workers.dev) and FSL on Cloudflare R2
+#: (<hash>.r2.cloudflarestorage.com). The patterns live in url_guard --
+#: the policy module -- so the fetch guard and the echo filter apply
+#: exactly the same rule.
+MIRROR_HOST_PATTERNS = url_guard.MIRROR_HOST_PATTERNS
 
 #: Per-host path policy for mirrors. hubcloud.ist is a valid mirror host
 #: ONLY for the Telegram mirror -- the "/drive/admin" login link shares
 #: that host and must never be emitted.
-MIRROR_PATH_PREFIXES: Dict[str, tuple[str, ...]] = {
-    "hubcloud.ist": ("/tg/go",),
-    "pixel.hubcloud.ist": ("/",),
-    "gpdl.hubcloud.ist": ("/",),
-    "pixeldrain.dev": ("/u/",),
-    "pixeldrain.com": ("/u/",),
-    "fuckingfast.net": ("/",),
-}
+#:
+#: DERIVED from the guard's single policy table so the two cannot drift
+#: apart -- there used to be a near-duplicate of _HOST_PATH_PREFIXES
+#: here, and the two disagreed on the randomised families.
+MIRROR_PATH_PREFIXES: Dict[str, tuple[str, ...]] = dict(
+    url_guard.MIRROR_PATH_PREFIXES
+)
 
 #: Known ad / tracker hosts seen on the generator page. They are not in
 #: MIRROR_HOSTS anyway; this list is a second, explicit barrier.
@@ -125,6 +135,10 @@ HOST_LABELS: Dict[str, str] = {
     "pixeldrain.com": "pixeldrain",
     "fuckingfast.net": "buzz",
     "hubcloud.ist": "telegram",
+    # ZipDisk: a Cloudflare Workers deployment OR a public GCS bucket.
+    "storage.googleapis.com": "zipdisk",
+    "zipdisk": "zipdisk",
+    "fsl": "fsl",
 }
 
 #: The constant dead pixeldrain href the generator page always ships.
@@ -185,7 +199,13 @@ _A_STOP_RE = re.compile(r"</a\b|<a\b", re.IGNORECASE)
 _HREF_RE = re.compile(r"(?<![\w-])href=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _CLASS_RE = re.compile(r"(?<![\w-])class=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _ID_RE = re.compile(r"(?<![\w-])id=[\"']([^\"']+)[\"']", re.IGNORECASE)
-_TAG_RE = re.compile(r"<[^>]+>")
+#: Strip a tag from the anchor's inner text. The length is BOUNDED on
+#: purpose: the unbounded "<[^>]+>" rescans forward from every "<", so a
+#: body of N bare "<" costs O(N^2) (80 000 of them -> 10 s). A bound of
+#: 500 is far above any real tag and makes the scan linear. A tag longer
+#: than that is left in the text, which is harmless -- the renderer
+#: HTML-escapes everything anyway.
+_TAG_RE = re.compile(r"<[^>]{0,500}>")
 #: `var pxl = "https://pixeldrain.dev/u/xxxx";` and friends.
 _PXL_VAR_RE = re.compile(
     r"\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*[\"'](https?://[^\"']+)[\"']", re.IGNORECASE
@@ -203,12 +223,25 @@ _SIZE_RE = re.compile(r"File\s*Size\s*<i[^>]*>([^<]{1,40})</i>", re.IGNORECASE)
 _FILE_TYPE_RE = re.compile(r"File\s*Type\s*<i[^>]*>([^<]{1,60})</i>", re.IGNORECASE)
 _SHARE_DATE_RE = re.compile(r"Share\s*Date\s*<i[^>]*>([^<]{1,60})</i>", re.IGNORECASE)
 _CODE_RE = re.compile(r"[?&]id=([A-Za-z0-9_\-]+)")
-_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+#: HTML comments are stripped by _strip_comments() below, not by a regex.
+#: The obvious "<!--.*?-->" is quadratic: at every "<!--" it rescans
+#: forward for the closing "-->", so a body of N unterminated comments
+#: costs O(N^2) (8 000 of them -> 3 s). The parse runs in a worker
+#: thread, but a thread cannot be cancelled by asyncio.wait_for, so the
+#: fetch budget would NOT have protected the bot.
 _CHALLENGE_MARKS = ("just a moment", "checking your browser", "cf-mitigated")
 
 #: Hard cap on the attribute text of one anchor. A malformed page must
 #: not be able to make the scan expensive.
-_MAX_ATTR_LEN = 500
+#:
+#: The scan itself is LINEAR (see _iter_anchors), so this cap no longer
+#: bounds the scan cost -- it only stops a pathological attribute blob
+#: from being handed to the parsers. It must therefore be large enough
+#: for a REAL href: the FSL mirror is a Cloudflare R2 presigned URL
+#: carrying an AWS SigV4 query string plus a response-content-disposition
+#: filename, which runs to ~640 characters. At the old 500 cap that
+#: anchor was silently skipped and the mirror was lost.
+_MAX_ATTR_LEN = 4096
 
 
 # --- dataclasses ------------------------------------------------------------
@@ -251,9 +284,37 @@ def _text(raw: str) -> str:
     return re.sub(r"\s+", " ", _TAG_RE.sub(" ", raw or "")).strip()
 
 
+def _strip_comments(html: str) -> str:
+    """Remove HTML comments -- LINEAR for any input.
+
+    str.find scans in C and the cursor only ever moves forward, so the
+    whole body is walked once. A comment of ANY length is handled
+    correctly (an unterminated one drops the rest of the body).
+    """
+    if not html or "<!--" not in html:
+        return html or ""
+    out: List[str] = []
+    i = 0
+    while True:
+        j = html.find("<!--", i)
+        if j < 0:
+            out.append(html[i:])
+            break
+        out.append(html[i:j])
+        k = html.find("-->", j + 4)
+        if k < 0:
+            # unterminated comment -- drop the remainder
+            break
+        i = k + 3
+    return " ".join(out)
+
+
 def _host(url: str) -> str:
     try:
-        return (urlsplit(url or "").hostname or "").lower()
+        # rstrip the trailing dot so it matches the guard, which
+        # normalises the same way. Without this a FQDN with a trailing
+        # dot passes the guard and is then dropped by the extractor.
+        return (urlsplit(url or "").hostname or "").lower().rstrip(".")
     except Exception:
         return ""
 
@@ -288,9 +349,25 @@ def _is_pixeldrain(host: str) -> bool:
 
 
 def _mirror_base(host: str) -> Optional[str]:
-    """The MIRROR_HOSTS entry covering `host` (exact match or real subdomain)."""
+    """The MIRROR_HOSTS entry covering `host` (exact match or real subdomain).
+
+    Mirror families whose subdomain is randomised per deployment (ZipDisk on
+    Cloudflare Workers, FSL on Cloudflare R2) are matched by PATTERN and
+    return their pattern id ("zipdisk" / "fsl") instead of a hostname.
+
+    A family pattern wins over a concrete hostname: the family's path
+    policy is the one that describes the mirror shape. Otherwise adding a
+    ZipDisk host to MIRROR_HOSTS would shadow the pattern and silently
+    drop every mirror on it.
+    """
     if not host:
         return None
+    for rx, pid in MIRROR_HOST_PATTERNS:
+        try:
+            if rx.match(host):
+                return pid
+        except Exception:
+            continue
     for base in MIRROR_HOSTS:
         if host == base:
             return base
@@ -410,6 +487,10 @@ def label_for(host: str, anchor_text: str = "") -> str:
         return "buzz"
     if "telegram" in low:
         return "telegram"
+    if "zipdisk" in low:
+        return "zipdisk"
+    if "fsl server" in low:
+        return "fsl"
     if low.startswith("download"):
         t = t[len("download"):].strip(" :[]")
     return (t or base or "mirror")[:40]
@@ -427,7 +508,7 @@ def extract_generator_url(html: str) -> Optional[str]:
     """
     if not html:
         return None
-    body = _COMMENT_RE.sub(" ", html)
+    body = _strip_comments(html)
     m = _GEN_URL_RE.search(body)
     if m:
         return _unescape(m.group(1).strip())
@@ -483,7 +564,7 @@ def extract_mirrors(html: str) -> List[HubMirror]:
         return out
     # Commented-out ad blocks contain unbalanced anchors -- drop them so
     # the anchor scan cannot be thrown off.
-    body = _COMMENT_RE.sub(" ", html)
+    body = _strip_comments(html)
     pxl_vars = _pxl_urls(body)
     pxl_bind = _pxl_bindings(body)
     default_pxl = ""
@@ -689,12 +770,14 @@ async def _fetch_hub_page(url: str, timeout: float) -> MirrorResult:
                     continue
                 try:
                     # Second, independent barrier: the mirror allowlist
-                    # with the host's own path policy.
+                    # with the host's own path policy. check_mirror_url
+                    # keeps the exact-host list, the randomised-family
+                    # patterns and the path policy together -- passing
+                    # them by hand is easy to get wrong, and forgetting
+                    # the patterns silently drops every ZipDisk/FSL
+                    # mirror.
                     await asyncio.to_thread(
-                        url_guard.check_url,
-                        m.url,
-                        allowed_hosts=MIRROR_HOSTS,
-                        allowed_path_prefixes=prefixes,
+                        url_guard.check_mirror_url, m.url
                     )
                 except Exception:
                     continue

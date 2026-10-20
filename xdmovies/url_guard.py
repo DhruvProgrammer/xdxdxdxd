@@ -124,6 +124,43 @@ MIRROR_HOSTS: tuple[str, ...] = (
     "pixeldrain.com",
     "fuckingfast.net",
     "gamerxyt.com",
+    # ZipDisk also serves some files from a public Google Cloud Storage
+    # bucket. Exact host -- Google controls the whole domain.
+    "storage.googleapis.com",
+)
+
+#: Host PATTERNS for mirror families whose subdomain is randomised per
+#: deployment, so no single hostname can ever be allowlisted. Each entry
+#: is (compiled regex, pattern id).
+#:
+#: ZipDisk is served from Cloudflare Workers subdomains whose middle label
+#: changes per deployment (ddl2.<random>.workers.dev). A bare
+#: "workers.dev" suffix match would admit EVERY worker on the platform,
+#: so the pattern pins the first label to "ddl2" as well.
+#:
+#: FSL is served from Cloudflare R2 public buckets
+#: (<account-hash>.r2.cloudflarestorage.com). The label is the Cloudflare
+#: ACCOUNT id -- the bucket name ("hub") is in the path.
+#:
+#: HONEST SCOPE: r2.cloudflarestorage.com is a wildcard DNS zone, so
+#: requiring hex does NOT pin the host to the FSL vendor -- any 16-64
+#: hex label resolves there. What the hex requirement buys is that a
+#: label must LOOK like a Cloudflare account id, so a typo or an ad
+#: host cannot match by accident. The real bound on this whole family
+#: is the same as for the pre-existing pixeldrain / fuckingfast
+#: entries: the bot only ever LINKS to a mirror and never fetches one,
+#: so the worst case is "the bot prints a link to someone else's file",
+#: not SSRF. The fetch-side protections (scheme, port, private-IP,
+#: solve-server) all still apply to the hub pages themselves.
+MIRROR_HOST_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    (
+        re.compile(r"^ddl2\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})\.workers\.dev$"),
+        "zipdisk",
+    ),
+    (
+        re.compile(r"^[0-9a-f]{16,64}\.r2\.cloudflarestorage\.com$"),
+        "fsl",
+    ),
 )
 
 #: Accepted path shapes. A path must start with one of these AND keep a
@@ -146,6 +183,20 @@ _HOST_PATH_PREFIXES: dict[str, tuple[str, ...]] = {
     "pixeldrain.com": ("/u/",),
     "fuckingfast.net": ("/",),
     "gamerxyt.com": ("/hubcloud.php",),
+    "storage.googleapis.com": ("/",),
+    # Pattern ids (see MIRROR_HOST_PATTERNS). ZipDisk and FSL carry their
+    # payload in a random path, so any path on those hosts is a mirror.
+    "zipdisk": ("/",),
+    "fsl": ("/",),
+}
+
+#: The mirror path policy, keyed by allowlist base (or by pattern id for
+#: the randomised families). Exposed so the mirror extractor and this
+#: guard cannot drift apart -- there used to be a near-duplicate table
+#: in the extractor.
+MIRROR_PATH_PREFIXES: Dict[str, tuple[str, ...]] = {
+    k: v for k, v in _HOST_PATH_PREFIXES.items()
+    if k in MIRROR_HOSTS or k in {"zipdisk", "fsl"}
 }
 
 #: Hosts that may serve the hub page's own static assets (CSS / JS /
@@ -236,6 +287,28 @@ def _pick_base(host: str, hosts: Sequence[str]) -> Optional[str]:
         if _host_matches(host, b) and (longest is None or len(b) > len(longest)):
             longest = b
     return exact or longest
+
+
+def _pick_pattern(
+    host: str,
+    patterns: Sequence[tuple["re.Pattern[str]", str]],
+) -> Optional[str]:
+    """The pattern id covering `host`, or None.
+
+    Used for mirror families whose subdomain is randomised per deployment
+    (ZipDisk on Cloudflare Workers, FSL on Cloudflare R2) -- no single
+    hostname can be allowlisted for those, so they are matched by pattern.
+    """
+    h = (host or "").lower().rstrip(".")
+    if not h:
+        return None
+    for rx, pid in patterns or ():
+        try:
+            if rx.match(h):
+                return pid
+        except Exception:
+            continue
+    return None
 
 
 def _resource(parts) -> str:
@@ -387,6 +460,7 @@ def check_url(
     *,
     allowed_hosts: Optional[Sequence[str]] = None,
     allowed_path_prefixes: Optional[Sequence[str]] = None,
+    allowed_host_patterns: Optional[Sequence[tuple["re.Pattern[str]", str]]] = None,
 ) -> str:
     """Validate `url` and return its normalized form.
 
@@ -435,6 +509,13 @@ def check_url(
     hosts = tuple(allowed_hosts) if allowed_hosts is not None else HUB_PAGE_HOSTS
     # 5. host allowlist
     base = _pick_base(host, hosts)
+    pid = _pick_pattern(host, allowed_host_patterns or ())
+    if pid is not None and (base is None or base not in _HOST_PATH_PREFIXES):
+        # A family pattern wins over a concrete hostname that has no path
+        # policy of its own. Otherwise adding a ZipDisk/FSL host to the
+        # hostname list would shadow the family's path policy and
+        # silently drop every mirror on it.
+        base = pid
     if base is None:
         raise ValueError(f"host not allowed: {host}")
     # 6. path shape
@@ -463,6 +544,7 @@ def is_safe_url(
     *,
     allowed_hosts: Optional[Sequence[str]] = None,
     allowed_path_prefixes: Optional[Sequence[str]] = None,
+    allowed_host_patterns: Optional[Sequence[tuple["re.Pattern[str]", str]]] = None,
 ) -> bool:
     """Boolean flavour of check_url. Never raises.
 
@@ -477,10 +559,44 @@ def is_safe_url(
             url,
             allowed_hosts=allowed_hosts,
             allowed_path_prefixes=allowed_path_prefixes,
+            allowed_host_patterns=allowed_host_patterns,
         )
         return True
     except Exception:
         return False
+
+
+def check_mirror_url(url: str) -> str:
+    """Validate a URL that is about to be EMITTED as a mirror link.
+
+    The mirror policy has two halves: the exact-host allowlist
+    (:data:`MIRROR_HOSTS`) and the family patterns
+    (:data:`MIRROR_HOST_PATTERNS`) for hosts whose subdomain is
+    randomised per deployment (ZipDisk on Cloudflare Workers, FSL on
+    Cloudflare R2). A caller that drives :func:`check_url` directly has
+    to remember to pass BOTH -- forgetting the patterns silently drops
+    every ZipDisk/FSL mirror -- so this helper keeps them together and
+    applies the matching per-host path policy.
+
+    Raises ValueError with a specific reason, exactly like
+    :func:`check_url`.
+
+    THREADING
+    ---------
+    SYNCHRONOUS and DNS-bound, like check_url. Inside an async function
+    use ``await asyncio.to_thread(check_mirror_url, url)``.
+    """
+    host = host_of(url)
+    base = _pick_base(host, MIRROR_HOSTS)
+    if base is None or base not in _HOST_PATH_PREFIXES:
+        base = _pick_pattern(host, MIRROR_HOST_PATTERNS) or base
+    prefixes = _HOST_PATH_PREFIXES.get(base or "", ("/",))
+    return check_url(
+        url,
+        allowed_hosts=MIRROR_HOSTS,
+        allowed_path_prefixes=prefixes,
+        allowed_host_patterns=MIRROR_HOST_PATTERNS,
+    )
 
 
 def is_hub_page_url(url: str) -> bool:
@@ -557,7 +673,10 @@ def is_echo_safe_url(url: str) -> bool:
         return False
     if port is not None and port not in _ALLOWED_PORTS:
         return False
-    if _pick_base(host, MIRROR_HOSTS) is None:
+    if (
+        _pick_base(host, MIRROR_HOSTS) is None
+        and _pick_pattern(host, MIRROR_HOST_PATTERNS) is None
+    ):
         return False
     if _is_solve_path(parts.path or ""):
         return False
