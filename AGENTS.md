@@ -24,7 +24,7 @@ There is **no test framework, no linter, no typecheck**. Verification is a
 two-step combo: offline import smoke test, then live Telegram.
 
 ```bash
-# 1. Offline smoke test (imports 5 modules + loads .env)
+# 1. Offline smoke test (imports 8 modules + loads .env)
 python -m xdmovies --check
 # or via the forwarder:
 python run.py --check
@@ -34,7 +34,8 @@ python -m xdmovies
 # VPS uses systemd: sudo systemctl start xdmovies-bot
 ```
 
-`--check` imports `bot_config, extractor, cookie_store, pipeline, bot` and
+`--check` imports `bot_config, extractor, cookie_store, pipeline,
+channel_post, usage, shutdown_store, bot` and
 prints cookie store status. It does **not** verify CloakBrowser can launch
 — the real test is the next solve in Telegram.
 
@@ -171,6 +172,30 @@ Keep-alive must hit a deep link, not home. The flow:
   `final_wait=20.0`, `ad_impression_wait=1.5`. Imports
   `is_chromium_family` + `stealth_plugin` from `browser_stealth.py`
   for the gate-page anti-ad init script (call site: `_gate_via_manual`).
+- `xdmovies/hub_mirrors.py` — expands a HubCloud page into its DDL
+  mirror links (10Gbps / buzz / pixeldrain / zipdisk / fsl / telegram)
+  over plain HTTPS: TWO GETs per file, no browser, no solve server.
+  Step 1 scrapes the opaque `gamerxyt.com` generator URL (with its
+  per-file `token`) out of the drive page; step 2 scrapes the mirror
+  anchors out of the generator page. The generator randomises its
+  mirror set per request, so the page is fetched EXACTLY ONCE.
+  TRAP: the pixeldrain anchor's `href` is a constant dead decoy
+  (`/u/negn6f`); the real URL is only in the inline `var pxl` script.
+- `xdmovies/url_guard.py` — the SSRF guard for the DDL/mirror path.
+  Scheme allowlist, exact/subdomain host
+  match (never a substring), path-prefix policy, DNS resolution with a
+  reject on private/loopback/link-local/CGNAT addresses, a
+  non-default-port check, and self-protection against the bot's own
+  solve server. `is_hub_page_url` is the cheap structural check
+  (no DNS) used to pick hub pages out of a message; `check_url` is the
+  full guard, applied before every request on the DDL path. The
+  CF-bypass browser pipeline does NOT use it.
+- `xdmovies/card_dump.py` — parses a forwarded result block (the bot's
+  own output pasted back) and re-renders it with mirror lines appended.
+  Card-aware chunking: a card is never split across Telegram messages
+  (unless a single card alone exceeds the message budget, where it is
+  split at line granularity) and a URL is never cut in half (unless that
+  one line alone exceeds the budget).
 - `xdmovies/browser_stealth.py` — gate-page stealth + init script.
   `playwright_stealth.Stealth()` plugin + `is_chromium_family()` helper.
   Used by `link_exec.py` only. Browser launch itself is in

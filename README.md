@@ -36,6 +36,7 @@ the whole catalog**.
 5. [Commands](#5-commands)
    - [/start](#start)
    - [/search](#search)
+   - [/ddl](#ddl)
    - [/status](#status)
    - [/usage](#usage)
    - [/queue](#queue)
@@ -89,6 +90,10 @@ or a series URL:
 ```
 https://huh.xdmovies.wtf/series/mirzapur-1080p-720p-hindi-download-789012
 ```
+
+You can also paste a **HubCloud page link** you already have
+(`https://hubcloud.ist/drive/<code>`) and the bot expands it into the
+real direct-download mirrors — see [`/ddl`](#ddl).
 
 You get back a result card like:
 
@@ -245,6 +250,67 @@ mirzapur
 kalki 2898 ad
 panchayat season 4
 ```
+
+### /ddl
+
+| | |
+|---|---|
+| Who | all |
+| Usage | `/ddl https://hubcloud.ist/drive/<code>` |
+| Does | Expands a HubCloud page into its real DDL mirror links |
+
+The normal pipeline stops at the HubCloud page — that page is the
+working link, but the direct mirrors behind it are one click away.
+This command opens that page (plain HTTPS, **no browser, no
+Cloudflare bypass, no solve server**) and lists the mirrors underneath
+the card:
+
+```
+/ddl https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+  <b>1) Girls.Will.Be.Girls.2024.720p...H.265-XDMovies.com.mkv</b>
+  Size: 853.87 MB
+  → https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+  →10Gbps: https://pixel.hubcloud.ist/?id=...
+  →buzz: https://fuckingfast.net/...
+  →telegram: https://hubcloud.ist/tg/go?id=...
+```
+
+You can also skip the command and **just paste the link** — the bot
+expands a bare HubCloud URL on its own, and expands a whole forwarded
+result block (numbered cards) the same way:
+
+```
+(you) https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+(bot) 🔄 Fetching DDL mirrors...
+      <b>1) Girls.Will.Be.Girls.2024.720p...mkv</b>
+      Size: 853.87 MB
+      → https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+      →10Gbps: https://pixel.hubcloud.ist/?id=...
+      →buzz: https://fuckingfast.net/...
+      ⏱ <b>total_time_for_all:</b> 0m 3s
+      [OK] 1/1 hub pages  [FAIL] 0 failed  [cancelled] 0  [skipped] 0
+```
+
+- **Title and size come from the HubCloud page itself** — for a pasted
+  link or `/ddl` there are no `Audio:` / `TMDB:` rows to keep, and the
+  bot does not invent them. A forwarded block keeps its own rows
+  (title, size, `Audio:`, `TMDB:`).
+- **Mirror families:** `10Gbps` (HubCloud's own 10Gbps servers), `buzz`
+  (fuckingfast.net), `pixeldrain`, `zipdisk` (Google Cloud Storage /
+  Cloudflare Workers), `fsl` (Cloudflare R2) and `telegram`. The set is
+  chosen by the HubCloud page per file — a `.mkv` page typically
+  returns several families at once (10Gbps, buzz, telegram, zipdisk,
+  fsl), while a `.zip` page usually returns a single family — and the
+  same file can return a different subset on each request.
+- **Caps:** 25 hub pages per message, 12 mirrors per page, 12s per
+  page, 180s for the whole job. The excess is reported, never dropped
+  silently.
+- **Never touches the solve server** — a HubCloud page behind a
+  Cloudflare challenge is reported inline as `[FAIL] CF challenge on
+  <host>`, and the VPS IP is never printed.
+- A dead or expired link reports `[FAIL] file not found (404 ! File
+  Not Found)` on that card; in a multi-card expansion the other cards
+  still resolve.
 
 ### /status
 
@@ -513,6 +579,15 @@ from SSH instead, remove `xdmovies_state/shutdown.json` (or run
   no silent fallback to vanilla Playwright) + stored `cf_clearance` +
   auto-nudge (max 3 dispatched clicks, 10s verify gaps, detached-frame guard)
   + full gate auto-drive + VPS token solve-server + 25-min keep-alive.
+- **DDL mirror expansion.** A HubCloud page can be opened and expanded
+  into its real direct-download mirrors (`10Gbps`, `buzz`, `pixeldrain`,
+  `zipdisk`, `fsl`, `telegram`) — by pasting the link, by forwarding a
+  whole result block, or with `/ddl`. Two plain HTTPS GETs per file: no
+  browser, no Cloudflare bypass (a challenge is reported inline, never
+  solved), no solve server, no VPS IP in the output. Every URL the
+  **DDL path** fetches or re-publishes passes an SSRF guard (scheme,
+  exact host, DNS-resolved private/loopback/link-local rejection,
+  solve-server self-protection).
 - **DM-only operations.** Solve links (which expose the VPS IP), wait pills,
   timeouts, FAILs and tracebacks always go to the requester's DM — the public
   channel only ever sees clean result batches. Solve messages self-delete.
@@ -530,7 +605,7 @@ from SSH instead, remove `xdmovies_state/shutdown.json` (or run
 - **Debug dumps.** When a movie page yields no cards, the HTML is saved to
   `xdmovies/xdmovies_dumps/latest_movie_page.html` for inspection.
 - **No test framework tax.** Verification is `python -m xdmovies --check`
-  (imports 6 modules + loads `.env`) plus `python -m compileall xdmovies`.
+  (imports 8 modules + loads `.env`) plus `python -m compileall xdmovies`.
 
 ---
 
@@ -594,6 +669,25 @@ Short-circuit path: cards already on hub hosts resolve with no browser at all.
 (bot) (message deleted) → ⏳ resuming → final hub link delivered
 ```
 
+### G. "I already have the HubCloud links — I want the direct downloads"
+
+```
+(you) https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+(bot) 🔄 Fetching DDL mirrors...
+      <b>1) Girls.Will.Be.Girls.2024.720p...mkv</b>
+      Size: 853.87 MB
+      → https://hubcloud.ist/drive/imv2ibxqt9bjx6o
+      →10Gbps: https://pixel.hubcloud.ist/?id=...
+      →buzz: https://fuckingfast.net/...
+      →telegram: https://hubcloud.ist/tg/go?id=...
+      ⏱ <b>total_time_for_all:</b> 0m 3s
+      [OK] 1/1 hub pages  [FAIL] 0 failed  [cancelled] 0  [skipped] 0
+```
+
+Paste the link, or forward the whole result block to expand every card
+at once. No browser, no Cloudflare bypass — the HubCloud page is read
+over plain HTTPS in two requests. See [`/ddl`](#ddl).
+
 ---
 
 ## 8. Setup & deploy
@@ -605,7 +699,7 @@ git clone <this repo>
 cd xdmovies_bot_repo
 python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r xdmovies/requirements.txt
-python -m xdmovies --check      # imports 6 modules + loads .env
+python -m xdmovies --check      # imports 8 modules + loads .env
 python -m compileall xdmovies   # syntax sweep (no test framework exists)
 python -m xdmovies --test <movie-url>  # one-shot resolve, no Telegram
 ```
@@ -662,6 +756,7 @@ from every log line.
 | `XDMOVIES_BOT_LOG` | – | normal log path, default `xdmovies_bot.log` |
 | `XDMOVIES_BOT_ERROR_LOG` | – | errors-only log, default `xdmovies_bot_errors.log` |
 | `XDMOVIES_MAX_SESSIONS` | – | browser session cap, default `8` |
+| `XDMOVIES_SEARCH_BASE` | – | search API base, default `https://huh.xdmovies.wtf` (the catalog scraper hardcodes the host) |
 | `XDMOVIES_INNER_NUDGE` | – | `=0` disables the gate-page Turnstile nudge (default on) |
 | `XDMOVIES_TXT_MAX_LINES` | – | `.txt` batch cap, default `10000` |
 | `XDMOVIES_ENABLE_VNC` | – | deploy-time only: adds XFCE + x11vnc + noVNC (`:6080`) |
@@ -715,6 +810,9 @@ xdmovies_bot_repo/
 │   ├── pipeline.py                # movie-page fetch + auto-nudge
 │   ├── link_follower.py           # redirect follower, dual-domain cookies
 │   ├── link_exec.py               # gate auto-drive + destination matcher
+│   ├── hub_mirrors.py             # HubCloud page → DDL mirror links (plain HTTPS, no browser)
+│   ├── url_guard.py               # SSRF guard for the DDL/mirror path
+│   ├── card_dump.py               # forwarded card-block parser + mirror-aware renderer
 │   ├── solve_server.py            # token solve-server :8080 (manual fallback)
 │   ├── keep_alive.py              # 25m silent refresh + escalation
 │   ├── eternal_bypass.py          # operator-only single-shot manual helper
@@ -746,4 +844,6 @@ covers traffic ~1000× over). The bot never downloads movie files — only
 links; GB-sized downloads happen on your own device. Per gate solve ≈
 5–15MB VPS-side (page + ad assets + screenshot stream); keep-alive ≈
 ~115MB/day worst case; autodetect adds one catalog page load per 30 min
-(negligible next to keep-alive).
+(negligible next to keep-alive). A DDL mirror expansion is two small
+HTTPS pages per file (≈40 KB) — one of the cheapest operations the bot
+does, against MB-scale gate solves.
