@@ -1884,4 +1884,8 @@ async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
             # already-dead link to find "Invalid or expired".
             await asyncio.sleep(25)
             await destroy_session(token)
+        else:
+            # Audit finding: Destroy browser immediately on timeout to prevent
+            # leaking headed Chromium processes on VPS when owner is offline
+            await destroy_session(token)
     return solved

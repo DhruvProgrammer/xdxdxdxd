@@ -48,6 +48,7 @@ def _load() -> Dict:
         "feed": "all",
         "card_filter": "all",
         "seen_urls": [],
+        "attempts": {},
         "last_check_ts": 0,
         "updated_at": 0,
     }
@@ -66,11 +67,15 @@ def _load() -> Dict:
         seen = data.get("seen_urls")
         if not isinstance(seen, list):
             seen = []
+        attempts = data.get("attempts")
+        if not isinstance(attempts, dict):
+            attempts = {}
         return {
             "enabled": bool(data.get("enabled", False)),
             "feed": feed,
             "card_filter": cf,
             "seen_urls": [u for u in seen if isinstance(u, str)],
+            "attempts": attempts,
             "last_check_ts": _safe_float(data.get("last_check_ts")),
             "updated_at": _safe_float(data.get("updated_at")),
         }
@@ -98,6 +103,7 @@ def _save(state: Dict) -> None:
                 if state.get("card_filter") in _VALID_CONTENT else "all"
             ),
             "seen_urls": list(state.get("seen_urls", []))[-_SEEN_CAP:],
+            "attempts": dict(state.get("attempts", {})) if isinstance(state.get("attempts"), dict) else {},
             "last_check_ts": _safe_float(state.get("last_check_ts")),
             "updated_at": time.time(),
         }
@@ -190,9 +196,30 @@ def add_seen(urls: List[str]) -> None:
             if isinstance(u, str) and u and u not in cur:
                 cur.append(u)
         st["seen_urls"] = cur[-_SEEN_CAP:]
+        # Clear attempt count when marked seen
+        attempts = st.get("attempts", {})
+        for u in urls:
+            attempts.pop(u, None)
+        st["attempts"] = attempts
         _save(st)
     except Exception:
         pass
+
+
+def record_attempt(url: str) -> int:
+    """Record an execution attempt for an autodetect URL. Returns attempt count."""
+    try:
+        st = _load()
+        attempts = st.get("attempts", {})
+        count = int(attempts.get(url, 0)) + 1
+        attempts[url] = count
+        if len(attempts) > _SEEN_CAP:
+            attempts = dict(list(attempts.items())[-(_SEEN_CAP // 2):])
+        st["attempts"] = attempts
+        _save(st)
+        return count
+    except Exception:
+        return 1
 
 
 def touch_check(new_count: int = 0) -> None:

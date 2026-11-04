@@ -286,7 +286,7 @@ async def _silent_refresh_once(target_url: str) -> Tuple[bool, str]:
         from xdmovies.pipeline import _is_cf_challenge_page
     except Exception as e:
         return False, f"import_fail:{e}"
-    cookies = get_cookies_for_url(target_url)
+    cookies = get_cookies_for_url(target_url, allow_expired=True)
     if not cookies:
         return False, "no_cookie_stored"
     ua = get_user_agent_for_url(target_url)
@@ -335,6 +335,13 @@ async def _silent_refresh_once(target_url: str) -> Tuple[bool, str]:
             await asyncio.sleep(1.0)
             is_chal = await _is_cf_challenge_page(page)
             if not is_chal:
+                title = ""
+                try:
+                    title = (await page.title() or "").lower()
+                except Exception:
+                    pass
+                if any(err in title for err in ("error", "520", "521", "502", "503", "1020", "access denied", "blocked")):
+                    return False, f"server_error_page:{title}"
                 # warm success - no challenge, cookie still valid, no need to save
                 logger.info(f"[keep_alive] silent hit ok (no challenge) {target_url[:70]}")
                 return True, "still_valid"
@@ -375,6 +382,7 @@ async def _loop(bot_app) -> None:
     await asyncio.sleep(20)
     consecutive_need_human = 0
     last_notify_ts = 0.0
+    last_notify_msg_id: Optional[int] = None
     while True:
         try:
             if _stop_event and _stop_event.is_set():
@@ -402,8 +410,21 @@ async def _loop(bot_app) -> None:
             if ok:
                 logger.info(f"[keep_alive] refresh success: {reason}")
                 _touch_keep_alive("xdmovies.wtf")
+                try:
+                    from xdmovies.cookie_store import touch_domain
+                    touch_domain("xdmovies.wtf")
+                except Exception as _e:
+                    logger.warning(f"[keep_alive] touch_domain failed: {_e}")
                 consecutive_need_human = 0
-                # also touch cookie_store updated_at? no, just keep_alive state
+                if last_notify_msg_id:
+                    try:
+                        from xdmovies.bot_config import load_config
+                        cfg = load_config()
+                        if bot_app and hasattr(bot_app, "bot") and bot_app.bot:
+                            await bot_app.bot.delete_message(chat_id=cfg.owner_id, message_id=last_notify_msg_id)
+                    except Exception:
+                        pass
+                    last_notify_msg_id = None
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             else:
@@ -418,12 +439,18 @@ async def _loop(bot_app) -> None:
                             from xdmovies.bot_config import load_config
                             cfg = load_config()
                             owner = cfg.owner_id
+                            if last_notify_msg_id and bot_app and hasattr(bot_app, "bot") and bot_app.bot:
+                                try:
+                                    await bot_app.bot.delete_message(chat_id=owner, message_id=last_notify_msg_id)
+                                except Exception:
+                                    pass
+                                last_notify_msg_id = None
                             # create token for the target
                             token = await create_session(target, user_id=owner, host="xdmovies.wtf", chat_id=owner)
                             url = get_public_url(token)
                             # send via bot
                             if bot_app and hasattr(bot_app, "bot") and bot_app.bot:
-                                await bot_app.bot.send_message(
+                                sent_msg = await bot_app.bot.send_message(
                                     chat_id=owner,
                                     text=(f"🔄 <b>Keep-alive needs human</b> — <code>xdmovies.wtf</code> challenge escalated.\n"
                                           f"Post: <code>{target}</code>\n"
@@ -431,6 +458,7 @@ async def _loop(bot_app) -> None:
                                           f"After solve, loop resumes unlimited."),
                                     parse_mode="HTML"
                                 )
+                                last_notify_msg_id = getattr(sent_msg, "message_id", None)
                                 last_notify_ts = now
                                 logger.info(f"[keep_alive] notified owner with VPS link {url[:60]}")
                         except Exception as e:
