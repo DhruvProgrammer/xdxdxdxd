@@ -311,6 +311,18 @@ async def _fetch_html_with_cookie_browser(url: str, timeout_ms: int = 35000) -> 
         except Exception:
             pass
         await asyncio.sleep(0.8)
+        _nav_ok = None
+        try:
+            from xdmovies.link_exec import _is_navigable_url as _nav_ok
+        except Exception:
+            pass
+        if _nav_ok is not None and not _nav_ok(page.url or ""):
+            # Navigation died (browser error page): the extractor would
+            # see garbage HTML and report the wrong diagnosis ("slug may
+            # be invalid"). Fail with the real reason instead.
+            raise RuntimeError(
+                f"movie page did not load (browser error page): {url[:80]}"
+            )
         is_chal = await _is_cf_challenge_page(page)
         html = await page.content()
         if is_chal:

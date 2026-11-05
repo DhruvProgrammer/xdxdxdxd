@@ -26,15 +26,29 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 from xdmovies.cookie_store import CFChallengeError, get_cookies_for_url, get_user_agent_for_url, _normalize_domain
+from xdmovies.link_exec import _is_navigable_url
 
 
 # Audit finding L6: removed the sync `follow_download_link` (httpx
 # variant). It was a leftover from the pre-CloakBrowser era and had
 # no live callers. The async `follow_download_link_in_browser_async`
 # below is the only path used by the bot.
+
+
+class FollowFailedError(Exception):
+    """The follow hop did not land on a real page.
+
+    A failed navigation leaves ``page.url`` at a browser-internal
+    pseudo-URL (``chrome-error://chromewebdata/`` or ``about:blank``).
+    The old code swallowed the goto exception and returned that junk URL
+    as a success, so the button flow then raised
+    ``Page.goto: net::ERR_ABORTED at chrome-error://chromewebdata/``
+    two stages later. This error surfaces the failure at the point it
+    actually happened, with a message shaped for the Telegram card.
+    """
 
 
 async def follow_download_link_in_browser_async(
@@ -91,16 +105,31 @@ async def follow_download_link_in_browser_async(
             await page.route(re.compile(r"\.(png|jpe?g|css|woff2?|gif|svg|ico)$"), lambda r: r.abort())
         except Exception:
             pass
+        goto_exc: Optional[Exception] = None
         try:
             resp = await page.goto(download_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        except Exception:
+        except Exception as exc:
             resp = None
+            goto_exc = exc
         try:
             await page.wait_for_load_state("load", timeout=4000)
         except Exception:
             pass
         await asyncio.sleep(0.6)
         final_url = page.url
+        # A failed navigation leaves page.url at chrome-error://
+        # chromewebdata/ (or about:blank). Raise here -- at the point of
+        # failure -- instead of letting the junk URL flow into
+        # execute_button_flow, where it caused net::ERR_ABORTED.
+        # If goto raised but the page recovered to a real URL, we still
+        # proceed (strictly more permissive than the old behavior).
+        if not _is_navigable_url(final_url):
+            if goto_exc is not None:
+                print(f"[link_follower] goto failed: {goto_exc!r}")
+            raise FollowFailedError(
+                f"did not reach a real page for {download_url[:80]} "
+                "-- link may be expired"
+            )
         status = resp.status if resp else 0
         try:
             title = (await page.title()) or ""

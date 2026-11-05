@@ -570,6 +570,17 @@ async def _launch_for_session(sess: SolveSession):
     except Exception as e:
         sess.goto_error = f"goto failed for {e!r}"
         logger.warning(f"[solve_server] goto failed for {sess.url}: {e}")
+    _nav_ss = None
+    try:
+        from xdmovies.link_exec import _is_navigable_url as _nav_ss
+    except Exception:
+        pass
+    if is_gate and _nav_ss is not None and not _nav_ss(page.url or ""):
+        # Page never actually loaded (browser error page): driving
+        # Generate/Continue against it is pointless and the screenshot
+        # shown to the human solver would capture chrome-error junk.
+        logger.warning("[solve_server] gate page did not load -- skipping auto-drive")
+        is_gate = False
     # Gate auto-drive: if this is a latestnewsonline.sbs URL, drive
     # Generate -> Continue -> Turnstile container automatically. Clicks
     # are synthetic-first (proven live 2026-09-04: main.js handlers check

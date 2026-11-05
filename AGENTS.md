@@ -75,7 +75,13 @@ Keep-alive must hit a deep link, not home. The flow:
    hide the VPS IP).
 3. `link_follower.py` + `link_exec.py` — follow the redirect through
    `latestnewsonline.sbs` and drive the Generate→Continue→Turnstile→Go
-   gate to the final HubCloud / GDrive URL.
+   gate to the final HubCloud / GDrive URL. A follow that never lands
+   on a real page raises `FollowFailedError` ("[FAIL] follow failed:
+   ...  -- link may be expired"; never routed to the solve server), and
+   every stage must pass `_is_navigable_url` (`link_exec.py`) before
+   re-navigating or echoing `page.url` as a link — a failed navigation
+   leaves `page.url` at `chrome-error://chromewebdata/`, which raises
+   `net::ERR_ABORTED` if handed to `goto`.
 4. `keep_alive.py` — every 25m silently visits a remembered post URL
    with stored cookies; nudges the Turnstile frame at (18,32) on light
    challenges, escalates to a fresh VPS token + owner notification on

@@ -333,6 +333,16 @@ async def _silent_refresh_once(target_url: str) -> Tuple[bool, str]:
             except Exception:
                 pass
             await asyncio.sleep(1.0)
+            _nav_ok = None
+            try:
+                from xdmovies.link_exec import _is_navigable_url as _nav_ok
+            except Exception:
+                pass
+            if _nav_ok is not None and not _nav_ok(page.url or ""):
+                # Navigation died (browser error page): do NOT report the
+                # cookie as warm -- that would reset the refresh timer on
+                # a page we never actually loaded.
+                return False, "browser_error_page"
             is_chal = await _is_cf_challenge_page(page)
             if not is_chal:
                 title = ""

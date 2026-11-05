@@ -130,6 +130,59 @@ def _is_destination_url(url: str) -> bool:
     return any(x in h for x in DEST_HOST_HINTS)
 
 
+# Browser-error pseudo-URLs Chromium leaves on a page after a navigation
+# failure. Navigating any of them raises Playwright
+# `Page.goto: net::ERR_ABORTED` -- the exact signature seen when this
+# junk flowed link_follower -> bot -> _gate_via_manual.
+_JUNK_URL_PREFIXES = (
+    "chrome-error:",   # covers chrome-error://chromewebdata/ and variants
+    "about:",          # about:blank, about:srcdoc, ...
+    "chrome://",
+    "devtools://",
+    "view-source:",
+    "data:",
+    "blob:",
+)
+
+
+def _is_navigable_url(url) -> bool:
+    """True only for URLs Chromium can actually navigate to.
+
+    Requires an http(s) scheme plus a real host. False for empty/None,
+    browser-internal pseudo-URLs (chrome-error://chromewebdata/,
+    about:blank, ...) and non-http schemes (file:, ftp:, javascript:).
+    Case-insensitive (CHROME-ERROR:// rejected) and whitespace-tolerant.
+
+    Every stage of the 3-stage flow must check this before trusting
+    `page.url`: the follower, the bot caller and the gate drive all
+    previously forwarded error-page URLs as if they were real links.
+    """
+    try:
+        u = (url or "").strip()
+        if not u:
+            return False
+        low = u.lower()
+        for _p in _JUNK_URL_PREFIXES:
+            if low.startswith(_p):
+                return False
+        from urllib.parse import urlsplit
+        sp = urlsplit(u)
+        if (sp.scheme or "").lower() not in ("http", "https"):
+            return False
+        if not (sp.hostname or "").strip():
+            return False
+        return True
+    except Exception:
+        return False
+
+
+class InvalidGateURLError(ValueError):
+    """A gate URL that is not actually navigable (browser error page or
+    unsupported scheme). Raised BEFORE any browser launch so the cost is
+    ~0s; callers map it to a human-readable card error instead of the
+    raw Playwright ERR_ABORTED text."""
+
+
 async def fetch_hub_details(url: str, timeout: float = 12.0):
     """Cheap static read of a hub drive page (no browser).
 
@@ -496,8 +549,16 @@ async def _try_rebind_skip(page, ctx, short_link_url: str) -> bool:
         # 4. Jump straight to step 2.
         try:
             _cur = page.url or ""
+            # A mid-flight navigation failure leaves page.url at a browser
+            # error page (chrome-error://chromewebdata/) -- its netloc
+            # ("chromewebdata") would silently become the step-2 base and
+            # the goto below would raise ERR_ABORTED. Fall back to the
+            # validated short_link_url instead.
+            _cur = _cur if _is_navigable_url(_cur) else short_link_url
             _bp = urlparse(_cur or short_link_url)
             _base = f"{_bp.scheme or 'https'}://{_bp.netloc or GATE_HOST}"
+            if not _is_navigable_url(_base):
+                _base = f"https://{GATE_HOST}"
             _step2 = f"{_base}/r/{_req_code}?step=2&sid={_sid2}"
             await page.goto(_step2, wait_until="domcontentloaded", timeout=20000)
             print(f"[link_exec] rebind skip ok: jumped to step 2 (sid={_sid2[:8]}...)")
@@ -677,8 +738,16 @@ async def _try_snippet_widget_complete(page, ctx) -> Optional[str]:
         _tok2 = str(_j["token"])
         try:
             from urllib.parse import urlparse as _up2
-            _pu2 = _up2(page.url or "")
+            # Never inherit a junk netloc from page.url: a browser error
+            # page would produce chrome-error://chromewebdata/go/... which
+            # both fails to navigate AND carries the "/go/" substring the
+            # caller's filter accepts -- a junk URL delivered as a result.
+            _cur2u = page.url or ""
+            _cur2u = _cur2u if _is_navigable_url(_cur2u) else f"https://{GATE_HOST}/"
+            _pu2 = _up2(_cur2u)
             _base2 = f"{_pu2.scheme or 'https'}://{_pu2.netloc or GATE_HOST}"
+            if not _is_navigable_url(_base2):
+                _base2 = f"https://{GATE_HOST}"
             _go = f"{_base2}/go/{_sid}?t={_tok2}"
         except Exception:
             _go = f"https://{GATE_HOST}/go/{_sid}?t={_tok2}"
@@ -1449,7 +1518,23 @@ async def execute_button_flow(
     ad_impression_wait: float = 1.5,
 ) -> Optional[str]:
     """Manual cookie only -- bullet proof, no auto solver. Speed-tuned."""
-    return await _gate_via_manual(short_link_url, session_id, step1_wait, step2_wait, final_wait, ad_impression_wait)
+    # Entry guard: navigating a browser-error pseudo-URL
+    # (chrome-error://chromewebdata/ etc.) raises Playwright
+    # `net::ERR_ABORTED` after a wasted browser launch + 120s wait.
+    # Raise a typed error INSTEAD, at ~0s cost; the caller maps it to a
+    # human card error.
+    if not _is_navigable_url(short_link_url):
+        raise InvalidGateURLError(
+            "gate URL is not navigable (browser error page or unsupported "
+            "scheme) -- link may be expired"
+        )
+    dest = await _gate_via_manual(short_link_url, session_id, step1_wait, step2_wait, final_wait, ad_impression_wait)
+    # Backstop: never hand a junk destination (error page / blob / data
+    # URL) back to the caller as if it were a resolved link.
+    if dest and not _is_navigable_url(dest):
+        print(f"[link_exec] discarding non-navigable destination: {dest[:80]}")
+        return None
+    return dest
 
 
 def execute_button_flow_sync(short_link_url: str, headless: bool = False, ad_impression_wait: float = 5.0) -> Optional[str]:

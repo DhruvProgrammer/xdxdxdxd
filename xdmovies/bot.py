@@ -874,10 +874,15 @@ def _is_gate_url(url: str) -> bool:
     and per-card routing). Host-based, so ad lookalikes can never match.
     """
     try:
-        from xdmovies.link_exec import GATE_HOST as _gh
+        from xdmovies.link_exec import GATE_HOST as _gh, _is_navigable_url as _nav_ok
     except Exception:
         _gh = "latestnewsonline.sbs"
+        _nav_ok = None
     try:
+        if _nav_ok is not None and not _nav_ok(url):
+            # chrome-error://, about:blank, file://, ... can never be a
+            # gate page even when a host string parses out of them.
+            return False
         from urllib.parse import urlparse
         h = (urlparse(url or "").hostname or "").lower()
         return bool(h) and (h == _gh or h.endswith("." + _gh))
@@ -902,6 +907,50 @@ def _is_download_url(url: str) -> bool:
         return path.startswith("/download/") and len(path) > len("/download/")
     except Exception:
         return False
+
+
+def _url2_navigable(url: str) -> bool:
+    """Shield between the follow hop and the button flow.
+
+    A failed navigation leaves page.url at chrome-error://chromewebdata/
+    (or about:blank); forwarding that into execute_button_flow made
+    Playwright raise `Page.goto: net::ERR_ABORTED at chrome-error://
+    chromewebdata/` after a wasted browser launch + 120s wait.
+    """
+    try:
+        from xdmovies.link_exec import _is_navigable_url as _nav_ok
+        return bool(_nav_ok(url))
+    except Exception:
+        # Helper unavailable (import hiccup): keep the old permissive
+        # behavior rather than failing every link.
+        return True
+
+
+def _button_flow_err(exc: BaseException) -> str:
+    """Card error text for a button-flow failure.
+
+    Known typed errors read as plain sentences (no class-name noise);
+    anything else keeps the 'ClassName: message' debug form.
+    """
+    try:
+        from xdmovies.link_exec import InvalidGateURLError as _IGE
+        if isinstance(exc, _IGE):
+            return f"button flow: {exc}"
+    except Exception:
+        pass
+    return f"button flow: {exc.__class__.__name__}: {exc}"
+
+
+def _resolve_fail_err(exc: BaseException) -> str:
+    """Card error text for a resolve-step failure (same policy).
+    """
+    try:
+        from xdmovies.link_follower import FollowFailedError as _FFE
+        if isinstance(exc, _FFE):
+            return f"follow failed: {exc}"
+    except Exception:
+        pass
+    return f"{exc.__class__.__name__}: {exc}"
 
 
 async def _enrich_hub_dest(dest: str, card) -> str:
@@ -2111,6 +2160,11 @@ class Bot:
                     )
                 if not url2:
                     err = "follow returned empty URL"
+                elif not _url2_navigable(url2):
+                    # Junk in, junk out: navigating a chrome-error:// page
+                    # raises ERR_ABORTED and would burn the whole 2-attempt
+                    # retry budget on a URL that can never succeed.
+                    err = "follow landed on a browser error page -- link may be expired"
                 else:
                     for _btn_attempt in range(2):
                         try:
@@ -2144,8 +2198,13 @@ class Bot:
                                             try:
                                                 from xdmovies.solve_server import get_solved_result as _gsr2
                                                 _r2 = _gsr2(token2) or {}
-                                                if (_r2.get("final_url") or "").strip():
-                                                    dest = _r2["final_url"].strip()
+                                                _r2f = (_r2.get("final_url") or "").strip()
+                                                # Screen the solve-server's captured
+                                                # URL like every other destination in
+                                                # the flow (adversarial review: this
+                                                # path bypassed the backstops).
+                                                if _r2f and _url2_navigable(_r2f):
+                                                    dest = _r2f
                                                     dest = await _finalize_gate_card(card, dest, result)
                                                     break
                                             except: pass
@@ -2157,7 +2216,7 @@ class Bot:
                                     break
                             except Exception:
                                 pass
-                            err = f"button flow: {exc.__class__.__name__}: {exc}"
+                            err = _button_flow_err(exc)
                             _LOG.exception("button flow failed for %s", url2)
                             break
                         if dest:
@@ -2195,8 +2254,9 @@ class Bot:
                                 try:
                                     from xdmovies.solve_server import get_solved_result as _gsrf
                                     _rf = _gsrf(tokenf) or {}
-                                    if (_rf.get("final_url") or "").strip():
-                                        dest = _rf["final_url"].strip()
+                                    _rff = (_rf.get("final_url") or "").strip()
+                                    if _rff and _url2_navigable(_rff):
+                                        dest = _rff
                                         dest = await _finalize_gate_card(card, dest, result)
                                         results.append((card, dest, None))
                                         job.resolved += 1
@@ -2208,7 +2268,7 @@ class Bot:
                                 except: pass
                                 try:
                                     url2r, _, _ = await _follow_download_link(card.url, session_id=shared_session, headless=self.headless)  # type: ignore
-                                    if url2r:
+                                    if url2r and _url2_navigable(url2r):
                                         try:
                                             dest = await _execute_button_flow(url2r, session_id=shared_session, headless=False)  # type: ignore
                                             if dest:
@@ -2224,9 +2284,9 @@ class Bot:
                                 except: pass
                         err = f"CF challenge on {hostf} -- opened solve link {blockedf}, still blocked"
                     else:
-                        err = f"{exc.__class__.__name__}: {exc}"
+                        err = _resolve_fail_err(exc)
                 except Exception:
-                    err = f"{exc.__class__.__name__}: {exc}"
+                    err = _resolve_fail_err(exc)
                 _LOG.exception("resolve failed for %s", card.url)
 
             results.append((card, dest, err))
