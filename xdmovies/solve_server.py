@@ -85,6 +85,12 @@ class SolveSession:
     # must keep running to reach the destination); this flag drives the
     # _gate_solved_fallback task that resolves capture-only sessions.
     cookie_captured: bool = False
+    # True when the interactive Turnstile widget never cleared to any
+    # synthetic input AND the background nudge also failed with nothing
+    # captured (gate sessions). wait_for_solve treats this as "the
+    # remaining human wait is futile" and ends early instead of burning
+    # the full window per blocked card.
+    hopeless: bool = False
     # Background tasks owned by this session (cancelled in destroy).
     launch_task: Optional[asyncio.Task] = None
     auto_nudge_task: Optional[asyncio.Task] = None
@@ -1012,11 +1018,40 @@ async def _run_auto_nudge(sess: SolveSession) -> None:
             sess.auto_nudge_failed = True
             logger.info(f"[solve_server] auto-nudge did not capture cookie within ~20s; "
                        f"user fallback required")
+            _mark_gate_hopeless_if_applicable(sess)
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.warning(f"[solve_server] auto_nudge error: {e!r}")
         sess.auto_nudge_failed = True
+        _mark_gate_hopeless_if_applicable(sess)
+
+
+def _mark_gate_hopeless_if_applicable(sess: SolveSession) -> None:
+    """Flag a gate session as hopeless when nothing succeeded.
+
+    Condition: gate session (latestnewsonline.sbs) + auto-nudge gave up +
+    no cf_clearance captured. In that state the checkbox loop has already
+    clicked the widget for its whole timeout and the background nudge
+    failed once more -- a human "tap" arrives through the SAME
+    page.mouse.click forwarding and has the same rejection profile, so
+    the remaining wait window is near-certainly wasted. wait_for_solve
+    reads the flag and ends the wait early (small grace) so the batch
+    moves on and later cards don't stall behind this one.
+    """
+    try:
+        _g = "latestnewsonline.sbs" in (
+            (sess.host or "") + (sess.url or "")
+        ).lower()
+        if _g and not getattr(sess, "cf_value", None):
+            sess.hopeless = True
+            logger.warning(
+                "[solve_server] gate session marked hopeless: interactive widget "
+                "rejected synthetic input and nudge failed with no capture "
+                f"token={sess.token[:8]}"
+            )
+    except Exception:
+        pass
 
 async def handle_solve_page(request):
     token = request.match_info.get("token", "")
@@ -1971,16 +2006,47 @@ def get_public_url(token: str) -> str:
     base = SOLVE_PUBLIC_BASE.rstrip("/")
     return f"{base}/solve/{token}"
 
-async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
+async def wait_for_solve(token: str, timeout: float = 120.0,
+                         poll_slice: float = 5.0,
+                         hopeless_grace: float = 30.0) -> bool:
     sess = _SESSIONS.get(token)
     if not sess:
         return False
     solved = False
     try:
-        await asyncio.wait_for(sess.event.wait(), timeout=timeout)
-        solved = sess.solved
-    except asyncio.TimeoutError:
-        solved = False
+        # Slice the event wait so hopeless gate sessions can bail early:
+        # the interactive widget never clears to any synthetic click and
+        # the nudge already failed -- ending the wait at hopeless+grace
+        # instead of the full window stops a fully-challenged job from
+        # stalling ~4min per card. Not hopeless: the slices change nothing
+        # perceptible (event fires within one slice).
+        _deadline = time.monotonic() + max(0.0, float(timeout))
+        _hopeless_since: Optional[float] = None
+        while True:
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                solved = False
+                break
+            try:
+                await asyncio.wait_for(
+                    sess.event.wait(), timeout=min(5.0, poll_slice, _remaining)
+                )
+                solved = sess.solved
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            if getattr(sess, "hopeless", False):
+                if _hopeless_since is None:
+                    _hopeless_since = time.monotonic()
+                    logger.info(
+                        f"[solve_server] hopeless session: ending human wait "
+                        f"after {int(hopeless_grace)}s grace token={token[:8]}"
+                    )
+                elif time.monotonic() - _hopeless_since >= hopeless_grace:
+                    solved = False
+                    break
     finally:
         # Audit finding C5: stop leaking the headed Chromium once the
         # bot has the cookie (or has given up waiting). The user's
