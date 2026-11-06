@@ -80,10 +80,22 @@ class SolveSession:
     # marked solved. bot.py reads it via get_solved_result() and uses it
     # directly instead of retrying with a stale cookie.
     final_url: Optional[str] = None
+    # True once a fresh cf_clearance was captured in a gate session.
+    # Gate sessions are NOT marked solved on capture (the auto-drive
+    # must keep running to reach the destination); this flag drives the
+    # _gate_solved_fallback task that resolves capture-only sessions.
+    cookie_captured: bool = False
+    # True when the interactive Turnstile widget never cleared to any
+    # synthetic input AND the background nudge also failed with nothing
+    # captured (gate sessions). wait_for_solve treats this as "the
+    # remaining human wait is futile" and ends early instead of burning
+    # the full window per blocked card.
+    hopeless: bool = False
     # Background tasks owned by this session (cancelled in destroy).
     launch_task: Optional[asyncio.Task] = None
     auto_nudge_task: Optional[asyncio.Task] = None
     expire_task: Optional[asyncio.Task] = None
+    gate_fallback_task: Optional[asyncio.Task] = None
     last_viewer_activity: float = 0.0
     last_shot_at: float = 0.0
 
@@ -263,6 +275,62 @@ document.getElementById('shot').addEventListener('click', async (e)=>{
 </script></body></html>
 """
 
+async def _gate_solved_fallback(sess: "SolveSession", grace: float = 45.0) -> None:
+    """Resolve a gate solve session that captured a fresh cf_clearance but
+    never produced a destination.
+
+    Gate sessions are no longer marked solved at capture time (the
+    auto-drive must keep running to reach /go/<sid>). If the drive never
+    yields a destination -- widget stalled, popup reaper rattled the tab,
+    page crashed -- the bot's human-wait would otherwise burn its whole
+    240s window on a session whose cookie is ALREADY in the store. After
+    the drive has had its chance, resolve the session on the strength of
+    the captured cookie: bot.py then re-runs the button flow with the
+    fresh cookie injected and the card succeeds without any human click.
+
+    Two phases:
+    - no capture yet → sleep `grace` first (give the drive its window),
+      then require a capture to exist;
+    - capture already present (poller re-arms this task at capture time
+      when the previous instance finished) → skip the initial grace and
+      let a STILL-RUNNING drive land its destination (bounded wait), then
+      resolve if still unsolved.
+    """
+    try:
+        if not getattr(sess, "cookie_captured", False):
+            await asyncio.sleep(grace)
+            if sess.solved:
+                return
+            if _SESSIONS.get(sess.token) is not sess:
+                return
+            if not getattr(sess, "cookie_captured", False):
+                # Nothing captured (yet): the human flow stays in charge.
+                return
+        # A capture exists. Never preempt a drive mid-flight forever:
+        # give a still-running drive a bounded chance to land the dest.
+        _lt = getattr(sess, "launch_task", None)
+        try:
+            if (_lt is not None and _lt is not asyncio.current_task()
+                    and not _lt.done()):
+                await asyncio.wait({_lt}, timeout=45.0)
+        except Exception:
+            pass
+        if sess.solved:
+            return
+        if _SESSIONS.get(sess.token) is not sess:
+            return
+        sess.solved = True
+        sess.event.set()
+        logger.info(
+            f"[solve_server] gate fallback: resolved via captured cookie "
+            f"(no destination) token={sess.token[:8]}"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
 async def _poll_for_cookie(sess: SolveSession):
     try:
         # Domain match: accept cookies whose domain is the host itself,
@@ -327,6 +395,11 @@ async def _poll_for_cookie(sess: SolveSession):
                         # Same value as what we injected. The
                         # user hasn't solved anything new.
                         continue
+                    if getattr(sess, "cf_value", None) == val:
+                        # Already captured this exact value in this
+                        # session (gate sessions keep polling while the
+                        # auto-drive runs) -- don't re-save/log every tick.
+                        continue
                     # NOTE (latestnewsonline.sbs gate fix): CF
                     # sometimes issues cf_clearance on domain
                     # ".cloudflare.com" instead of the site
@@ -369,9 +442,35 @@ async def _poll_for_cookie(sess: SolveSession):
                             user_agent=ua,
                         )
                         sess.cf_value = val
-                        sess.solved = True
-                        sess.event.set()
-                        _stash_solved_result(sess.token, cf_value=val)
+                        # Gate sessions (latestnewsonline.sbs): a captured
+                        # cf_clearance does NOT mean the solve is finished --
+                        # the Generate->Continue->Turnstile->Go auto-drive
+                        # must still run to reach the destination (see
+                        # SolveSession.final_url). Marking solved here used
+                        # to no-op every auto-drive step (they all gate on
+                        # `not sess.solved`), leaving only a final_url-less
+                        # result: the first card of every job then failed
+                        # with "still blocked" while the warm cookie let
+                        # later cards pass. Flag the capture instead; the
+                        # gate fallback task decides resolvedness.
+                        _sess_is_gate = "latestnewsonline.sbs" in (
+                            (sess.host or "") + (sess.url or "")
+                        ).lower()
+                        if _sess_is_gate:
+                            sess.cookie_captured = True
+                            _stash_solved_result(sess.token, cf_value=val)
+                            logger.info(
+                                f"[solve_server] gate session: cookie captured, "
+                                f"auto-drive continues (no solved yet) token={sess.token[:8]}"
+                            )
+                            if sess.gate_fallback_task is None or sess.gate_fallback_task.done():
+                                sess.gate_fallback_task = asyncio.create_task(
+                                    _gate_solved_fallback(sess)
+                                )
+                        else:
+                            sess.solved = True
+                            sess.event.set()
+                            _stash_solved_result(sess.token, cf_value=val)
                         logger.info(
                             f"[solve_server] auto-captured NEW cf_clearance for {sess.host} "
                             f"(cookie-domain={c.get('domain')}) token={sess.token[:8]} "
@@ -570,6 +669,17 @@ async def _launch_for_session(sess: SolveSession):
     except Exception as e:
         sess.goto_error = f"goto failed for {e!r}"
         logger.warning(f"[solve_server] goto failed for {sess.url}: {e}")
+    _nav_ss = None
+    try:
+        from xdmovies.link_exec import _is_navigable_url as _nav_ss
+    except Exception:
+        pass
+    if is_gate and _nav_ss is not None and not _nav_ss(page.url or ""):
+        # Page never actually loaded (browser error page): driving
+        # Generate/Continue against it is pointless and the screenshot
+        # shown to the human solver would capture chrome-error junk.
+        logger.warning("[solve_server] gate page did not load -- skipping auto-drive")
+        is_gate = False
     # Gate auto-drive: if this is a latestnewsonline.sbs URL, drive
     # Generate -> Continue -> Turnstile container automatically. Clicks
     # are synthetic-first (proven live 2026-09-04: main.js handlers check
@@ -882,6 +992,12 @@ async def _launch_for_session(sess: SolveSession):
                     logger.warning(f"[solve_server] gate Go-click failed: {exc_go!r}")
         except Exception as exc:
             logger.warning(f"[solve_server] gate auto-drive failed (user can still click manually): {exc!r}")
+        if sess.gate_fallback_task is None or sess.gate_fallback_task.done():
+            # The drive has had its chance; arm the capture-only resolver
+            # so a cookie captured mid-drive (or by the human later)
+            # still ends the session. The poller re-arms the same task
+            # (finished tasks are re-created) when a capture lands late.
+            sess.gate_fallback_task = asyncio.create_task(_gate_solved_fallback(sess))
     # Always start the poller — it picks up cf_clearance as soon as
     # the page lands.
     sess.poll_task = asyncio.create_task(_poll_for_cookie(sess))
@@ -902,11 +1018,40 @@ async def _run_auto_nudge(sess: SolveSession) -> None:
             sess.auto_nudge_failed = True
             logger.info(f"[solve_server] auto-nudge did not capture cookie within ~20s; "
                        f"user fallback required")
+            _mark_gate_hopeless_if_applicable(sess)
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.warning(f"[solve_server] auto_nudge error: {e!r}")
         sess.auto_nudge_failed = True
+        _mark_gate_hopeless_if_applicable(sess)
+
+
+def _mark_gate_hopeless_if_applicable(sess: SolveSession) -> None:
+    """Flag a gate session as hopeless when nothing succeeded.
+
+    Condition: gate session (latestnewsonline.sbs) + auto-nudge gave up +
+    no cf_clearance captured. In that state the checkbox loop has already
+    clicked the widget for its whole timeout and the background nudge
+    failed once more -- a human "tap" arrives through the SAME
+    page.mouse.click forwarding and has the same rejection profile, so
+    the remaining wait window is near-certainly wasted. wait_for_solve
+    reads the flag and ends the wait early (small grace) so the batch
+    moves on and later cards don't stall behind this one.
+    """
+    try:
+        _g = "latestnewsonline.sbs" in (
+            (sess.host or "") + (sess.url or "")
+        ).lower()
+        if _g and not getattr(sess, "cf_value", None):
+            sess.hopeless = True
+            logger.warning(
+                "[solve_server] gate session marked hopeless: interactive widget "
+                "rejected synthetic input and nudge failed with no capture "
+                f"token={sess.token[:8]}"
+            )
+    except Exception:
+        pass
 
 async def handle_solve_page(request):
     token = request.match_info.get("token", "")
@@ -1836,6 +1981,9 @@ async def destroy_session(token: str):
     if sess.expire_task and sess.expire_task is not asyncio.current_task():
         try: sess.expire_task.cancel()
         except: pass
+    if sess.gate_fallback_task:
+        try: sess.gate_fallback_task.cancel()
+        except: pass
     try:
         if sess.page:
             try: await sess.page.close()
@@ -1858,16 +2006,47 @@ def get_public_url(token: str) -> str:
     base = SOLVE_PUBLIC_BASE.rstrip("/")
     return f"{base}/solve/{token}"
 
-async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
+async def wait_for_solve(token: str, timeout: float = 120.0,
+                         poll_slice: float = 5.0,
+                         hopeless_grace: float = 30.0) -> bool:
     sess = _SESSIONS.get(token)
     if not sess:
         return False
     solved = False
     try:
-        await asyncio.wait_for(sess.event.wait(), timeout=timeout)
-        solved = sess.solved
-    except asyncio.TimeoutError:
-        solved = False
+        # Slice the event wait so hopeless gate sessions can bail early:
+        # the interactive widget never clears to any synthetic click and
+        # the nudge already failed -- ending the wait at hopeless+grace
+        # instead of the full window stops a fully-challenged job from
+        # stalling ~4min per card. Not hopeless: the slices change nothing
+        # perceptible (event fires within one slice).
+        _deadline = time.monotonic() + max(0.0, float(timeout))
+        _hopeless_since: Optional[float] = None
+        while True:
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                solved = False
+                break
+            try:
+                await asyncio.wait_for(
+                    sess.event.wait(), timeout=min(5.0, poll_slice, _remaining)
+                )
+                solved = sess.solved
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            if getattr(sess, "hopeless", False):
+                if _hopeless_since is None:
+                    _hopeless_since = time.monotonic()
+                    logger.info(
+                        f"[solve_server] hopeless session: ending human wait "
+                        f"after {int(hopeless_grace)}s grace token={token[:8]}"
+                    )
+                elif time.monotonic() - _hopeless_since >= hopeless_grace:
+                    solved = False
+                    break
     finally:
         # Audit finding C5: stop leaking the headed Chromium once the
         # bot has the cookie (or has given up waiting). The user's
@@ -1883,5 +2062,9 @@ async def wait_for_solve(token: str, timeout: float = 120.0) -> bool:
             # destroy_session fires, and the user clicks their
             # already-dead link to find "Invalid or expired".
             await asyncio.sleep(25)
+            await destroy_session(token)
+        else:
+            # Audit finding: Destroy browser immediately on timeout to prevent
+            # leaking headed Chromium processes on VPS when owner is offline
             await destroy_session(token)
     return solved

@@ -119,14 +119,25 @@ async def _check_once(bot) -> tuple[List[str], str]:
                 from xdmovies.cookie_store import CFChallengeError  # noqa: F401
                 owner = getattr(getattr(bot, "cfg", None), "owner_id", 0)
                 token, _m = await bot._send_solve_link(
-                    owner, getattr(exc, "url", "") or url, "xdmovies.wtf", owner
+                    owner, getattr(exc, "url", "") or url, "xdmovies.wtf", owner,
+                    header="🔄 <b>Auto-detect: Cloudflare challenge</b> on <code>xdmovies.wtf</code>"
                 )
-                if token and await bot._wait_for_solve(token, timeout=120.0):
-                    html = await fetch_rendered_html(url, session_id="autodetect", headless=False)
-                    page_urls = extract_catalog_urls(html, feed, url)
-                else:
-                    store.touch_check(0)
-                    return [], "cf_unsolved"
+                try:
+                    if token and await bot._wait_for_solve(token, timeout=120.0):
+                        html = await fetch_rendered_html(url, session_id="autodetect", headless=False)
+                        page_urls = extract_catalog_urls(html, feed, url)
+                    else:
+                        if hasattr(bot, "_autodetect_cf_blocked_until"):
+                            bot._autodetect_cf_blocked_at = time.time()
+                            bot._autodetect_cf_blocked_until = time.time() + 300.0
+                        store.touch_check(0)
+                        return [], "cf_unsolved"
+                finally:
+                    if _m:
+                        try:
+                            await bot._bot.delete_message(chat_id=owner, message_id=_m)
+                        except Exception:
+                            pass
             except Exception as e2:
                 logger.warning(f"[autodetect] CF solve retry failed: {e2}")
                 store.touch_check(0)
@@ -146,8 +157,6 @@ async def _check_once(bot) -> tuple[List[str], str]:
     live = await _collect_live_urls_async(bot)
     new_urls = [u for u in page_urls if u not in seen and u not in live]
     new_urls = new_urls[:MAX_NEW_PER_TICK]
-    if new_urls:
-        store.add_seen(new_urls)  # mark seen at enqueue time (no re-queue on crash)
     store.touch_check(len(new_urls))
     return new_urls, "new" if new_urls else "clean"
 

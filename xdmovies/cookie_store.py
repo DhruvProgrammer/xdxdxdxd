@@ -36,6 +36,7 @@ import json
 import os
 import re
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -112,7 +113,7 @@ def _save_raw(data: Dict) -> None:
         os.makedirs(d, exist_ok=True)
     except Exception:
         pass
-    tmp = path + ".tmp"
+    tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     try:
@@ -124,6 +125,12 @@ def _save_raw(data: Dict) -> None:
             pass
         try:
             os.replace(tmp, path)
+        except Exception:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except Exception:
             pass
 
@@ -320,6 +327,7 @@ def set_cookies_for_domain(domain_or_url: str, cookie_text: str, user_agent: Opt
         entry[k] = v
 
     now = time.time()
+    entry.setdefault("_created_at", now)
     entry["_updated_at"] = now
     entry["_updated_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
     entry["_store_key"] = key
@@ -336,15 +344,49 @@ def set_cookies_for_domain(domain_or_url: str, cookie_text: str, user_agent: Opt
 def set_cookie(domain_or_url: str, cookie_text: str, user_agent: Optional[str] = None) -> Tuple[str, Dict[str, str]]:
     return set_cookies_for_domain(domain_or_url, cookie_text, user_agent)
 
+MAX_COOKIE_LIFETIME: int = 43200  # 12h hard ceiling to prevent zombie sessions
+
+def touch_domain(domain_or_url: str, ttl_seconds: Optional[int] = None) -> bool:
+    """Extend the expiration time of an existing valid cookie entry without altering contents.
+
+    Called when a request (or keep-alive silent hit) proves the stored cf_clearance
+    cookie is still accepted by Cloudflare, advancing _expires_at by ttl_seconds
+    (default DEFAULT_TTL_SECONDS = 2h).
+    Enforces a hard ceiling of MAX_COOKIE_LIFETIME (12h) from initial solve.
+    """
+    key = _normalize_domain(domain_or_url)
+    data = _load_raw()
+    entry = data.get(key)
+    if not entry:
+        return False
+    # Only touch if we actually have cf_clearance
+    has_cf = any(k.lower() == "cf_clearance" for k in entry.keys() if not k.startswith("_"))
+    if not has_cf:
+        return False
+    now = time.time()
+    created_at = float(entry.get("_created_at") or entry.get("_updated_at") or now)
+    if (now - created_at) > MAX_COOKIE_LIFETIME:
+        return False
+    ttl = ttl_seconds if ttl_seconds is not None else DEFAULT_TTL_SECONDS
+    entry["_updated_at"] = now
+    entry["_updated_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    entry["_expires_at"] = now + ttl
+    entry["_expires_human"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now + ttl))
+    data[key] = entry
+    _save_raw(data)
+    return True
+
 def get_entry(domain_or_url: str) -> Optional[Dict]:
     key = _normalize_domain(domain_or_url)
     data = _load_raw()
     return data.get(key)
 
-def get_cookies_for_url(url: str) -> List[Dict]:
+def get_cookies_for_url(url: str, allow_expired: bool = False) -> List[Dict]:
     """Return Playwright add_cookies payload with real CF attributes.
 
     Includes Secure/HttpOnly/SameSite/expires so CF doesn't reject injection.
+    If allow_expired is True (used by keep-alive to test validity on the wire),
+    cookies past client-side TTL are still returned.
     """
     key = _normalize_domain(url)
     entry = get_entry(key)
@@ -352,7 +394,7 @@ def get_cookies_for_url(url: str) -> List[Dict]:
         return []
     # check expiry — if expired, treat as missing (caller will prompt)
     exp = entry.get("_expires_at", 0)
-    if exp and time.time() > exp:
+    if not allow_expired and exp and time.time() > exp:
         return []
     cookies: List[Dict] = []
     host = _host_for_injection(key, url)

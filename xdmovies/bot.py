@@ -874,10 +874,15 @@ def _is_gate_url(url: str) -> bool:
     and per-card routing). Host-based, so ad lookalikes can never match.
     """
     try:
-        from xdmovies.link_exec import GATE_HOST as _gh
+        from xdmovies.link_exec import GATE_HOST as _gh, _is_navigable_url as _nav_ok
     except Exception:
         _gh = "latestnewsonline.sbs"
+        _nav_ok = None
     try:
+        if _nav_ok is not None and not _nav_ok(url):
+            # chrome-error://, about:blank, file://, ... can never be a
+            # gate page even when a host string parses out of them.
+            return False
         from urllib.parse import urlparse
         h = (urlparse(url or "").hostname or "").lower()
         return bool(h) and (h == _gh or h.endswith("." + _gh))
@@ -902,6 +907,50 @@ def _is_download_url(url: str) -> bool:
         return path.startswith("/download/") and len(path) > len("/download/")
     except Exception:
         return False
+
+
+def _url2_navigable(url: str) -> bool:
+    """Shield between the follow hop and the button flow.
+
+    A failed navigation leaves page.url at chrome-error://chromewebdata/
+    (or about:blank); forwarding that into execute_button_flow made
+    Playwright raise `Page.goto: net::ERR_ABORTED at chrome-error://
+    chromewebdata/` after a wasted browser launch + 120s wait.
+    """
+    try:
+        from xdmovies.link_exec import _is_navigable_url as _nav_ok
+        return bool(_nav_ok(url))
+    except Exception:
+        # Helper unavailable (import hiccup): keep the old permissive
+        # behavior rather than failing every link.
+        return True
+
+
+def _button_flow_err(exc: BaseException) -> str:
+    """Card error text for a button-flow failure.
+
+    Known typed errors read as plain sentences (no class-name noise);
+    anything else keeps the 'ClassName: message' debug form.
+    """
+    try:
+        from xdmovies.link_exec import InvalidGateURLError as _IGE
+        if isinstance(exc, _IGE):
+            return f"button flow: {exc}"
+    except Exception:
+        pass
+    return f"button flow: {exc.__class__.__name__}: {exc}"
+
+
+def _resolve_fail_err(exc: BaseException) -> str:
+    """Card error text for a resolve-step failure (same policy).
+    """
+    try:
+        from xdmovies.link_follower import FollowFailedError as _FFE
+        if isinstance(exc, _FFE):
+            return f"follow failed: {exc}"
+    except Exception:
+        pass
+    return f"{exc.__class__.__name__}: {exc}"
 
 
 async def _enrich_hub_dest(dest: str, card) -> str:
@@ -1503,6 +1552,8 @@ class Bot:
         # dispatcher. Keeping a parallel boolean dict that nothing read
         # was misleading.
         self._last_cf_url: dict[int, str] = {}
+        self._autodetect_cf_blocked_until: float = 0.0
+        self._autodetect_cf_blocked_at: float = 0.0
         _LOG.info("browser: headed (Chromium launches with xvfb if DISPLAY is unset)")
 
     # ---- queue helpers ---------------------------------------------------
@@ -1669,6 +1720,15 @@ class Bot:
         except Exception:
             pass
 
+    def _mark_autodetect_seen_if_needed(self, job: Job) -> None:
+        """Mark an autodetect job URL as seen so it isn't re-polled indefinitely."""
+        if getattr(job, "user_name", "") == "autodetect" and getattr(job, "url", ""):
+            try:
+                from xdmovies import autodetect_store
+                autodetect_store.add_seen([job.url])
+            except Exception as exc:
+                _LOG.debug(f"autodetect add_seen failed: {exc!r}")
+
     # ---- the big resolver coroutine -------------------------------------
     async def _run_for_user(self, job: Job) -> None:
         if job.job_type == "scrape_all":
@@ -1677,6 +1737,27 @@ class Bot:
         if job.job_type == "ddl_dump":
             await self._run_ddl_dump(job)
             return
+
+        if getattr(job, "user_name", "") == "autodetect":
+            blocked_until = getattr(self, "_autodetect_cf_blocked_until", 0.0)
+            if time.time() < blocked_until:
+                # Check if a fresh cookie was saved after the challenge block occurred
+                try:
+                    from xdmovies.cookie_store import get_entry
+                    entry = get_entry("xdmovies.wtf")
+                    updated = float(entry.get("_updated_at", 0)) if entry else 0.0
+                except Exception:
+                    updated = 0.0
+                if updated <= getattr(self, "_autodetect_cf_blocked_at", 0.0):
+                    rem = int(blocked_until - time.time())
+                    _LOG.info(f"[autodetect] skipping sibling job {job.url} due to CF challenge cooldown ({rem}s remaining)")
+                    job.status = "error"
+                    job.error = f"cf_blocked_cooldown:{rem}s"
+                    job.finished_at = time.time()
+                    return
+                else:
+                    self._autodetect_cf_blocked_until = 0.0
+
         cfg = self.cfg
         started = time.time()
         job.started_at = started
@@ -1745,7 +1826,10 @@ class Bot:
             # hybrid: try VPS token solve (posts need it, not home).
             # Operational chatter goes to the requester's DM (_op_dm),
             # never the public channel (it carries the VPS IP).
-            token, msg_id = await self._send_solve_link(_op_dm(job), blocked_url, host, job.user_id)
+            solve_hdr = None
+            if getattr(job, "user_name", "") == "autodetect":
+                solve_hdr = f"🔄 <b>Auto-detect: Cloudflare challenge</b> on <code>{host}</code>"
+            token, msg_id = await self._send_solve_link(_op_dm(job), blocked_url, host, job.user_id, header=solve_hdr)
             if token:
                 # Keep the bot wait short; the solve page/browser remains available
                 # for one hour of viewer activity so a late tap still works.
@@ -1754,10 +1838,16 @@ class Bot:
                     _solved = await self._wait_for_solve(token, timeout=120.0)
                 finally:
                     await _drop_msg(self._bot, _op_dm(job), _waitpill)
+                    if not _solved and msg_id:
+                        try:
+                            await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id)
+                        except Exception:
+                            pass
                 if _solved:
                     if msg_id:
                         try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id)
                         except: pass
+                    self._autodetect_cf_blocked_until = 0.0
                     # Audit finding H10: move the post-solve retry out of
                     # the except CFChallengeError block so non-CF
                     # exceptions are also caught by the parent's generic
@@ -1788,18 +1878,45 @@ class Bot:
                     except CFChallengeError as cf2:
                         # still blocked after solve
                         host2 = getattr(cf2, "host", "") or host
+                        if getattr(job, "user_name", "") == "autodetect":
+                            self._autodetect_cf_blocked_at = time.time()
+                            self._autodetect_cf_blocked_until = time.time() + 300.0
                         await _send_safe(self._bot, _op_dm(job), f"[FAIL] Still blocked on <code>{host2}</code> after solve -- try again or /status", parse_mode=ParseMode.HTML)
                         job.status = "error"
                         job.error = f"cf_challenge:{host2}"
                         job.finished_at = time.time()
                         return
                 else:
-                    await _send_safe(self._bot, _op_dm(job), f"⏰ Solve timed out. Resend the link to get a fresh solve link (keep-alive paused).", parse_mode=ParseMode.HTML)
+                    if getattr(job, "user_name", "") == "autodetect":
+                        self._autodetect_cf_blocked_at = time.time()
+                        self._autodetect_cf_blocked_until = time.time() + 300.0
+                        try:
+                            from xdmovies import autodetect_store
+                            attempts = autodetect_store.record_attempt(job.url)
+                            if attempts >= 3:
+                                autodetect_store.add_seen([job.url])
+                                _LOG.warning(f"[autodetect] URL {job.url} reached {attempts} CF attempts; marked seen to avoid infinite retries")
+                        except Exception:
+                            pass
+                        await _send_safe(
+                            self._bot, _op_dm(job),
+                            f"⏰ <b>Auto-detect solve timed out</b> on <code>{host}</code>.\n\n"
+                            f"Link: <code>{blocked_url}</code>\n\n"
+                            f"Cloudflare verification was not completed within 120s. "
+                            f"Auto-detect is paused for 5 minutes and will retry unposted titles on future checks. "
+                            f"Use /status to inspect or /cookies to update Cloudflare clearance.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        await _send_safe(self._bot, _op_dm(job), f"⏰ Solve timed out. Resend the link to get a fresh solve link (keep-alive paused).", parse_mode=ParseMode.HTML)
                     job.status = "error"
                     job.error = f"cf_challenge:{host}"
                     job.finished_at = time.time()
                     return
             else:
+                if getattr(job, "user_name", "") == "autodetect":
+                    self._autodetect_cf_blocked_at = time.time()
+                    self._autodetect_cf_blocked_until = time.time() + 300.0
                 _vps = os.environ.get("SOLVE_SERVER_PUBLIC_BASE", "http://VPS:8080").rstrip("/")
                 await _send_safe(self._bot, _op_dm(job), f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\nLink: <code>{blocked_url}</code>\nCould not create solve link -- check VPS {_vps}", parse_mode=ParseMode.HTML)
                 job.status = "error"
@@ -1833,6 +1950,7 @@ class Bot:
                 job.status = "done"
                 job.finished_at = time.time()
                 self.last_solve_ago = 0.0
+                self._mark_autodetect_seen_if_needed(job)
                 return
             if len(_kept) != len(cards):
                 _LOG.info(
@@ -1889,6 +2007,7 @@ class Bot:
             job.status = "done"
             job.finished_at = time.time()
             self.last_solve_ago = 0.0
+            self._mark_autodetect_seen_if_needed(job)
             # Audit finding M5: touch keep-alive on every successful
             # job so the 25m refresh loop restarts from now. Otherwise
             # the loop fires 25m after the *last solve*, not the *last
@@ -2041,6 +2160,11 @@ class Bot:
                     )
                 if not url2:
                     err = "follow returned empty URL"
+                elif not _url2_navigable(url2):
+                    # Junk in, junk out: navigating a chrome-error:// page
+                    # raises ERR_ABORTED and would burn the whole 2-attempt
+                    # retry budget on a URL that can never succeed.
+                    err = "follow landed on a browser error page -- link may be expired"
                 else:
                     for _btn_attempt in range(2):
                         try:
@@ -2059,11 +2183,14 @@ class Bot:
                                     if token2:
                                         _gate2 = "latestnews" in (host2 or "")
                                         _wait2 = 240.0 if _gate2 else 90.0
-                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.")
+                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- this usually auto-clears on its own; open the link and tap only if it doesn't.")
                                         try:
                                             _solved2 = await self._wait_for_solve(token2, timeout=_wait2)
                                         finally:
                                             await _drop_msg(self._bot, _op_dm(job), _waitpill2)
+                                            if not _solved2 and msg_id2:
+                                                try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id2)
+                                                except: pass
                                         if _solved2:
                                             if msg_id2:
                                                 try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_id2)
@@ -2071,8 +2198,13 @@ class Bot:
                                             try:
                                                 from xdmovies.solve_server import get_solved_result as _gsr2
                                                 _r2 = _gsr2(token2) or {}
-                                                if (_r2.get("final_url") or "").strip():
-                                                    dest = _r2["final_url"].strip()
+                                                _r2f = (_r2.get("final_url") or "").strip()
+                                                # Screen the solve-server's captured
+                                                # URL like every other destination in
+                                                # the flow (adversarial review: this
+                                                # path bypassed the backstops).
+                                                if _r2f and _url2_navigable(_r2f):
+                                                    dest = _r2f
                                                     dest = await _finalize_gate_card(card, dest, result)
                                                     break
                                             except: pass
@@ -2084,7 +2216,7 @@ class Bot:
                                     break
                             except Exception:
                                 pass
-                            err = f"button flow: {exc.__class__.__name__}: {exc}"
+                            err = _button_flow_err(exc)
                             _LOG.exception("button flow failed for %s", url2)
                             break
                         if dest:
@@ -2107,11 +2239,14 @@ class Bot:
                         if tokenf:
                             _gatef = "latestnews" in (hostf or "")
                             _waitf = 240.0 if _gatef else 90.0
-                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.")
+                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- this usually auto-clears on its own; open the link and tap only if it doesn't.")
                             try:
                                 _solvedf = await self._wait_for_solve(tokenf, timeout=_waitf)
                             finally:
                                 await _drop_msg(self._bot, _op_dm(job), _waitpillf)
+                                if not _solvedf and msg_idf:
+                                    try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_idf)
+                                    except: pass
                             if _solvedf:
                                 if msg_idf:
                                     try: await self._bot.delete_message(chat_id=_op_dm(job), message_id=msg_idf)
@@ -2119,8 +2254,9 @@ class Bot:
                                 try:
                                     from xdmovies.solve_server import get_solved_result as _gsrf
                                     _rf = _gsrf(tokenf) or {}
-                                    if (_rf.get("final_url") or "").strip():
-                                        dest = _rf["final_url"].strip()
+                                    _rff = (_rf.get("final_url") or "").strip()
+                                    if _rff and _url2_navigable(_rff):
+                                        dest = _rff
                                         dest = await _finalize_gate_card(card, dest, result)
                                         results.append((card, dest, None))
                                         job.resolved += 1
@@ -2132,7 +2268,7 @@ class Bot:
                                 except: pass
                                 try:
                                     url2r, _, _ = await _follow_download_link(card.url, session_id=shared_session, headless=self.headless)  # type: ignore
-                                    if url2r:
+                                    if url2r and _url2_navigable(url2r):
                                         try:
                                             dest = await _execute_button_flow(url2r, session_id=shared_session, headless=False)  # type: ignore
                                             if dest:
@@ -2148,9 +2284,9 @@ class Bot:
                                 except: pass
                         err = f"CF challenge on {hostf} -- opened solve link {blockedf}, still blocked"
                     else:
-                        err = f"{exc.__class__.__name__}: {exc}"
+                        err = _resolve_fail_err(exc)
                 except Exception:
-                    err = f"{exc.__class__.__name__}: {exc}"
+                    err = _resolve_fail_err(exc)
                 _LOG.exception("resolve failed for %s", card.url)
 
             results.append((card, dest, err))
@@ -2192,6 +2328,12 @@ class Bot:
         job.status = "done" if job.failed == 0 else "done_with_errors"
         job.finished_at = time.time()
         self.last_solve_ago = 0.0
+        self._mark_autodetect_seen_if_needed(job)
+        try:
+            from xdmovies.cookie_store import touch_domain
+            touch_domain("xdmovies.wtf")
+        except Exception:
+            pass
         # remember movie posts for keep-alive refresh (CF is on posts, not
         # home). Gate-direct and download-direct jobs have no post page --
         # nothing to remember.
@@ -3056,6 +3198,8 @@ class Bot:
         self.error_count += 1
         job.status = "error"
         job.finished_at = time.time()
+        if getattr(job, "user_name", "") == "autodetect" and not str(job.error or "").startswith("cf_challenge"):
+            self._mark_autodetect_seen_if_needed(job)
         try:
             with open(self.cfg.error_log_path, "a", encoding="utf-8") as f:
                 f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} user={job.user_id} url={job.url} ===\n")
@@ -6094,13 +6238,14 @@ class Bot:
         except asyncio.TimeoutError:
             _LOG.error("application shutdown exceeded 45s")
 
-    async def _send_solve_link(self, chat_id: int, url: str, host: str, user_id: int):
+    async def _send_solve_link(self, chat_id: int, url: str, host: str, user_id: int, header: Optional[str] = None):
         try:
             from xdmovies.solve_server import create_session, get_public_url
             token = await create_session(url, user_id, host, chat_id)
             public_url = get_public_url(token)
+            hdr = header or f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>"
             msg = await self._bot.send_message(chat_id=chat_id,
-                text=(f"🔒 <b>Cloudflare blocked</b> -- <code>{host}</code>\n\n"
+                text=(f"{hdr}\n\n"
                       f"Link: <code>{url}</code>\n\n"
                       f"👉 <b>Tap to solve (auto-captures, no paste):</b>\n{public_url}\n\n"
                       "Open it, tap checkbox on screenshot if you see it. I’ll auto-capture and delete this message to hide VPS IP."),
@@ -6124,7 +6269,10 @@ class Bot:
             # call sites actually fire (they were guarded by `if
             # await self._wait_for_solve(...)`, which used to evaluate
             # False even on success).
-            return bool(await wait_for_solve(token, timeout=timeout))
+            ok = bool(await wait_for_solve(token, timeout=timeout))
+            if ok:
+                self._autodetect_cf_blocked_until = 0.0
+            return ok
         except Exception:
             return False
 
