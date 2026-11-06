@@ -2183,7 +2183,7 @@ class Bot:
                                     if token2:
                                         _gate2 = "latestnews" in (host2 or "")
                                         _wait2 = 240.0 if _gate2 else 90.0
-                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- open solve link and tap if needed.")
+                                        _waitpill2 = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_wait2)}s -- this usually auto-clears on its own; open the link and tap only if it doesn't.")
                                         try:
                                             _solved2 = await self._wait_for_solve(token2, timeout=_wait2)
                                         finally:
@@ -2239,7 +2239,7 @@ class Bot:
                         if tokenf:
                             _gatef = "latestnews" in (hostf or "")
                             _waitf = 240.0 if _gatef else 90.0
-                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- open solve link and tap if needed.")
+                            _waitpillf = await _send_transient_note(self._bot, _op_dm(job), f"⏳ Waiting up to {int(_waitf)}s -- this usually auto-clears on its own; open the link and tap only if it doesn't.")
                             try:
                                 _solvedf = await self._wait_for_solve(tokenf, timeout=_waitf)
                             finally:

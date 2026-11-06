@@ -51,6 +51,90 @@ class FollowFailedError(Exception):
     """
 
 
+# Managed/light CF challenges are proven by a non-interactive
+# proof-of-work plus TLS/header checks and very often auto-verify within
+# a few seconds of the interstitial loading -- no click anywhere. The
+# old code only granted this auto-verify wait to `non-interactive`
+# mode and raised CFChallengeError INSTANTLY for light/managed, which
+# made the first gate card of every job demand a 240s human solve for a
+# challenge Cloudflare itself was about to clear. Both knobs are
+# env-overridable so the VPS can be tuned without a code edit.
+import time as _time
+try:
+    _MANAGED_GRACE_SECONDS = max(0.0, float(os.getenv("XDMOVIES_CF_MANAGED_GRACE", "12")))
+except (TypeError, ValueError):
+    _MANAGED_GRACE_SECONDS = 12.0
+_MANAGED_GRACE_INTERVAL = 3.0
+
+
+def _cf_challenge_raise(final_url: str) -> None:
+    """Raise the typed CFChallengeError for a still-blocked destination,
+    distinguishing no-cookie from stale-cookie (bot.py shows both)."""
+    dest_host = _normalize_domain(final_url)
+    from xdmovies.cookie_store import get_entry
+    if not get_entry(dest_host):
+        raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
+    raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
+
+
+async def _save_fresh_clearance(page, final_url: str) -> None:
+    """Save a newly-issued cf_clearance for the destination host, but only
+    when the browser value actually differs from the stored one (never
+    overwrite a good cookie with the same value we injected).
+
+    Domain-hygiene audit fix: the context deliberately holds cookies for
+    BOTH domains (the short-link host and the gate host are injected
+    together). Only cookies whose domain actually belongs to the
+    destination host may be persisted under it -- the first
+    cf_clearance in the jar otherwise poisons the gate key with the
+    short-link host's stale cookie and the fresh gate clearance is
+    never scanned (cookie save loop had a bare `break` on first hit).
+    """
+    try:
+        cookies = await page.context.cookies()
+        dest_host = _normalize_domain(final_url)
+        if not dest_host:
+            return
+        from xdmovies.cookie_store import get_entry, set_cookies_for_domain
+        old_cf = ((get_entry(dest_host) or {}).get("cf_clearance") or "")
+
+        def _belongs(cookie_domain: str) -> bool:
+            d = (cookie_domain or "").lstrip(".").lower()
+            return bool(d) and (
+                d == dest_host or d.endswith("." + dest_host)
+            )
+
+        for c in cookies:
+            if c.get("name") != "cf_clearance" or len(c.get("value", "")) <= 20:
+                continue
+            cd = (c.get("domain") or "").lstrip(".").lower()
+            if cd and not _belongs(cd):
+                # A cookie minted for the other injected domain: never
+                # store it under the destination key.
+                continue
+            new_val = c.get("value")
+            if new_val != old_cf:
+                set_cookies_for_domain(dest_host, f"cf_clearance={new_val}")
+            break
+    except Exception:
+        pass
+
+
+async def _challenge_still_present(page) -> bool:
+    """True while the page still renders a CF interstitial challenge.
+    Mirrors the title/cf-mitigated sniff used everywhere in this module."""
+    try:
+        title = (await page.title()) or ""
+        html = await page.content()
+        return bool(
+            ("Just a moment" in title)
+            or ("Checking your browser" in title)
+            or ("cf-mitigated" in html)
+        )
+    except Exception:
+        return True
+
+
 async def follow_download_link_in_browser_async(
     download_url: str,
     session_id: str = "xdmovies_follow_session",
@@ -159,47 +243,28 @@ async def follow_download_link_in_browser_async(
                 if mode == "non-interactive":
                     # invisible fingerprint — no click needed, just wait 8s for auto-verify
                     await asyncio.sleep(8)
-                    try:
-                        title2 = (await page.title()) or ""
-                        html2 = await page.content()
-                        still = ("Just a moment" in title2 or "Checking your browser" in title2 or "cf-mitigated" in html2)
-                        if not still:
-                            # auto-solved — only save cookie if it's actually fresh
-                            # (don't overwrite good cookie with the same injected one)
-                            try:
-                                cookies = await page.context.cookies()
-                                dest_host = _normalize_domain(final_url)
-                                from xdmovies.cookie_store import get_entry
-                                old_entry = get_entry(dest_host) or {}
-                                old_cf = (old_entry.get("cf_clearance") or "")
-                                for c in cookies:
-                                    if c.get("name") == "cf_clearance" and len(c.get("value","")) > 20:
-                                        new_val = c.get("value")
-                                        if new_val != old_cf:
-                                            # only save when value actually changed — fresh from CF
-                                            from xdmovies.cookie_store import set_cookies_for_domain
-                                            set_cookies_for_domain(dest_host, f"cf_clearance={new_val}")
-                                        break
-                            except Exception:
-                                pass
-                        else:
-                            dest_host = _normalize_domain(final_url)
-                            from xdmovies.cookie_store import get_entry
-                            if not get_entry(dest_host):
-                                raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
-                            else:
-                                raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
-                    except CFChallengeError:
-                        raise
-                    except Exception:
-                        pass
-                else:
-                    dest_host = _normalize_domain(final_url)
-                    from xdmovies.cookie_store import get_entry
-                    if not get_entry(dest_host):
-                        raise CFChallengeError(final_url, reason="no_cookie_for_dest", host=dest_host)
+                    if not await _challenge_still_present(page):
+                        await _save_fresh_clearance(page, final_url)
                     else:
-                        raise CFChallengeError(final_url, reason="stale_cookie_for_dest", host=dest_host)
+                        _cf_challenge_raise(final_url)
+                elif mode in ("light", "managed"):
+                    # Managed/light challenges auto-verify passive checks
+                    # within seconds -- grant them the same grace wait the
+                    # non-interactive path gets instead of demanding a
+                    # human solve instantly (the first-card stall bug).
+                    _cleared = False
+                    _gdeadline = _time.monotonic() + _MANAGED_GRACE_SECONDS
+                    while _time.monotonic() < _gdeadline:
+                        await asyncio.sleep(_MANAGED_GRACE_INTERVAL)
+                        if not await _challenge_still_present(page):
+                            _cleared = True
+                            break
+                    if _cleared:
+                        await _save_fresh_clearance(page, final_url)
+                    else:
+                        _cf_challenge_raise(final_url)
+                else:
+                    _cf_challenge_raise(final_url)
         except CFChallengeError:
             raise
         except Exception:

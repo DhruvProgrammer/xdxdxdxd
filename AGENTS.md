@@ -169,7 +169,12 @@ Keep-alive must hit a deep link, not home. The flow:
   public base `http://132.145.15.58:8080`. Serves `/solve/<token>`
   HTML (with a `<img /shot>` JPEG pulled from the CloakBrowser session
   every 2s) and forwards click events to `page.mouse.click`. Auto-captures
-  the cookie on `ctx.cookies()` change and signals the waiting bot.
+  the cookie on `ctx.cookies()` change and signals the waiting bot --
+  except gate sessions (`latestnewsonline.sbs`), which stay open so the
+  Generate→Continue→Turnstile→Go auto-drive can land the destination;
+  if only a cookie was captured, `_gate_solved_fallback` resolves the
+  session after the drive window so bot.py can re-run the button flow
+  with the warm cookie.
 - `xdmovies/keep_alive.py` — 25m silent refresh loop. Targets
   `xdmovies_state/refresh_targets.json` (posts the bot solved recently),
   NOT the home page. `REFRESH_AFTER=25m`, `CHECK_INTERVAL=30s`.
